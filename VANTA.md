@@ -54,18 +54,31 @@ Run before any high-stakes decision. Takes 2-5 minutes. Fires Gemini and Codex i
 
 ---
 
-## How Vanta Relates to Gstack
+## How Vanta Relates to the Three Underlying Frameworks
 
-Vanta is a **thin wrapper on top of Superpowers/gstack**. It doesn't replace gstack — it makes it approachable.
+Three separate frameworks are installed simultaneously. Vanta wraps two of them.
+
+| Framework | Source | Installed at | Role |
+|---|---|---|---|
+| **garrytan/gstack** | https://github.com/garrytan/gstack | `~/.claude/skills/gstack/` | Specialist personas: /ship, /qa, /review, /investigate, /office-hours |
+| **gsd-build/get-shit-done** | https://github.com/gsd-build/get-shit-done | `~/.claude/skills/gsd-*/` + hooks | Workflow + context engineering: .planning/, phase discipline, learnings extraction |
+| **obra/superpowers** | https://github.com/obra/superpowers | `~/.claude/plugins/cache/.../superpowers/` | TDD-first: /brainstorm, /write-plan, /execute-plan |
+
+Vanta's three commands call into GSD for orchestration:
 
 | Vanta | Calls underneath |
 |---|---|
-| `/vanta` bootstrap | `/gsd-new-project`, `/gsd-plan-phase` |
-| `/vanta` resume | Reads `.planning/` directly |
-| `/vanta-sync` | `/gsd-extract_learnings`, updates invariants file |
-| `/council` | `mcp__Multi-CLI__Ask-Gemini`, `mcp__Multi-CLI__Ask-Codex` |
+| `/vanta` bootstrap | GSD: `/gsd-new-project`, `/gsd-plan-phase` |
+| `/vanta` resume | GSD: reads `.planning/` directly |
+| `/vanta-sync` | GSD: `/gsd-extract_learnings` → updates invariants file |
+| `/council` | Multi-CLI MCP: `mcp__Multi-CLI__Ask-Gemini` + `mcp__Multi-CLI__Ask-Codex` |
 
-The full gstack skill library (85 skills) is still available via the Superpowers plugin — see `~/.claude/plugins/cache/claude-plugins-official/superpowers/`. Vanta just gives you the three commands you need 90% of the time.
+**gstack specialists are NOT called by Vanta** — you invoke them directly:
+- Use `/ship` when ready to deploy, `/qa` for browser testing, `/review` before merge
+- Use `/office-hours` when product direction needs resetting
+- Use `/health` for code quality audit, `/cso` for security
+
+Vanta is the 3 commands you need 90% of the time. The other 80% of both frameworks' skills are still available directly.
 
 ---
 
