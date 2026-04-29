@@ -180,70 +180,37 @@ echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"phrase\":\"PHRASE\",\"route\"
 
 Triggered by phrases like "what do I know about X", "have we solved X", "how did we do X".
 
-Extract the topic from the phrase (the noun after "about"/"solved"/"do"). Then run:
+Extract the topic (the noun after "about"/"solved"/"do") and run the canonical resolver — one call instead of five separate greps. Single ranking, expiry-aware, supersession-aware:
 
 ```bash
-TOPIC="$1"  # the extracted topic, e.g. "Supabase JWT" or "PixiJS"
-echo "🔎 Searching cross-project knowledge for: $TOPIC"
-echo ""
+TOPIC="$1"  # the extracted topic, e.g. "jwt" or "pixijs"
+PROJECT="${2:-$(basename "$PWD")}"
+RESOLVER=~/.claude/bin/vanta-resolve.js
+[ ! -f "$RESOLVER" ] && RESOLVER=~/Projects/vanta/bin/vanta-resolve.js
 
-# Source 1: Global invariants (highest signal)
-echo "── Invariants ──"
-rg -i --max-count 3 "$TOPIC" ~/.claude/rules/vinamr-invariants.md 2>/dev/null | head -10
-
-# Source 2: Auto-memory (project context, decisions across sessions)
-echo ""
-echo "── Memory ──"
-rg -i --max-count 2 -l "$TOPIC" ~/.claude/projects/-Users-vinamr/memory/ 2>/dev/null | while read f; do
-  echo "→ $(basename $f .md):"
-  rg -i --max-count 2 "$TOPIC" "$f" 2>/dev/null | head -3
-done
-
-# Source 3: Decision logs across all gstack projects
-echo ""
-echo "── Decisions ──"
-rg -i --max-count 2 -l "$TOPIC" ~/.gstack/projects/*/decisions.md 2>/dev/null | while read f; do
-  proj=$(basename $(dirname "$f"))
-  echo "→ $proj:"
-  rg -i --max-count 2 "$TOPIC" "$f" 2>/dev/null | head -3
-done
-
-# Source 4: Project CLAUDE.md gotchas
-echo ""
-echo "── Project Gotchas ──"
-rg -i --max-count 1 -l "$TOPIC" ~/Projects/*/CLAUDE.md 2>/dev/null | while read f; do
-  proj=$(basename $(dirname "$f"))
-  echo "→ $proj:"
-  rg -i --max-count 1 "$TOPIC" "$f" 2>/dev/null | head -2
-done
-
-# Source 5: Episodic memory (time-aware: "what did we discuss last week")
-echo ""
-echo "── Episodes ──"
-if [ -f ~/.vanta/episodes.jsonl ]; then
-  node -e "
-const fs=require('fs');
-const topic='${TOPIC}'.toLowerCase();
-const lines=fs.readFileSync(process.env.HOME+'/.vanta/episodes.jsonl','utf8').trim().split('\n').filter(Boolean);
-const matches=lines.map(l=>{try{return JSON.parse(l);}catch{return null;}}).filter(e=>e && (
-  (e.topics||[]).some(t=>t.includes(topic)) ||
-  (e.decision||'').toLowerCase().includes(topic)
-));
-const recent=matches.sort((a,b)=>b.ts.localeCompare(a.ts)).slice(0,5);
-recent.forEach(e=>{
-  const date=e.ts.slice(0,10);
-  const proj=e.slug||'?';
-  const dec=(e.decision||'').slice(0,80);
-  console.log(\`→ \${date} [\${proj}] (\${e.outcome}): \${dec}\`);
-});
-if(recent.length===0) console.log('  (no episodic matches)');
-"
+if [ -f "$RESOLVER" ]; then
+  echo "🔎 Searching cross-project knowledge for: $TOPIC"
+  echo ""
+  node "$RESOLVER" --topic "$TOPIC" --project "$PROJECT" --cwd "$PWD" --max 8 --format text
+else
+  # Fallback if resolver not deployed yet
+  echo "⚠ vanta-resolve not found; falling back to direct grep"
+  rg -i --max-count 3 "$TOPIC" ~/.claude/rules/vinamr-invariants.md 2>/dev/null
 fi
 ```
 
-After running, summarize: "Found N matches across [invariants/memory/decisions/gotchas/episodes]. Most relevant: [1-line summary]." If zero matches: "Nothing in local knowledge. This might be a fresh problem — worth capturing in `/vanta-sync` if you solve it."
+The resolver returns ranked results across:
+- **invariants** — `~/.claude/rules/vinamr-invariants.md` (global tool gotchas)
+- **decisions** — `~/.gstack/projects/<slug>/decisions.md` (council verdicts; expired/superseded auto-dropped)
+- **gotchas** — `<project>/CLAUDE.md` Gotchas section (project-specific)
+- **episodes** — `~/.vanta/episodes.jsonl` (time-aware decision log)
+- **memory** — `~/.claude/projects/-Users-vinamr/memory/*.md` (auto-saved context)
 
-**Time-aware queries:** "what did we discuss last week" / "this month" / "yesterday" — if user includes a time expression, filter episodes by ISO date prefix (e.g. last 7 days = ts >= today-7).
+Each result carries: source, section/heading, confidence (decisions only), date (when applicable), score, file path. Higher source weight + recency + topic-match strength = higher rank.
+
+After running, summarize: "Found N matches. Most relevant: [1-line summary]." If zero matches: "Nothing in local knowledge. This might be a fresh problem — worth capturing in `/vanta-sync` if you solve it."
+
+**Time-aware queries:** "what did we discuss last week" / "this month" / "yesterday" — pass `--since YYYY-MM-DD` (TODO: resolver needs `--since` flag in v3.4) or post-filter the JSON output by `date >= today-7`.
 
 ## Intent (state 4)
 

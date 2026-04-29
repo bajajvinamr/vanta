@@ -116,9 +116,29 @@ The moment Claude starts to write `auth/`, `payment/`, `migration/`, or any secu
 📌 PRIOR DECISIONS — what /council already decided about this topic
 ⚠️  INVARIANTS — relevant gotchas from vinamr-invariants.md
 🔒 PROJECT GOTCHAS — what this repo's CLAUDE.md says about this topic
+🧠 RECENT EPISODES — what we decided about this in the last few sessions
+🌑 PENDING SHADOW REVIEW — plans flagged but not yet council-reviewed
 ```
 
 Claude doesn't have to remember to check. The constraint pack is in-context at the moment of decision. Past learnings shape present action automatically.
+
+All five sources flow through one canonical query layer (`bin/vanta-resolve.js`) — single ranking, single expiry/supersession filter, single dedup. Replaces five separate greps with one ranked, scored, metadata-aware index.
+
+---
+
+## Shadow Council (pre-emptive governance)
+
+When you write a plan to `.planning/*.md` that mentions auth, payments, migrations, or security keywords, `plan-watcher.js` fires *immediately* and writes a flag to `~/.gstack/projects/<slug>/.shadow_pending.md`.
+
+Then on the very first code edit to that area, `council-advisory.js` reads the flag and surfaces:
+
+```
+🌑 PENDING SHADOW REVIEW (plan flagged but not council-reviewed):
+- 2026-04-30-auth-rewrite.md · auth, session · flagged 2026-04-29T22:36Z
+  → Run /council before implementing.
+```
+
+The plan-watcher fires when the plan is written; the surfacing fires when implementation starts. You can't accidentally implement a sensitive plan that hasn't been adversarially reviewed — Vanta surfaces the gap at exactly the moment it would matter.
 
 ---
 
@@ -162,10 +182,11 @@ If the report flags ≥2 issues, it offers to run `/council` *on the report itse
 
 | Hook | Trigger | What |
 |---|---|---|
-| `council-advisory.js` | PreToolUse: Write/Edit to auth/payment/migration paths | **Constraint-pack injector** — surfaces prior decisions, invariants, and project gotchas as `additionalContext` *before* the edit |
+| `council-advisory.js` | PreToolUse: Write/Edit to auth/payment/migration paths | **Constraint-pack injector** — queries `vanta-resolve.js` for ranked decisions, invariants, gotchas, episodes, and pending shadow reviews |
+| `plan-watcher.js` | PostToolUse: Write/Edit to `.planning/*.md` | **Shadow Council flag** — detects sensitive topics in plans, writes pending-review flag for council-advisory to surface at code time |
 | `test-failure-advisor.js` | PostToolUse: Bash with test failures | Hard-stop — don't ship over broken tests |
 | `stack-file-nudge.js` | PostToolUse: Write/Edit to config files | Follow-up actions for config changes |
-| `auto-sync.js` | Stop: session end | Queue session + write episodic memory (topics, decision, outcome) |
+| `auto-sync.js` | Stop: session end | Queue session + write episodic memory; dedupes by session_id |
 
 ---
 
@@ -197,9 +218,13 @@ See `docs/install.md` for manual setup and dependency notes.
   vanta-sync/       ← /vanta-sync: invariant extraction, scoped queue clearing
   vanta-patterns/   ← /vanta-patterns: weekly self-governance retrospective
 
+~/.claude/bin/
+  vanta-resolve.js  ← canonical knowledge query layer (one ranked index over 5 sources)
+
 ~/.claude/hooks/
-  auto-sync.js              ← Stop hook: sync-queue + episodic memory
-  council-advisory.js       ← PreToolUse: constraint-pack injection
+  auto-sync.js              ← Stop hook: sync-queue + episodic memory (deduped by session_id)
+  council-advisory.js       ← PreToolUse: constraint-pack via vanta-resolve
+  plan-watcher.js           ← PostToolUse: Shadow Council flag on sensitive plans
   test-failure-advisor.js   ← PostToolUse: hard-stop on broken tests
   stack-file-nudge.js       ← PostToolUse: config-file follow-ups
 
@@ -238,3 +263,4 @@ Everything is plain markdown. No packages. No runtime. No network calls. Fails g
 | v3 | 9.4/10 | 25 routes, Stop hook auto-memory, decisions.md, staleness detection, codemap at bootstrap |
 | v3.1 | 9.6/10 | 33 routes incl. cross-project recall, scoped sync-queue, smarter Stop hook (decision markers), routing precedence rules |
 | v3.2 | 9.8/10 | Constraint-pack hook (anticipatory memory at write-time), episodic memory (`episodes.jsonl`), `/vanta-patterns` self-governance loop, decision metadata (confidence/scope/expires/supersedes), Gemini trust fix |
+| v3.3 | 9.9/10 | `bin/vanta-resolve.js` canonical knowledge index (replaces 5 separate greps with one ranked query, expiry+supersession-aware), Shadow Council via `plan-watcher.js` (pre-emptive governance at plan-write time), Stop hook dedup by session_id, decision-extractor strips markdown, install bug fixed (all 4 hooks now register, not just Stop) |

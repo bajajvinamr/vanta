@@ -8,6 +8,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILLS_DIR="$HOME/.claude/skills"
 HOOKS_DIR="$HOME/.claude/hooks"
+BIN_DIR="$HOME/.claude/bin"
 SETTINGS="$HOME/.claude/settings.json"
 CLAUDE_MD="$HOME/.claude/CLAUDE.md"
 
@@ -42,11 +43,24 @@ echo ""
 echo "Installing hooks..."
 mkdir -p "$HOOKS_DIR"
 
-for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js; do
+for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js; do
   src="$REPO_DIR/hooks/$hook"
   if [ -f "$src" ]; then
     cp "$src" "$HOOKS_DIR/$hook"
     echo "  ✓ $hook"
+  fi
+done
+echo ""
+
+# ── Bin (knowledge resolver and other shared scripts) ───────────────────────
+echo "Installing shared bins..."
+mkdir -p "$BIN_DIR"
+for binfile in vanta-resolve.js; do
+  src="$REPO_DIR/bin/$binfile"
+  if [ -f "$src" ]; then
+    cp "$src" "$BIN_DIR/$binfile"
+    chmod +x "$BIN_DIR/$binfile"
+    echo "  ✓ $binfile"
   fi
 done
 echo ""
@@ -73,6 +87,7 @@ const REGISTRATIONS = [
   { event: 'PreToolUse',   matcher: 'Write|Edit', file: 'council-advisory.js',     timeout: 5 },
   { event: 'PostToolUse',  matcher: 'Bash',       file: 'test-failure-advisor.js', timeout: 5 },
   { event: 'PostToolUse',  matcher: 'Write|Edit', file: 'stack-file-nudge.js',     timeout: 5 },
+  { event: 'PostToolUse',  matcher: 'Write|Edit', file: 'plan-watcher.js',         timeout: 5 },
 ];
 
 let added = 0, skipped = 0, missing = 0;

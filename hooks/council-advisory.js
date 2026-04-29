@@ -2,28 +2,40 @@
 // PreToolUse on Write|Edit — anticipatory constraint pack injector.
 //
 // When you write to security/architecture-critical paths, this hook surfaces:
-//   1. Relevant prior decisions from ~/.gstack/projects/<slug>/decisions.md
-//   2. Tool-specific invariants from ~/.claude/rules/vinamr-invariants.md
-//   3. Project-specific gotchas from ./CLAUDE.md (Gotchas section)
-//   4. The standard council advisory if no prior context exists
+//   1. Ranked, deduped knowledge via bin/vanta-resolve.js (the canonical query layer)
+//   2. Pending Shadow Council verdicts (if a recent plan flagged this topic)
+//   3. The standard council advisory if no prior context exists
 //
-// This turns "remember to /council" into "here is what you've already decided."
-// Anticipatory memory > reactive nudges.
+// As of v3.3, the three separate parsers (decisions/invariants/gotchas) are gone —
+// vanta-resolve owns ranking, expiry, and supersession in one place.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
 
+// Load the canonical resolver. Try the deployed path first, fall back to repo.
+let resolveKnowledge = null;
+for (const p of [
+  path.join(os.homedir(), '.claude', 'bin', 'vanta-resolve.js'),
+  path.join(os.homedir(), 'Projects', 'vanta', 'bin', 'vanta-resolve.js'),
+]) {
+  try { ({ resolve: resolveKnowledge } = require(p)); break; } catch { /* keep looking */ }
+}
+
+// Topics ordered MOST SPECIFIC → LEAST SPECIFIC. The resolver matches each one
+// independently; specific topics surface tighter results, generic ones widen reach
+// when nothing specific hits. 'session' is intentionally NOT in the broad auth
+// trigger — it pulls in unrelated Stop-hook invariants. Sessions get their own row.
 const COUNCIL_TRIGGERS = [
-  { re: /\/(auth|authn|authz|authentication|authorization|oauth|jwt|token|credential|password)([\/.]|$)/i, reason: 'auth/credential code', topics: ['auth', 'jwt', 'oauth', 'token', 'credential', 'password', 'session'] },
-  { re: /\/sessions?([\/.]|$)/i, reason: 'auth/session code', topics: ['session', 'auth'] },
-  { re: /\/(payment|billing|stripe|subscription|checkout)/i, reason: 'payment/billing code', topics: ['payment', 'stripe', 'billing', 'subscription'] },
-  { re: /\/(admin|privilege|rbac|role)\//i, reason: 'access-control code', topics: ['rbac', 'role', 'permission', 'admin'] },
-  { re: /\/migrations?\//i, reason: 'database migration', topics: ['migration', 'schema', 'prisma'] },
+  { re: /\/(auth|authn|authz|authentication|authorization|oauth|jwt|token|credential|password)([\/.]|$)/i, reason: 'auth/credential code', topics: ['jwt', 'oauth', 'token', 'credential', 'password', 'auth'] },
+  { re: /\/sessions?([\/.]|$)/i, reason: 'auth/session code', topics: ['session', 'cookie', 'auth'] },
+  { re: /\/(payment|billing|stripe|subscription|checkout)/i, reason: 'payment/billing code', topics: ['stripe', 'subscription', 'payment', 'billing', 'webhook'] },
+  { re: /\/(admin|privilege|rbac|role)\//i, reason: 'access-control code', topics: ['rbac', 'permission', 'role', 'admin'] },
+  { re: /\/migrations?\//i, reason: 'database migration', topics: ['prisma', 'migration', 'schema'] },
   { re: /schema\.prisma$/i, reason: 'database schema', topics: ['prisma', 'schema', 'migration'] },
-  { re: /\/(middleware|security|cors|helmet)\//i, reason: 'security middleware', topics: ['cors', 'csp', 'security'] },
-  { re: /\/(infrastructure|terraform|k8s|kubernetes)\//i, reason: 'infrastructure code', topics: ['terraform', 'k8s', 'infra'] },
+  { re: /\/(middleware|security|cors|helmet)\//i, reason: 'security middleware', topics: ['csp', 'cors', 'helmet', 'security'] },
+  { re: /\/(infrastructure|terraform|k8s|kubernetes)\//i, reason: 'infrastructure code', topics: ['terraform', 'kubernetes', 'k8s', 'infra'] },
 ];
 
 function extractFilePath(data) {
@@ -46,82 +58,22 @@ function getProjectSlug(cwd) {
   return path.basename(cwd);
 }
 
-// Find relevant bullets matching any of the topics. Captures multi-line bullets
-// (a `- ` line + any indented continuation until the next bullet or blank line).
-function grepTopics(content, topics, maxLines = 3) {
-  if (!content) return [];
-  const re = new RegExp(`\\b(${topics.join('|')})\\b`, 'i');
-  const lines = content.split('\n');
-  const bullets = [];
-  let buf = null;
-  const flush = () => { if (buf && re.test(buf)) bullets.push(buf.trim()); buf = null; };
-  for (const l of lines) {
-    if (/^\s*-\s/.test(l)) { flush(); buf = l; }
-    else if (buf && /^\s+\S/.test(l)) { buf += '\n' + l; }
-    else { flush(); }
+// Read pending Shadow Council reviews for this project. plan-watcher.js writes
+// these flags when a sensitive plan file gets edited but hasn't been council-reviewed.
+function readPendingShadowReviews(slug, topics) {
+  if (!slug) return [];
+  const file = path.join(os.homedir(), '.gstack', 'projects', slug, '.shadow_pending.md');
+  let content; try { content = fs.readFileSync(file, 'utf8'); } catch { return []; }
+  const re = new RegExp(`\\b(${topics.join('|')})s?\\b`, 'i');
+  const out = [];
+  for (const block of content.split(/\n## /).slice(1)) {
+    if (re.test(block)) {
+      const firstLine = block.split('\n')[0];
+      out.push(firstLine.trim());
+      if (out.length >= 2) break;
+    }
   }
-  flush();
-  return bullets.slice(0, maxLines);
-}
-
-// Parse a decision entry's metadata (Expires, Supersedes, Confidence, Scope).
-function parseMeta(body) {
-  const get = re => { const m = body.match(re); return m ? m[1].trim() : null; };
-  return {
-    expires:    get(/\*\*Expires:?\*\*\s*([^\n]+)/i),
-    supersedes: get(/\*\*Supersedes:?\*\*\s*([^\n]+)/i),
-    confidence: get(/\*\*Confidence:?\*\*\s*([^\n]+)/i),
-    scope:      get(/\*\*Scope:?\*\*\s*([^\n]+)/i),
-    decision:   get(/\*\*Decision:?\*\*\s*([^\n]+)/i),
-    verdict:    get(/\*\*Verdict:?\*\*\s*([^\n]+)/i),
-  };
-}
-
-function isExpired(expiresStr, today) {
-  if (!expiresStr) return false;
-  if (/until superseded|n\/?a|none/i.test(expiresStr)) return false;
-  const m = expiresStr.match(/(\d{4}-\d{2}-\d{2})/);
-  return !!m && m[1] < today;
-}
-
-function confidenceRank(c) {
-  if (!c) return 1;
-  if (/high/i.test(c)) return 3;
-  if (/medium|med/i.test(c)) return 2;
-  return 1;
-}
-
-// Extract live (non-expired, non-superseded) decisions matching topics.
-function relevantDecisions(content, topics, maxEntries = 2) {
-  if (!content) return [];
-  const re = new RegExp(`\\b(${topics.join('|')})\\b`, 'i');
-  const today = new Date().toISOString().slice(0, 10);
-  // Split on top-level "## " headings — each entry has heading + body.
-  const raw = content.split(/^## /m).slice(1);
-  const entries = raw.map((blob, idx) => {
-    const lines = blob.split('\n');
-    const heading = lines[0] || '';
-    const body = lines.slice(1).join('\n');
-    const dateMatch = heading.match(/(\d{4}-\d{2}-\d{2})/);
-    return { idx, heading, body, date: dateMatch ? dateMatch[1] : '0000-00-00', meta: parseMeta(body) };
-  });
-  // Drop expired and explicitly superseded entries.
-  const supersededDates = new Set(
-    entries.map(e => e.meta.supersedes && (e.meta.supersedes.match(/\d{4}-\d{2}-\d{2}/) || [])[0]).filter(Boolean)
-  );
-  const live = entries.filter(e => !isExpired(e.meta.expires, today) && !supersededDates.has(e.date));
-  // Filter by topic match.
-  const matched = live.filter(e => re.test(e.heading) || re.test(e.body));
-  // Rank: confidence desc, then recency desc.
-  matched.sort((a, b) => {
-    const cr = confidenceRank(b.meta.confidence) - confidenceRank(a.meta.confidence);
-    return cr !== 0 ? cr : b.date.localeCompare(a.date);
-  });
-  return matched.slice(0, maxEntries).map(e => {
-    const decision = (e.meta.decision || e.meta.verdict || '').slice(0, 120);
-    const conf = e.meta.confidence ? ` [${e.meta.confidence}]` : '';
-    return `## ${e.heading.trim()}${conf} — ${decision}`;
-  });
+  return out;
 }
 
 let input = '';
@@ -142,35 +94,58 @@ process.stdin.on('end', () => {
     const cwd = data.cwd || process.cwd();
     const slug = getProjectSlug(cwd);
 
-    // Build constraint pack
-    const sections = [];
-
-    // 1. Prior decisions on this topic
-    const decisionsFile = path.join(os.homedir(), '.gstack', 'projects', slug, 'decisions.md');
-    const decisions = relevantDecisions(safeReadFile(decisionsFile), trigger.topics);
-    if (decisions.length) {
-      sections.push(`📌 PRIOR DECISIONS (${slug}):\n` + decisions.join('\n'));
-    }
-
-    // 2. Tool-specific invariants
-    const invariantsFile = path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.md');
-    const invariants = grepTopics(safeReadFile(invariantsFile), trigger.topics, 3);
-    if (invariants.length) {
-      sections.push(`⚠️  INVARIANTS:\n` + invariants.map(l => l.trim()).join('\n'));
-    }
-
-    // 3. Project-specific gotchas
-    const projectClaudeMd = path.join(cwd, 'CLAUDE.md');
-    const projectContent = safeReadFile(projectClaudeMd);
-    if (projectContent) {
-      const gotchasMatch = projectContent.split(/^##\s+Gotchas/im)[1];
-      if (gotchasMatch) {
-        const gotchas = grepTopics(gotchasMatch.split(/^##\s+/m)[0], trigger.topics, 2);
-        if (gotchas.length) sections.push(`🔒 PROJECT GOTCHAS:\n` + gotchas.map(l => l.trim()).join('\n'));
+    // Query the canonical knowledge resolver across all topics for this trigger.
+    // Earlier topics in the list are more specific — boost their scores so they
+    // dominate over results that only hit a generic later topic.
+    const aggregated = [];
+    if (resolveKnowledge) {
+      const seen = new Set();
+      for (let ti = 0; ti < trigger.topics.length; ti++) {
+        const topic = trigger.topics[ti];
+        const specificity = 1 + (trigger.topics.length - ti) * 0.3;  // 1st topic ~3x the boost vs last
+        const out = resolveKnowledge({ topic, project: slug, cwd, max: 3 });
+        for (const r of (out.results || [])) {
+          const key = r.path + '|' + (r.excerpt || '').slice(0, 80);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          r.score = (r.score || 0) * specificity;
+          r.matched_topic = topic;
+          aggregated.push(r);
+        }
       }
+      aggregated.sort((a, b) => (b.score || 0) - (a.score || 0));
     }
 
-    // Build the additionalContext message
+    // Cap at 4 total — beyond that the pack stops being focused.
+    const buckets = { decision: [], invariant: [], gotcha: [], episode: [], memory: [] };
+    for (const r of aggregated.slice(0, 4)) (buckets[r.source] || []).push(r);
+
+    const sections = [];
+    if (buckets.decision.length) {
+      sections.push('📌 PRIOR DECISIONS:\n' + buckets.decision.map(d => {
+        const conf = d.confidence && d.confidence !== 'unknown' ? ` [${d.confidence}]` : '';
+        return `- ${d.section || d.date || ''}${conf} — ${d.excerpt}`;
+      }).join('\n'));
+    }
+    if (buckets.invariant.length) {
+      sections.push('⚠️  INVARIANTS:\n' + buckets.invariant.map(i => i.excerpt.replace(/^\s*-\s/, '- ')).join('\n'));
+    }
+    if (buckets.gotcha.length) {
+      sections.push('🔒 PROJECT GOTCHAS:\n' + buckets.gotcha.map(g => g.excerpt.replace(/^\s*-\s/, '- ')).join('\n'));
+    }
+    if (buckets.episode.length) {
+      sections.push('🧠 RECENT EPISODES:\n' + buckets.episode.map(e =>
+        `- ${e.date || ''} (${e.outcome || '?'}): ${e.excerpt}`).join('\n'));
+    }
+
+    // Shadow Council pending reviews for this topic
+    const pendingShadow = readPendingShadowReviews(slug, trigger.topics);
+    if (pendingShadow.length) {
+      sections.push('🌑 PENDING SHADOW REVIEW (plan flagged but not council-reviewed):\n' +
+        pendingShadow.map(p => `- ${p}`).join('\n') +
+        '\n  → Run /council before implementing.');
+    }
+
     const baseAdvisory =
       `COUNCIL ADVISORY: Editing ${trigger.reason} — ${filePath}. ` +
       `If this introduces a new flow (not a small fix), run /council first.`;
