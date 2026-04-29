@@ -118,6 +118,13 @@ Check GSTACK_AVAILABLE and GSD_AVAILABLE before invoking. Match on keywords anyw
 | "retro", "what did we learn", "retrospective", "reflect" | gstack + vanta | `Skill("gstack")` with context "run /retro", then `Skill("vanta-sync")` |
 | "security audit", "check security", "audit this", "cso" | gstack | `Skill("gstack")` with context "run /cso" |
 | "office hours", "strategy session", "roadmap review", "think with me" | gstack | `Skill("gstack")` with context "run /office-hours" |
+| "execute phase", "start the phase", "let's build it", "build this", "start building" | GSD | `Skill("gsd-execute-phase")` |
+| "resume work", "pick up where", "continue the phase", "get back to work" | GSD | `Skill("gsd-resume-work")` |
+| "complete milestone", "wrap up milestone", "milestone done" | GSD | `Skill("gsd-complete-milestone")` |
+| "write the plan", "document the approach", "spec this out" | superpowers | `Skill("writing-plans")` |
+| "execute the plan", "run the plan", "implement the plan" | superpowers | `Skill("execute-plan")` |
+| "follow tdd", "test first", "tdd this", "test-driven" | superpowers | `Skill("tdd-workflow")` |
+| "verify before done", "check before shipping", "pre-ship check" | superpowers | `Skill("verification-before-completion")` |
 
 **Collision Rule:**
 - "review this" matches both gstack `/review` AND `gsd-code-review`

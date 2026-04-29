@@ -76,11 +76,39 @@ new_string: "[last line of file]\n\n## [New Tool]\n\n- [invariant]."
 
 For Codex: if the invariant is relevant to build tooling, package management, or API behavior, use the **Edit tool** to append a short note to `~/.codex/AGENTS.md` under the relevant section.
 
-**Step 5 — Update project CLAUDE.md**
+**Step 5 — Update project CLAUDE.md (mandatory)**
 
-If the learning is project-specific, use the **Edit tool** to add it to the project's `CLAUDE.md` under a `## Gotchas` section (create the section if absent).
+For EVERY learning extracted in Step 1, explicitly ask: "Is this specific to this project's stack, config, or codebase (not a general tool fact)?"
 
-**Step 6 — Confirm**
+If yes → use the **Edit tool** to append to `./CLAUDE.md` under `## Gotchas` (create section if absent). Do not skip this. Do not ask — just write it.
+
+Format:
+```
+## Gotchas
+
+- [one-line fact specific to this project]. [what breaks if ignored].
+```
+
+If no learnings are project-specific: note "Project CLAUDE.md: no project-specific learnings this session." Do not leave this step unaddressed.
+
+**Step 6 — Mark synced sessions**
+
+After writing invariants, mark processed entries in sync-queue.jsonl:
+
+```bash
+_QUEUE=~/.vanta/sync-queue.jsonl
+if [ -f "$_QUEUE" ]; then
+  node -e "
+const fs=require('fs');
+const lines=fs.readFileSync('$_QUEUE','utf8').trim().split('\n').filter(Boolean);
+const updated=lines.map(l=>{try{const e=JSON.parse(l);e.synced=true;return JSON.stringify(e);}catch{return l;}});
+fs.writeFileSync('$_QUEUE',updated.join('\n')+'\n');
+"
+  echo "  ✓ sync-queue marked"
+fi
+```
+
+**Step 7 — Confirm**
 
 Report back:
 ```
