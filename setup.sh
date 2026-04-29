@@ -43,10 +43,11 @@ echo ""
 echo "Installing hooks..."
 mkdir -p "$HOOKS_DIR"
 
-for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js; do
+for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js session-start; do
   src="$REPO_DIR/hooks/$hook"
   if [ -f "$src" ]; then
     cp "$src" "$HOOKS_DIR/$hook"
+    chmod +x "$HOOKS_DIR/$hook"
     echo "  ✓ $hook"
   fi
 done
@@ -55,7 +56,7 @@ echo ""
 # ── Bin (knowledge resolver and other shared scripts) ───────────────────────
 echo "Installing shared bins..."
 mkdir -p "$BIN_DIR"
-for binfile in vanta-resolve.js; do
+for binfile in vanta-resolve.js vanta-brief.js; do
   src="$REPO_DIR/bin/$binfile"
   if [ -f "$src" ]; then
     cp "$src" "$BIN_DIR/$binfile"
@@ -82,7 +83,9 @@ s.hooks = s.hooks || {};
 
 // Each registration: event -> matcher -> hook file
 // matcher uses Claude Code's tool-name pipe syntax (e.g. "Write|Edit", "Bash")
+// SessionStart hook is bash, not node. Pass full path; setup detects by extension.
 const REGISTRATIONS = [
+  { event: 'SessionStart', matcher: '',          file: 'session-start',           timeout: 5,  runtime: 'bash' },
   { event: 'Stop',         matcher: '',          file: 'auto-sync.js',            timeout: 10 },
   { event: 'PreToolUse',   matcher: 'Write|Edit', file: 'council-advisory.js',     timeout: 5 },
   { event: 'PostToolUse',  matcher: 'Bash',       file: 'test-failure-advisor.js', timeout: 5 },
@@ -94,7 +97,7 @@ let added = 0, skipped = 0, missing = 0;
 for (const r of REGISTRATIONS) {
   const hookPath = `${hooksDir}/${r.file}`;
   if (!fs.existsSync(hookPath)) { console.log(`  - ${r.file} (missing on disk, skipped)`); missing++; continue; }
-  const cmd = `node "${hookPath}"`;
+  const cmd = r.runtime === 'bash' ? `bash "${hookPath}"` : `node "${hookPath}"`;
   s.hooks[r.event] = s.hooks[r.event] || [];
   // Look for an existing entry that already runs this command (any matcher).
   const already = s.hooks[r.event].some(e => (e.hooks || []).some(h => h.command === cmd));

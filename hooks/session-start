@@ -1,25 +1,62 @@
 #!/usr/bin/env bash
-# SessionStart hook for Vanta plugin.
-# Injects using-vanta/SKILL.md as additionalContext so Claude knows
-# when to invoke /vanta, /vanta-sync, /council without being asked.
+# SessionStart hook for Vanta plugin — emits the live project brief.
+#
+# The static using-vanta protocol is already loaded via CLAUDE.md @-import. This
+# hook's job is the DYNAMIC piece that protocol describes: branch, phase,
+# recent decisions, stale signals, pending shadow reviews — all computed live
+# at session start by bin/vanta-brief.js.
+#
+# v3.3 had a static dump of using-vanta SKILL.md here; both councils flagged
+# that the brief described inside that skill was never actually computed.
+# v3.4 fixes the delivery loop.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BRIEF_BIN_DEPLOYED="${HOME}/.claude/bin/vanta-brief.js"
+BRIEF_BIN_REPO="${HOME}/Projects/vanta/bin/vanta-brief.js"
 
-using_vanta_content=$(cat "${PLUGIN_ROOT}/skills/using-vanta/SKILL.md" 2>&1 || echo "Error reading using-vanta skill")
+# Resolve brief generator: prefer deployed, fall back to repo location.
+BRIEF_BIN=""
+[ -f "$BRIEF_BIN_DEPLOYED" ] && BRIEF_BIN="$BRIEF_BIN_DEPLOYED"
+[ -z "$BRIEF_BIN" ] && [ -f "$BRIEF_BIN_REPO" ] && BRIEF_BIN="$BRIEF_BIN_REPO"
+
+# If we have no generator, exit silently — never break session start.
+if [ -z "$BRIEF_BIN" ]; then
+  printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}'
+  exit 0
+fi
+
+# Read cwd from stdin JSON (Claude Code SessionStart input format).
+input_json=""
+read -t 2 -r input_json 2>/dev/null || input_json=""
+cwd=""
+if [ -n "$input_json" ]; then
+  cwd=$(echo "$input_json" | python3 -c "import json,sys; d=json.loads(sys.stdin.read() or '{}'); print(d.get('cwd', ''))" 2>/dev/null || echo "")
+fi
+[ -z "$cwd" ] && cwd="$PWD"
+
+# Run brief with implicit Node timeout (the script is fast — no stale data
+# blocks session start). On any error, emit empty additionalContext.
+brief_lines=""
+if [ -d "$cwd" ]; then
+  brief_lines=$(node "$BRIEF_BIN" --cwd "$cwd" 2>/dev/null || true)
+fi
+
+if [ -z "$brief_lines" ]; then
+  printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}'
+  exit 0
+fi
 
 escape_for_json() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    s="${s//$'\n'/\\n}"
-    s="${s//$'\r'/\\r}"
-    s="${s//$'\t'/\\t}"
-    printf '%s' "$s"
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
 }
 
-escaped=$(escape_for_json "$using_vanta_content")
-
+escaped=$(escape_for_json "$brief_lines")
 printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}' "$escaped"

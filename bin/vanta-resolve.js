@@ -355,24 +355,33 @@ function scoreResult(r, topic) {
   return Math.round((sw * cm * rm + tm * 0.5) * 100) / 100;
 }
 
-// Apply project-scope penalty. activeProject = canonical slug of the project
-// the user is currently working in. Results from other projects get heavily
-// down-ranked but not eliminated — visible only when nothing scoped scores
-// higher, or when --include-foreign is set.
+// Apply project-scope filter. activeProject = canonical slug of the active project.
+// Default behavior: HARD-FILTER foreign results — they never enter the result set.
+// (Gemini council R2: "a lower score does not prevent an LLM from reading injected
+// text — foreign projects must be filtered, not just penalized.")
+// includeForeign=true: keep foreign results but down-rank to FOREIGN_PENALTY × score
+// so they only appear in /recall when the user explicitly opts in.
 function applyProjectScope(results, activeProject, includeForeign) {
   const active = canonProject(activeProject);
+  const out = [];
   for (const r of results) {
     const rp = canonProject(r.project) || GLOBAL_PROJECT;
     if (!active || rp === GLOBAL_PROJECT) {
       r.scope_match = 'global';
+      out.push(r);
     } else if (rp === active) {
       r.scope_match = 'scoped';
+      out.push(r);
     } else {
       r.scope_match = 'foreign';
-      if (!includeForeign) r.score *= FOREIGN_PENALTY;
+      if (includeForeign) {
+        r.score *= FOREIGN_PENALTY;
+        out.push(r);
+      }
+      // Default: drop foreign entirely. Never lands in constraint pack or /recall.
     }
   }
-  return results;
+  return out;
 }
 
 // ─── Main resolver ──────────────────────────────────────────────────────────
@@ -386,14 +395,16 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false }) {
     ...readMemory(topic),
   ];
   for (const r of all) r.score = scoreResult(r, topic);
-  applyProjectScope(all, project, includeForeign);
-  all.sort((a, b) => b.score - a.score);
+  // applyProjectScope returns the FILTERED list — foreign dropped by default.
+  const filtered = applyProjectScope(all, project, includeForeign);
+  filtered.sort((a, b) => b.score - a.score);
   return {
     topic,
     project: project || null,
     activeProjectCanon: canonProject(project),
-    count: all.length,
-    results: all.slice(0, max),
+    count: filtered.length,
+    foreignDropped: all.length - filtered.length,
+    results: filtered.slice(0, max),
   };
 }
 
