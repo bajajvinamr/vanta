@@ -43,7 +43,7 @@ echo ""
 echo "Installing hooks..."
 mkdir -p "$HOOKS_DIR"
 
-for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js session-start; do
+for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js code-index-watch.js session-start; do
   src="$REPO_DIR/hooks/$hook"
   if [ -f "$src" ]; then
     cp "$src" "$HOOKS_DIR/$hook"
@@ -56,7 +56,7 @@ echo ""
 # ── Bin (knowledge resolver and other shared scripts) ───────────────────────
 echo "Installing shared bins..."
 mkdir -p "$BIN_DIR"
-for binfile in vanta-resolve.js vanta-brief.js; do
+for binfile in vanta-resolve.js vanta-brief.js vanta-index-code.js; do
   src="$REPO_DIR/bin/$binfile"
   if [ -f "$src" ]; then
     cp "$src" "$BIN_DIR/$binfile"
@@ -91,6 +91,7 @@ const REGISTRATIONS = [
   { event: 'PostToolUse',  matcher: 'Bash',       file: 'test-failure-advisor.js', timeout: 5 },
   { event: 'PostToolUse',  matcher: 'Write|Edit', file: 'stack-file-nudge.js',     timeout: 5 },
   { event: 'PostToolUse',  matcher: 'Write|Edit', file: 'plan-watcher.js',         timeout: 5 },
+  { event: 'PostToolUse',  matcher: 'Write|Edit|NotebookEdit', file: 'code-index-watch.js', timeout: 3 },
 ];
 
 let added = 0, skipped = 0, missing = 0;

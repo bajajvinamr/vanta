@@ -8,8 +8,9 @@
 //   1. invariants  — ~/.claude/rules/vinamr-invariants.md
 //   2. decisions   — ~/.gstack/projects/<slug>/decisions.md
 //   3. gotchas     — <project>/CLAUDE.md  Gotchas section
-//   4. episodes    — ~/.vanta/episodes.jsonl
-//   5. memory      — ~/.claude/projects/-Users-vinamr/memory/*.md
+//   4. code        — ~/.vanta/code-knowledge.jsonl  (Tier 2 indexer output)
+//   5. episodes    — ~/.vanta/episodes.jsonl
+//   6. memory      — ~/.claude/projects/-Users-vinamr/memory/*.md
 //
 // Filters: drop expired decisions, drop superseded decisions.
 // Ranking:  source_weight × confidence_mult × recency_mult + topic_match_bonus
@@ -25,7 +26,11 @@ const path = require('path');
 const os = require('os');
 
 // ─── Config ─────────────────────────────────────────────────────────────────
-const SOURCE_WEIGHTS = { invariant: 2.0, decision: 1.5, gotcha: 1.5, episode: 1.0, memory: 0.8 };
+// Source weights: invariants are user-curated truths (highest); decisions are
+// dated/scoped (high); gotchas + code are auto-extracted from project (medium-
+// high — code beats episode because it's ground truth in the repo); episodes
+// are session derivations (medium); memory is conversational (lowest).
+const SOURCE_WEIGHTS = { invariant: 2.0, decision: 1.5, gotcha: 1.5, code: 1.3, episode: 1.0, memory: 0.8 };
 const CONFIDENCE_MULT = { high: 1.5, medium: 1.0, low: 0.7, unknown: 1.0 };
 const TODAY = new Date().toISOString().slice(0, 10);
 
@@ -290,6 +295,34 @@ function readGotchas(cwd, topic) {
   return out;
 }
 
+// Read code-knowledge from ~/.vanta/code-knowledge.jsonl (Tier 2 indexer output).
+// Entries are project-tagged at index time, so cross-project bleed is structural,
+// not topical. Topic match runs against snippet + context + category + why.
+function readCodeKnowledge(topic, max = 20) {
+  const file = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
+  const content = readSafe(file);
+  if (!content) return [];
+  const out = [];
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let e; try { e = JSON.parse(line); } catch { continue; }
+    const haystack = [e.snippet, e.context, e.category, e.why].filter(Boolean).join(' ');
+    if (topicMatch(haystack, topic) === 0) continue;
+    out.push({
+      source: 'code',
+      // Use category as section so it groups in formatText output
+      section: e.category,
+      excerpt: e.snippet + (e.context ? `\n  context: ${e.context.slice(0, 160)}` : '') + (e.why ? `\n  why: ${e.why}` : ''),
+      date: (e.ts || '').slice(0, 10),
+      path: file,
+      sourceLocation: e.source,
+      project: canonProject(e.project) || e.project || GLOBAL_PROJECT,
+    });
+    if (out.length >= max * 3) break;
+  }
+  return out;
+}
+
 function readEpisodes(topic, max = 5) {
   const file = path.join(os.homedir(), '.vanta', 'episodes.jsonl');
   const content = readSafe(file);
@@ -391,6 +424,7 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false }) {
     ...readInvariants(topic, cwd),
     ...readDecisions(project, topic),
     ...readGotchas(cwd, topic),
+    ...readCodeKnowledge(topic),
     ...readEpisodes(topic),
     ...readMemory(topic),
   ];
@@ -428,7 +462,7 @@ function formatText(out) {
     ? `${out.count} result(s) for "${out.topic}" (active project: ${out.activeProjectCanon}):`
     : `${out.count} result(s) for "${out.topic}":`;
   const lines = [header, ''];
-  const icon = { invariant: '⚠️ ', decision: '📌', gotcha: '🔒', episode: '🧠', memory: '💭' };
+  const icon = { invariant: '⚠️ ', decision: '📌', gotcha: '🔒', code: '▤', episode: '🧠', memory: '💭' };
   const scopeIcon = { scoped: '◉', global: '○', foreign: '⊗' };
   for (const r of out.results) {
     // Provenance: show canonical project tag and scope match status.
@@ -445,6 +479,8 @@ function formatText(out) {
       ` · score=${r.score}`;
     lines.push(head);
     lines.push('  ' + r.excerpt.replace(/\n/g, '\n  '));
+    // Code entries also surface their file:line location for fast jump-to.
+    if (r.sourceLocation) lines.push(`  ↳ ${r.sourceLocation}`);
     if (r.path) lines.push(`  → ${r.path}`);
     lines.push('');
   }
