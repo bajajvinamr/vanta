@@ -1,0 +1,21 @@
+{
+  "name": "vanta",
+  "description": "Personal AI dev lifecycle harness. Three commands (/vanta, /vanta-sync, /council) that compose garrytan/gstack + gsd-build/get-shit-done + obra/superpowers into a unified workflow. Proactively managed — you focus on building.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Vinamr Bajaj",
+    "email": "bajajvinamr@gmail.com"
+  },
+  "homepage": "https://github.com/vinamr/vanta",
+  "repository": "https://github.com/vinamr/vanta",
+  "license": "MIT",
+  "keywords": [
+    "vanta",
+    "gstack",
+    "gsd",
+    "superpowers",
+    "workflow",
+    "council",
+    "adversarial-review"
+  ]
+}

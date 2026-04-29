@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# SessionStart hook for Vanta plugin.
+# Injects using-vanta/SKILL.md as additionalContext so Claude knows
+# when to invoke /vanta, /vanta-sync, /council without being asked.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+using_vanta_content=$(cat "${PLUGIN_ROOT}/skills/using-vanta/SKILL.md" 2>&1 || echo "Error reading using-vanta skill")
+
+escape_for_json() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+escaped=$(escape_for_json "$using_vanta_content")
+
+printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}' "$escaped"

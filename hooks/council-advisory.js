@@ -5,7 +5,8 @@
 // Small fixes in these files are fine — this is a nudge, not a block.
 
 const COUNCIL_TRIGGERS = [
-  { re: /\/(auth|authn|authz|authentication|authorization|oauth|jwt|token|session|credential|password)/i, reason: 'auth/credential code' },
+  { re: /\/(auth|authn|authz|authentication|authorization|oauth|jwt|token|credential|password)([\/.]|$)/i, reason: 'auth/credential code' },
+  { re: /\/sessions?([\/.]|$)/i, reason: 'auth/session code' },
   { re: /\/(payment|billing|stripe|subscription|checkout)/i, reason: 'payment/billing code' },
   { re: /\/(admin|privilege|rbac|role)\//i, reason: 'access-control code' },
   { re: /\/migrations?\//i, reason: 'database migration' },

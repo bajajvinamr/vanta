@@ -1,0 +1,14 @@
+{
+  "name": "vanta",
+  "version": "1.0.0",
+  "description": "Personal AI dev lifecycle harness built on gstack + GSD + superpowers",
+  "type": "module",
+  "license": "MIT",
+  "author": "Vinamr Bajaj <bajajvinamr@gmail.com>",
+  "homepage": "https://github.com/vinamr/vanta",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vinamr/vanta"
+  },
+  "keywords": ["vanta", "claude-code", "gstack", "gsd", "superpowers", "ai-workflow", "council"]
+}

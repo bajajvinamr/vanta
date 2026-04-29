@@ -29,7 +29,7 @@ const STACK_ADVISORIES = {
   'tailwind.config.ts':   'tailwind.config.ts changed. Verify content paths are correct.',
   'schema.prisma':        'Prisma schema changed. Run `npx prisma generate` to update the client, then `npx prisma migrate dev` for a new migration. Never skip generate after schema edits.',
   'drizzle.config.ts':    'drizzle.config.ts changed. Run `npx drizzle-kit generate` to sync schema artifacts.',
-  'drizzle.config.js':    'drizzle.config.ts changed. Run `npx drizzle-kit generate`.',
+  'drizzle.config.js':    'drizzle.config.js changed. Run `npx drizzle-kit generate`.',
   'wrangler.toml':        'wrangler.toml changed. Test with `wrangler dev` locally. Env var changes must also be set in the CF dashboard — `wrangler.toml` does not push secrets.',
   'wrangler.jsonc':       'wrangler.jsonc changed. Test with `wrangler dev`. Secrets must still be set separately.',
   'supabase/config.toml': 'Supabase config changed. Restart local dev: `supabase stop && supabase start`. Verify edge function env vars are still set.',
