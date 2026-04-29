@@ -29,6 +29,132 @@ const SOURCE_WEIGHTS = { invariant: 2.0, decision: 1.5, gotcha: 1.5, episode: 1.
 const CONFIDENCE_MULT = { high: 1.5, medium: 1.0, low: 0.7, unknown: 1.0 };
 const TODAY = new Date().toISOString().slice(0, 10);
 
+// Cross-project bleed penalty — multiplies the final score of any result whose
+// project tag does NOT match the active project (and isn't 'global'). Values <1
+// down-rank foreign results so they only appear if no active-project results
+// score higher. Both councils flagged this as the v3.4 safety prerequisite.
+const FOREIGN_PENALTY = 0.15;
+const GLOBAL_PROJECT = '__global__';
+
+// Project-keyword index. Used to tag invariants and memory entries with the
+// project they belong to. Slugs match gstack convention: <user>-<repo>.
+// Add new projects here as they grow LW-specific or pi-perception-specific
+// invariants. Untagged content defaults to GLOBAL (applies everywhere).
+const PROJECT_KEYWORDS = {
+  'little-wins':       [/\blittle[\s-]?wins?\b/i, /\bMitthu\b/i, /\bPOCSO\b/i, /\bSDQ\b/i, /\bIndian norms\b/i, /\btwo[- ]signal\b/i, /\bDPDP\b/i, /\bbajajvinamr-little-wins\b/],
+  'pi-perception':     [/\bpi[- ]?perception\b/i, /\b12[- ]dim\b/i, /\bperception intelligence\b/i, /\bbajajvinamr-pi-perception\b/],
+  'sales-agent-publisher': [/\bsales[- ]agent[- ]publisher\b/i, /\bsalestracker\b/i],
+  'founderos':         [/\bfounder ?os\b/i, /\bpaperclip\b/i],
+  'priyaa-audit':      [/\bpriyaa\b/i],
+  'vanta':             [/\bvanta[- ]run\b/i, /\bvanta[- ]council\b/i, /\bvanta[- ]sync\b/i, /\bvanta[- ]patterns\b/i, /\bvanta-resolve\b/, /\bvanta-brief\b/, /\bcouncil[- ]advisory\b/, /\bplan[- ]watcher\b/],
+};
+
+// Detect project tag for arbitrary text. Returns first matching slug, or
+// GLOBAL_PROJECT if no project keywords matched.
+function detectProject(text) {
+  if (!text) return GLOBAL_PROJECT;
+  for (const [slug, regexes] of Object.entries(PROJECT_KEYWORDS)) {
+    if (regexes.some(re => re.test(text))) return slug;
+  }
+  return GLOBAL_PROJECT;
+}
+
+// Normalize project slug — handles bare repo names ("little-wins"), gstack
+// slugs ("bajajvinamr-little-wins"), and suffixed memory slugs ("little-wins-stack")
+// to the same canonical form for matching.
+// Order: PROJECT_KEYWORDS lookup first (covers "little-wins-stack" → "little-wins"
+// and "bajajvinamr-little-wins" → "little-wins"), then fall back to user-prefix
+// stripping for unknown projects.
+function canonProject(slug) {
+  if (!slug) return null;
+  const lower = slug.toLowerCase();
+  // Check known projects first — handles all suffix and prefix variants.
+  for (const [proj, regexes] of Object.entries(PROJECT_KEYWORDS)) {
+    if (regexes.some(re => re.test(lower))) return proj;
+  }
+  // Fallback: strip GitHub-user-prefix if remainder still has a dash.
+  const m = lower.match(/^([a-z0-9]+)-(.+)$/);
+  if (m && m[2].includes('-')) return m[2];
+  return lower;
+}
+
+// Map invariant section names → stack tags that must be present in the project
+// for the invariant to apply. If the project doesn't use the stack, the
+// invariant is filtered out before it can pollute the constraint pack.
+// Sections without a stack mapping are always-applicable (e.g. "Security / Config").
+const SECTION_STACK_MAP = {
+  'prisma':            ['prisma', '@prisma/client'],
+  'pixijs v8':         ['pixi.js', '@pixi/react', 'pixijs'],
+  'next.js / cloudflare pages': ['next'],
+  'whatsapp / baileys': ['@whiskeysockets/baileys', 'baileys'],
+  'bullmq / redis':    ['bullmq', 'ioredis'],
+  'multi-llm / api clients': ['@anthropic-ai/sdk', 'openai'],
+  'supabase / deno edge functions': ['@supabase/supabase-js', '@supabase/ssr'],
+};
+
+// Detect which stacks a project uses by parsing package manifests.
+// Walks the cwd plus common subdirs (app/, web/, frontend/, packages/*,
+// services/*) since monorepos and apps-in-subdirs are common.
+// Memoized per cwd because manifests don't change across resolver calls.
+const _stackCache = new Map();
+const STACK_SUBDIRS = ['', 'app', 'web', 'frontend', 'backend', 'server', 'api', 'apps/web', 'apps/api', 'packages/web'];
+
+function _readPkg(dir) {
+  const c = readSafe(path.join(dir, 'package.json'));
+  if (!c) return [];
+  try {
+    const j = JSON.parse(c);
+    return Object.keys({ ...j.dependencies, ...j.devDependencies, ...j.peerDependencies });
+  } catch { return []; }
+}
+
+function detectStack(cwd) {
+  if (!cwd) return new Set();
+  if (_stackCache.has(cwd)) return _stackCache.get(cwd);
+  const stacks = new Set();
+  // Walk likely subdirs for package.json. Empty string means cwd itself.
+  for (const sub of STACK_SUBDIRS) {
+    const dir = sub ? path.join(cwd, sub) : cwd;
+    if (!fs.existsSync(dir)) continue;
+    for (const dep of _readPkg(dir)) stacks.add(dep.toLowerCase());
+  }
+  // Also discover any package.json under packages/ or services/ (common monorepo)
+  for (const monoDir of ['packages', 'services', 'apps']) {
+    const d = path.join(cwd, monoDir);
+    if (!fs.existsSync(d)) continue;
+    try {
+      for (const sub of fs.readdirSync(d)) {
+        for (const dep of _readPkg(path.join(d, sub))) stacks.add(dep.toLowerCase());
+      }
+    } catch { /* ignore */ }
+  }
+  // Python
+  for (const f of ['pyproject.toml', 'requirements.txt']) {
+    const c = readSafe(path.join(cwd, f));
+    if (c) c.toLowerCase().match(/^([a-z0-9._-]+)/gm)?.forEach(p => stacks.add(p));
+  }
+  // Supabase config = strong signal even without npm deps
+  for (const sub of ['', 'app', 'web']) {
+    if (fs.existsSync(path.join(cwd, sub, 'supabase', 'config.toml'))) stacks.add('@supabase/supabase-js');
+  }
+  _stackCache.set(cwd, stacks);
+  return stacks;
+}
+
+// True if the section is allowed under the active project's stack.
+// Sections not in the map are always allowed (general security/config rules etc).
+function sectionAllowedForStack(section, stacks) {
+  if (!section) return true;
+  const lower = section.toLowerCase();
+  for (const [secKey, requiredDeps] of Object.entries(SECTION_STACK_MAP)) {
+    if (lower.includes(secKey)) {
+      // Section maps to a stack — require ANY of the stack deps to be present.
+      return requiredDeps.some(dep => stacks.has(dep.toLowerCase()));
+    }
+  }
+  return true;  // Unmapped section = always allowed
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 function readSafe(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } }
 
@@ -52,16 +178,22 @@ function topicMatch(text, topic) {
 }
 
 // ─── Source readers ─────────────────────────────────────────────────────────
-function readInvariants(topic) {
+function readInvariants(topic, cwd) {
   const file = path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.md');
   const content = readSafe(file);
   if (!content) return [];
+  const stacks = detectStack(cwd);
   const out = [];
   let section = '(unsectioned)';
   let buf = null;
   const flush = () => {
     if (buf && topicMatch(buf.text, topic) > 0) {
-      out.push({ source: 'invariant', section, excerpt: buf.text.trim(), path: file, line: buf.line });
+      // Stack filter: drop invariants whose section maps to a stack the project
+      // doesn't use. E.g. "## Prisma" is dropped on a Supabase-only project.
+      // Both councils flagged this as the "Prisma on Supabase" false-positive.
+      if (cwd && !sectionAllowedForStack(section, stacks)) { buf = null; return; }
+      const project = detectProject(`${section}\n${buf.text}`);
+      out.push({ source: 'invariant', section, excerpt: buf.text.trim(), path: file, line: buf.line, project });
     }
     buf = null;
   };
@@ -126,6 +258,8 @@ function readDecisions(slug, topic) {
       expires: e.meta.expires,
       date: e.date,
       path: file,
+      // Decisions are inherently project-scoped (file lives under project dir).
+      project: canonProject(slug) || slug,
     }));
 }
 
@@ -137,11 +271,13 @@ function readGotchas(cwd, topic) {
   const after = content.split(/^##\s+Gotchas/im)[1];
   if (!after) return [];
   const section = after.split(/^##\s+/m)[0];
+  // Project = the directory we're reading from. Always project-scoped.
+  const project = canonProject(path.basename(cwd)) || path.basename(cwd);
   const out = [];
   let buf = null;
   const flush = () => {
     if (buf && topicMatch(buf, topic) > 0) {
-      out.push({ source: 'gotcha', excerpt: buf.trim(), path: file });
+      out.push({ source: 'gotcha', excerpt: buf.trim(), path: file, project });
     }
     buf = null;
   };
@@ -176,6 +312,8 @@ function readEpisodes(topic, max = 5) {
       slug: e.slug,
       outcome: e.outcome,
       path: file,
+      // Episodes always carry a slug from the originating session's cwd.
+      project: canonProject(e.slug) || e.slug || GLOBAL_PROJECT,
     });
     if (out.length >= max * 3) break;  // overshoot for ranking
   }
@@ -191,10 +329,19 @@ function readMemory(topic) {
     const file = path.join(dir, f);
     const content = readSafe(file);
     if (!content || topicMatch(content, topic) === 0) continue;
-    // Extract first paragraph after frontmatter
+    // Memory filenames follow the convention: <type>_<slug>.md
+    // e.g. project_little_wins.md → little-wins, reference_pi_perception.md → pi-perception
+    let project = GLOBAL_PROJECT;
+    const fnameMatch = f.match(/^(?:project|reference)_(.+)\.md$/);
+    if (fnameMatch) {
+      project = fnameMatch[1].replace(/_/g, '-');
+    } else {
+      // Fallback: scan content for project keywords
+      project = detectProject(content);
+    }
     const body = content.replace(/^---[\s\S]*?---\n/, '').trim();
     const firstPara = body.split(/\n\n/)[0].slice(0, 200);
-    out.push({ source: 'memory', excerpt: firstPara, path: file });
+    out.push({ source: 'memory', excerpt: firstPara, path: file, project });
   }
   return out;
 }
@@ -208,19 +355,46 @@ function scoreResult(r, topic) {
   return Math.round((sw * cm * rm + tm * 0.5) * 100) / 100;
 }
 
+// Apply project-scope penalty. activeProject = canonical slug of the project
+// the user is currently working in. Results from other projects get heavily
+// down-ranked but not eliminated — visible only when nothing scoped scores
+// higher, or when --include-foreign is set.
+function applyProjectScope(results, activeProject, includeForeign) {
+  const active = canonProject(activeProject);
+  for (const r of results) {
+    const rp = canonProject(r.project) || GLOBAL_PROJECT;
+    if (!active || rp === GLOBAL_PROJECT) {
+      r.scope_match = 'global';
+    } else if (rp === active) {
+      r.scope_match = 'scoped';
+    } else {
+      r.scope_match = 'foreign';
+      if (!includeForeign) r.score *= FOREIGN_PENALTY;
+    }
+  }
+  return results;
+}
+
 // ─── Main resolver ──────────────────────────────────────────────────────────
-function resolve({ topic, project, cwd, max = 5 }) {
+function resolve({ topic, project, cwd, max = 5, includeForeign = false }) {
   if (!topic) return { topic: null, results: [], error: 'topic required' };
   const all = [
-    ...readInvariants(topic),
+    ...readInvariants(topic, cwd),
     ...readDecisions(project, topic),
     ...readGotchas(cwd, topic),
     ...readEpisodes(topic),
     ...readMemory(topic),
   ];
   for (const r of all) r.score = scoreResult(r, topic);
+  applyProjectScope(all, project, includeForeign);
   all.sort((a, b) => b.score - a.score);
-  return { topic, project: project || null, count: all.length, results: all.slice(0, max) };
+  return {
+    topic,
+    project: project || null,
+    activeProjectCanon: canonProject(project),
+    count: all.length,
+    results: all.slice(0, max),
+  };
 }
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
@@ -239,10 +413,21 @@ function parseArgs(argv) {
 
 function formatText(out) {
   if (!out.results.length) return `No results for "${out.topic}".`;
-  const lines = [`${out.count} result(s) for "${out.topic}":`, ''];
+  const header = out.activeProjectCanon
+    ? `${out.count} result(s) for "${out.topic}" (active project: ${out.activeProjectCanon}):`
+    : `${out.count} result(s) for "${out.topic}":`;
+  const lines = [header, ''];
   const icon = { invariant: '⚠️ ', decision: '📌', gotcha: '🔒', episode: '🧠', memory: '💭' };
+  const scopeIcon = { scoped: '◉', global: '○', foreign: '⊗' };
   for (const r of out.results) {
+    // Provenance: show canonical project tag and scope match status.
+    // ⊗ = foreign (other project), ◉ = scoped to active, ○ = global.
+    const canonical = r.project && r.project !== GLOBAL_PROJECT ? canonProject(r.project) : null;
+    const provenance = canonical
+      ? ` ${scopeIcon[r.scope_match] || '·'}${canonical}`
+      : ` ○global`;
     const head = `${icon[r.source] || '·'} ${r.source.toUpperCase()}` +
+      provenance +
       (r.section ? ` (${r.section})` : '') +
       (r.confidence && r.confidence !== 'unknown' ? ` [${r.confidence}]` : '') +
       (r.date ? ` · ${r.date}` : '') +
@@ -275,6 +460,7 @@ async function main() {
     project: input.project,
     cwd: input.cwd || process.cwd(),
     max: parseInt(input.max, 10) || 5,
+    includeForeign: !!input['include-foreign'],
   });
   if (input.format === 'text') {
     process.stdout.write(formatText(out));
