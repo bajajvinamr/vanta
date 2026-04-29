@@ -1,40 +1,96 @@
 #!/usr/bin/env bash
-# Vanta local install script.
+# Vanta install script.
 # Run from the repo root: ./setup.sh
-# Installs skills and hooks into ~/.claude/, checks all three dependencies.
+# Deploys skills, hooks, Stop hook registration, and CLAUDE.md context injection.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILLS_DIR="$HOME/.claude/skills"
 HOOKS_DIR="$HOME/.claude/hooks"
+SETTINGS="$HOME/.claude/settings.json"
+CLAUDE_MD="$HOME/.claude/CLAUDE.md"
 
 echo "=== Vanta Setup ==="
 echo ""
 
-# ── Skills ──────────────────────────────────────────────────────────────────
-echo "Installing skills..."
-mkdir -p "$SKILLS_DIR/vanta"
+# ── Skills (flat — one level under ~/.claude/skills/) ──────────────────────
+# Claude Code scanner reads ~/.claude/skills/<name>/SKILL.md — one level only.
+# Repo dir → deployed name mapping:
+#   skills/vanta/    → ~/.claude/skills/vanta-run/
+#   skills/council/  → ~/.claude/skills/vanta-council/
+#   skills/vanta-sync/ → ~/.claude/skills/vanta-sync/
+# skills/using-vanta/ is NOT deployed — loaded as always-active context via CLAUDE.md @.
 
-for skill in using-vanta vanta vanta-sync council; do
-  src="$REPO_DIR/skills/$skill"
-  dst="$SKILLS_DIR/vanta/$skill"
-  rm -rf "$dst" 2>/dev/null || true
-  cp -r "$src" "$dst"
-  echo "  ✓ $skill"
-done
+echo "Installing skills..."
+mkdir -p "$SKILLS_DIR"
+
+deploy_skill() {
+  local src="$1" dst_name="$2"
+  rm -rf "$SKILLS_DIR/$dst_name"
+  cp -r "$src" "$SKILLS_DIR/$dst_name"
+  echo "  ✓ $dst_name"
+}
+
+deploy_skill "$REPO_DIR/skills/vanta"     "vanta-run"
+deploy_skill "$REPO_DIR/skills/council"   "vanta-council"
+deploy_skill "$REPO_DIR/skills/vanta-sync" "vanta-sync"
+echo ""
 
 # ── Hooks ────────────────────────────────────────────────────────────────────
 echo "Installing hooks..."
-cp "$REPO_DIR/hooks/council-advisory.js"    "$HOOKS_DIR/"
-cp "$REPO_DIR/hooks/test-failure-advisor.js" "$HOOKS_DIR/"
-cp "$REPO_DIR/hooks/stack-file-nudge.js"    "$HOOKS_DIR/"
-cp "$REPO_DIR/hooks/session-start"          "$HOOKS_DIR/vanta-session-start"
-chmod +x "$HOOKS_DIR/vanta-session-start"
-echo "  ✓ council-advisory.js"
-echo "  ✓ test-failure-advisor.js"
-echo "  ✓ stack-file-nudge.js"
-echo "  ✓ session-start → vanta-session-start"
+mkdir -p "$HOOKS_DIR"
+
+for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js; do
+  src="$REPO_DIR/hooks/$hook"
+  if [ -f "$src" ]; then
+    cp "$src" "$HOOKS_DIR/$hook"
+    echo "  ✓ $hook"
+  fi
+done
+echo ""
+
+# ── Stop hook registration in settings.json ──────────────────────────────────
+echo "Registering Stop hook..."
+
+if [ ! -f "$SETTINGS" ]; then
+  echo '{"hooks":{}}' > "$SETTINGS"
+fi
+
+# Add Stop hook if not already present
+node - "$SETTINGS" "$HOOKS_DIR/auto-sync.js" << 'JS'
+const fs = require('fs');
+const [,, settingsPath, hookPath] = process.argv;
+const s = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+s.hooks = s.hooks || {};
+const cmd = `node "${hookPath}"`;
+const already = (s.hooks.Stop || []).some(e => (e.hooks || []).some(h => h.command === cmd));
+if (!already) {
+  s.hooks.Stop = s.hooks.Stop || [];
+  s.hooks.Stop.push({ hooks: [{ type: 'command', command: cmd, timeout: 10 }] });
+  fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
+  console.log('  ✓ Stop hook registered');
+} else {
+  console.log('  ✓ Stop hook already registered');
+}
+JS
+echo ""
+
+# ── CLAUDE.md context injection ───────────────────────────────────────────────
+# using-vanta loads as always-active context, not a deployed skill.
+# The @-import must point to the repo copy so edits take effect without re-running setup.
+echo "Wiring session context..."
+
+IMPORT_LINE="@~/Projects/vanta/skills/using-vanta/SKILL.md"
+
+if [ -f "$CLAUDE_MD" ] && grep -qF "$IMPORT_LINE" "$CLAUDE_MD"; then
+  echo "  ✓ using-vanta already in CLAUDE.md"
+else
+  echo "" >> "$CLAUDE_MD"
+  echo "# Vanta session protocol" >> "$CLAUDE_MD"
+  echo "$IMPORT_LINE" >> "$CLAUDE_MD"
+  echo "  ✓ using-vanta added to ~/.claude/CLAUDE.md"
+fi
 echo ""
 
 # ── Dependency check ─────────────────────────────────────────────────────────
@@ -54,7 +110,6 @@ if [ -d "$SKILLS_DIR/gsd-new-project" ]; then
 else
   echo "  ✗ gsd-build/get-shit-done — NOT found"
   echo "      Install: /plugin install gsd@claude-plugins-official  (in Claude Code)"
-  echo "      Or: https://github.com/gsd-build/get-shit-done"
   MISSING=$((MISSING + 1))
 fi
 
@@ -68,13 +123,11 @@ fi
 
 echo ""
 if [ "$MISSING" -eq 0 ]; then
-  echo "✓ All dependencies installed. Vanta is ready."
-  echo "  Start a Claude Code session and run: /vanta"
+  echo "✓ All dependencies present. Vanta is ready."
 else
-  echo "⚠  $MISSING dependency(ies) missing."
-  echo "   Vanta degrades gracefully — install for full functionality."
+  echo "⚠  $MISSING dependency(ies) missing. Vanta degrades gracefully — routes to whatever is installed."
 fi
 
 echo ""
-echo "Note: hooks.json will be used automatically when Vanta is installed"
-echo "as a plugin. For manual installs, hooks are already wired in settings.json."
+echo "Restart Claude Code for skill changes to take effect."
+echo "Then run: /vanta"

@@ -168,6 +168,36 @@ Format: [P1]/[P2]/[P3]/[P4] + file:line + fix. Under 200 words.
 - R1 + R2: 4–7 minutes
 - Tell the user before firing: "Running council — takes a few minutes. R2 fires if P1s are found."
 
+## Step 6 — Auto-Log Decision
+
+After every council run (regardless of verdict), append to the project's decisions file.
+
+**Only log when verdict is PASS WITH CONDITIONS or BLOCK, OR when the user confirmed a specific decision.**
+Skip PASS verdicts with no action — don't pollute the log with noise.
+
+First resolve the slug and path:
+```bash
+eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+_SLUG=${SLUG:-$(basename "$PWD")}
+_DECISIONS="${GSTACK_HOME:-$HOME/.gstack}/projects/$_SLUG/decisions.md"
+mkdir -p "$(dirname "$_DECISIONS")"
+```
+
+Then append (replace placeholders with actual values from the review):
+```bash
+cat >> "$_DECISIONS" << 'ENTRY'
+
+## <DATE>: <TOPIC>
+
+**Verdict:** <PASS WITH CONDITIONS / BLOCK / PASS>
+**Decision:** <what was decided — one sentence>
+**Alternatives considered:** <what was rejected, why>
+**Council:** Codex: <verdict> · Gemini: <verdict or "unavailable">
+ENTRY
+```
+
+If the user amends the council verdict during discussion, note it: `**Vinamr:** <amendment>`
+
 ## What Council Is Not
 
 Not a rubber stamp. If both models find nothing, say: "Council clean — no P1/P2 findings. R2 skipped." Don't invent issues.

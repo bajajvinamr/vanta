@@ -11,6 +11,39 @@ If you were dispatched as a subagent to execute a specific task, skip this skill
 
 Vanta has three commands. **You manage when to run them. Never make Vinamr remember.**
 
+## Session-Start Project Brief
+
+At every session start, silently check project context and emit a brief (4 lines max):
+
+1. **GSD phase** (`.planning/` exists in cwd):
+   - Read the newest `.planning/*.md` file by mtime (cap at 5 files)
+   - Extract: current phase name, phase number/total, any blocking item
+   - PHASE.md is authoritative when sources conflict
+
+2. **gstack timeline** (`~/.gstack/projects/<slug>/timeline.jsonl` exists):
+   - Read last 3 entries; ignore entries older than 7 days
+   - Surface: last skill run + time since
+
+3. **Memory context** (`~/.claude/projects/-Users-vinamr/memory/MEMORY.md`):
+   - Already loaded. Pull active project name + last known status.
+
+4. **Recent decisions** (`~/.gstack/projects/<slug>/decisions.md` exists):
+   - Read last 2 `## <date>: <topic>` entries
+   - Surface: topic + date — one-word summary each
+
+Source priority when sources contradict: PHASE.md > timeline.jsonl > MEMORY.md
+
+**Brief format** (4 lines max, injected into first response silently):
+```
+[Vanta] Active: <project> · Phase <N>/<M>: <phase-name> · Last: <skill> <time-ago>
+Decisions: <topic> (<age>) · <topic> (<age>)   [omit line if no decisions.md or file is empty]
+Next: <suggested command based on phase state>
+Routes: ship this · review this · debug this · write tests · checkpoint · what's next · retro
+```
+
+If no `.planning/` and no timeline: omit the brief. Do not say "no context found."
+Omit the Decisions line if `~/.gstack/projects/<slug>/decisions.md` doesn't exist or has no entries.
+
 ## The Three Commands
 
 | Command | How to invoke | When |
@@ -33,15 +66,61 @@ Vanta has three commands. **You manage when to run them. Never make Vinamr remem
 - A major PR merged
 - One mention is enough — do not nag
 
-**Suggest /council before:**
-- Architecture change touching >2 services or >10 files
-- Writing to `auth/`, `payment/`, `migration/`, `middleware/` paths
-- A refactor that is hard to reverse
-- Any PR touching shared infrastructure
+**Suggest /council before (planning phase only — `council-advisory.js` hook covers file writes):**
+- Architecture decision touching >2 services or >10 files — before any code is written
+- User is *about to start* implementing auth, payment, migration, or security features (planning discussion, not file write)
+- Hard-to-reverse refactor being *planned* — suggest before first file is touched
+- Any PR touching shared infrastructure — at design time, not after
+
+Note: `council-advisory.js` fires automatically when auth/payment/migration files are written.
+Do not suggest `/council` after file writes have already started — the hook handles that.
+
+## Staleness Detection
+
+After loading the session-start brief, silently check for stale signals:
+
+```bash
+# Open PRs older than 3 days
+gh pr list --state open --json number,title,createdAt 2>/dev/null | python3 -c "
+import json,sys,datetime
+prs=json.load(sys.stdin)
+now=datetime.datetime.utcnow()
+for p in prs:
+  created=datetime.datetime.strptime(p['createdAt'][:10],'%Y-%m-%d')
+  age=(now-created).days
+  if age>=3: print(f'STALE_PR: #{p[\"number\"]} {p[\"title\"][:40]} ({age}d old)')
+" 2>/dev/null
+
+# Unsynced sessions
+[ -f ~/.vanta/sync-queue.jsonl ] && _U=$(grep -c '"synced":false' ~/.vanta/sync-queue.jsonl 2>/dev/null || echo 0) && [ "$_U" -gt 0 ] && echo "UNSYNCED: $_U sessions"
+
+# Routing misses this week
+[ -f ~/.vanta/missed-intents.jsonl ] && _WEEK=$(date -u -d '7 days ago' +%Y-%m-%dT 2>/dev/null || date -u -v-7d +%Y-%m-%dT 2>/dev/null) && [ -n "$_WEEK" ] && _M=$(awk -v w="$_WEEK" '$0>=w' ~/.vanta/missed-intents.jsonl 2>/dev/null | wc -l | tr -d ' ') && [ "$_M" -ge 3 ] && echo "ROUTING_MISSES: $_M this week"
+```
+
+Surface in the brief if signals found:
+- `STALE_PR`: "PR #N open Xd — /review or /ship?"
+- `UNSYNCED`: shown by vanta-run Resume (already handled)
+- `ROUTING_MISSES ≥ 3`: "N routing misses this week — add routes? (check ~/.vanta/missed-intents.jsonl)"
+
+One line per signal, appended after the Routes line. Cap at 2 stale signals — don't overwhelm.
 
 ## Rule
 
 After any session with substantial work, offer `/vanta-sync`. Do not wait to be asked.
+
+## Context Watchdog
+
+No token counting is possible from SKILL.md. Apply this heuristic instead:
+
+When the conversation has had many exchanges AND the user asks for a new large task:
+- Say once: "This session is getting long. Run `/compact` before we start, or I may lose track of earlier decisions."
+- If a GSD phase is active: add "Or `/gsd-resume-work` to checkpoint the phase first."
+
+When the user says something new after extended work ("now let's also…", "one more thing…"):
+- If the conversation has been going a while, offer `/compact <brief hint>` before proceeding.
+
+One mention per session is enough. Do not nag.
 
 ## Dependency Detection
 
