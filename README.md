@@ -57,9 +57,27 @@ Type a phrase. Vanta routes to the right tool across three frameworks — no sla
 | "what's next" / "next step" | GSD reads `.planning/` |
 | "am I done" / "verify this" | GSD `/gsd-verify-work` |
 | "restore context" / "where was I" | gstack `/context-restore` |
+| "execute phase" / "let's build it" | GSD `/gsd-execute-phase` |
+| "follow tdd" / "test first" | Superpowers `/tdd-workflow` |
+| **"what do I know about X" / "have we solved X before"** | **vanta cross-project recall** (rg over invariants + memory + decisions) |
 | + compound chains | "resume and ship" → /review → /qa → /ship |
 
 On miss: logs to `~/.vanta/missed-intents.jsonl` and surfaces a hint. Miss patterns become new routes.
+
+---
+
+## Cross-project recall
+
+Type **"what do I know about Supabase"** or **"have we solved this with PixiJS before"** — Vanta searches across:
+
+- `~/.claude/rules/vinamr-invariants.md` — global tool gotchas (the things that burned you)
+- `~/.claude/projects/-Users-vinamr/memory/*.md` — project context auto-saved across sessions
+- `~/.gstack/projects/*/decisions.md` — every council verdict and trade-off you made
+- `~/Projects/*/CLAUDE.md` — project-specific gotchas
+
+200ms grep. No vectors. No SaaS. The corpus is small but signal-dense — this is what a 2nd brain actually feels like.
+
+Example: ask "what do I know about PixiJS" and you get back the v8 init pattern, the Lottie sprite-sheet trick, and the exact project where it matters. All in one block.
 
 ---
 
@@ -175,3 +193,4 @@ Everything is plain markdown. No packages. No runtime. No network calls. Fails g
 | v1 | 6/10 | 3 commands, prose suggestions, no routing |
 | v2 | 7.5/10 | 13 routes, session brief, compound chains, direct invocations |
 | v3 | 9.4/10 | 25 routes, Stop hook auto-memory, decisions.md, staleness detection, codemap at bootstrap |
+| v3.1 | 9.6/10 | 33 routes incl. cross-project recall, scoped sync-queue, smarter Stop hook (decision markers), routing precedence rules |

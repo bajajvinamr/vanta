@@ -91,22 +91,33 @@ Format:
 
 If no learnings are project-specific: note "Project CLAUDE.md: no project-specific learnings this session." Do not leave this step unaddressed.
 
-**Step 6 — Mark synced sessions**
+**Step 6 — Mark synced sessions (scoped to current project)**
 
-After writing invariants, mark processed entries in sync-queue.jsonl:
+Only mark entries for the CURRENT project (cwd) — never touch other projects' unsynced entries:
 
 ```bash
 _QUEUE=~/.vanta/sync-queue.jsonl
+_CWD="$(pwd)"
 if [ -f "$_QUEUE" ]; then
   node -e "
 const fs=require('fs');
+const targetCwd='$_CWD';
 const lines=fs.readFileSync('$_QUEUE','utf8').trim().split('\n').filter(Boolean);
-const updated=lines.map(l=>{try{const e=JSON.parse(l);e.synced=true;return JSON.stringify(e);}catch{return l;}});
+let marked=0;
+const updated=lines.map(l=>{
+  try{
+    const e=JSON.parse(l);
+    if(e.synced===false && e.cwd===targetCwd){ e.synced=true; marked++; }
+    return JSON.stringify(e);
+  }catch{return l;}
+});
 fs.writeFileSync('$_QUEUE',updated.join('\n')+'\n');
+console.log(\`  ✓ sync-queue: \${marked} entries marked synced for \${targetCwd}\`);
 "
-  echo "  ✓ sync-queue marked"
 fi
 ```
+
+Critical: do NOT mark entries from other cwds — they belong to other projects and need their own /vanta-sync run.
 
 **Step 7 — Confirm**
 

@@ -92,7 +92,15 @@ When resuming:
 ## Intent Routing (pre-check before state 4)
 
 Before treating an argument as a generic intent, match it against the routing table.
-Check GSTACK_AVAILABLE and GSD_AVAILABLE before invoking. Match on keywords anywhere in the phrase.
+Check GSTACK_AVAILABLE and GSD_AVAILABLE before invoking.
+
+**Match precedence (apply in order — first hit wins):**
+1. Exact compound phrases ("resume and ship", "review and ship", "deploy to prod")
+2. Multi-word specific phrases ("write tests", "code review", "office hours")
+3. Single-word generic verbs ("ship", "deploy", "review")
+4. Keyword anywhere in phrase (fallback)
+
+Destructive actions ("deploy to prod", "land this", "force push") always require confirmation, never auto-invoke.
 
 **Single-Action Routes:**
 
@@ -125,6 +133,7 @@ Check GSTACK_AVAILABLE and GSD_AVAILABLE before invoking. Match on keywords anyw
 | "execute the plan", "run the plan", "implement the plan" | superpowers | `Skill("execute-plan")` |
 | "follow tdd", "test first", "tdd this", "test-driven" | superpowers | `Skill("tdd-workflow")` |
 | "verify before done", "check before shipping", "pre-ship check" | superpowers | `Skill("verification-before-completion")` |
+| "what do I know about", "have we solved", "how did we do", "recall", "have I seen this" | vanta | run cross-project recall (see below) |
 
 **Collision Rule:**
 - "review this" matches both gstack `/review` AND `gsd-code-review`
@@ -159,8 +168,57 @@ On confirmation: invoke each step in sequence. Confirm each step's output before
 mkdir -p ~/.vanta
 echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"phrase\":\"PHRASE\",\"fallthrough\":\"generic-intent\"}" >> ~/.vanta/missed-intents.jsonl
 ```
-2. Emit: "Routing miss — phrases I understand: ship this · review this · debug this · write tests · checkpoint · what's next · retro · investigate"
+2. Emit: "Routing miss — phrases I understand: ship this · review this · debug this · write tests · checkpoint · what's next · retro · investigate · what do I know about X"
 3. Fall through to state 4 generic intent handling.
+
+**On every successful route match:** log to routing-events.jsonl for telemetry (used by Phase 5 staleness detection):
+```bash
+echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"phrase\":\"PHRASE\",\"route\":\"ROUTE\",\"confirmed\":true,\"project\":\"$(basename $PWD)\"}" >> ~/.vanta/routing-events.jsonl
+```
+
+## Cross-Project Recall
+
+Triggered by phrases like "what do I know about X", "have we solved X", "how did we do X".
+
+Extract the topic from the phrase (the noun after "about"/"solved"/"do"). Then run:
+
+```bash
+TOPIC="$1"  # the extracted topic, e.g. "Supabase JWT" or "PixiJS"
+echo "🔎 Searching cross-project knowledge for: $TOPIC"
+echo ""
+
+# Source 1: Global invariants (highest signal)
+echo "── Invariants ──"
+rg -i --max-count 3 "$TOPIC" ~/.claude/rules/vinamr-invariants.md 2>/dev/null | head -10
+
+# Source 2: Auto-memory (project context, decisions across sessions)
+echo ""
+echo "── Memory ──"
+rg -i --max-count 2 -l "$TOPIC" ~/.claude/projects/-Users-vinamr/memory/ 2>/dev/null | while read f; do
+  echo "→ $(basename $f .md):"
+  rg -i --max-count 2 "$TOPIC" "$f" 2>/dev/null | head -3
+done
+
+# Source 3: Decision logs across all gstack projects
+echo ""
+echo "── Decisions ──"
+rg -i --max-count 2 -l "$TOPIC" ~/.gstack/projects/*/decisions.md 2>/dev/null | while read f; do
+  proj=$(basename $(dirname "$f"))
+  echo "→ $proj:"
+  rg -i --max-count 2 "$TOPIC" "$f" 2>/dev/null | head -3
+done
+
+# Source 4: Project CLAUDE.md gotchas (if rg available, scan home dir Projects)
+echo ""
+echo "── Project Gotchas ──"
+rg -i --max-count 1 -l "$TOPIC" ~/Projects/*/CLAUDE.md 2>/dev/null | while read f; do
+  proj=$(basename $(dirname "$f"))
+  echo "→ $proj:"
+  rg -i --max-count 1 "$TOPIC" "$f" 2>/dev/null | head -2
+done
+```
+
+After running, summarize: "Found N matches across [invariants/memory/decisions/gotchas]. Most relevant: [1-line summary]." If zero matches: "Nothing in local knowledge. This might be a fresh problem — worth capturing in `/vanta-sync` if you solve it."
 
 ## Intent (state 4)
 

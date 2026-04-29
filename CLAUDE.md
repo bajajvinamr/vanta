@@ -28,6 +28,9 @@ Three hooks fire automatically:
 - **`/plugin install vanta@vanta` does not work** — `known_marketplaces.json` is read at startup only. Manual deployment to `~/.claude/skills/` is the only reliable install path for this repo.
 - **Repo dir names ≠ deployed skill names**: `skills/vanta/` deploys as `vanta-run`, `skills/council/` as `vanta-council`. The deployed directory name is the invocation key — the `name:` frontmatter field is display-only.
 - **`using-vanta` is context, not a skill**: Loaded via CLAUDE.md `@./skills/using-vanta/SKILL.md` notation (always-active session context). It is NOT deployed to `~/.claude/skills/using-vanta/` and cannot be invoked via `Skill()`. Editing `~/Projects/vanta/skills/using-vanta/SKILL.md` is the only correct path.
+- **Gemini council requires trust**: Gemini CLI exits 55 in headless mode without `GEMINI_CLI_TRUST_WORKSPACE=true`. When Gemini fails, proceed as PARTIAL COUNCIL (Codex only) — run R2 with Codex reacting to its own R1 findings for false-positive check.
+- **Codex optional params break**: `approvalPolicy`/`sandbox` in `Ask-Codex` cause exit 2 arg-parse failure. Always omit optional params unless explicitly needed.
+- **sync-queue consumers must clear**: The Stop hook writes `synced: false`. vanta-sync must mark `synced: true` after processing or alerts repeat every session indefinitely.
 
 ---
 @./skills/using-vanta/SKILL.md
