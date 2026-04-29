@@ -15,9 +15,9 @@ Vanta has three commands. **You manage when to run them. Never make Vinamr remem
 
 | Command | How to invoke | When |
 |---|---|---|
-| `/vanta` | `Skill("vanta:vanta")` | New project / no `.planning/` / "start", "new project", "fresh" |
-| `/vanta-sync` | `Skill("vanta:vanta-sync")` | After "done", "shipped", "merged", "that's working" / after `/gsd-ship` |
-| `/council` | `Skill("vanta:council")` | Before arch decisions, auth/payments/security, hard-to-reverse refactor |
+| `/vanta` | `Skill("vanta-run")` | New project / no `.planning/` / "start", "new project", "fresh" |
+| `/vanta-sync` | `Skill("vanta-sync")` | After "done", "shipped", "merged", "that's working" / after `/gsd-ship` |
+| `/council` | `Skill("vanta-council")` | Before arch decisions, auth/payments/security, hard-to-reverse refactor |
 
 ## Proactive Trigger Rules
 
