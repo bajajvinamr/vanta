@@ -51,29 +51,47 @@ for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto
 done
 echo ""
 
-# ── Stop hook registration in settings.json ──────────────────────────────────
-echo "Registering Stop hook..."
+# ── Hook registration in settings.json (all 4 hooks, not just Stop) ─────────
+# Without this, council-advisory.js, test-failure-advisor.js, and stack-file-nudge.js
+# exist on disk but never fire — a fresh install would silently lose 75% of the harness.
+echo "Registering hooks in settings.json..."
 
 if [ ! -f "$SETTINGS" ]; then
   echo '{"hooks":{}}' > "$SETTINGS"
 fi
 
-# Add Stop hook if not already present
-node - "$SETTINGS" "$HOOKS_DIR/auto-sync.js" << 'JS'
+node - "$SETTINGS" "$HOOKS_DIR" << 'JS'
 const fs = require('fs');
-const [,, settingsPath, hookPath] = process.argv;
+const [,, settingsPath, hooksDir] = process.argv;
 const s = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
 s.hooks = s.hooks || {};
-const cmd = `node "${hookPath}"`;
-const already = (s.hooks.Stop || []).some(e => (e.hooks || []).some(h => h.command === cmd));
-if (!already) {
-  s.hooks.Stop = s.hooks.Stop || [];
-  s.hooks.Stop.push({ hooks: [{ type: 'command', command: cmd, timeout: 10 }] });
-  fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
-  console.log('  ✓ Stop hook registered');
-} else {
-  console.log('  ✓ Stop hook already registered');
+
+// Each registration: event -> matcher -> hook file
+// matcher uses Claude Code's tool-name pipe syntax (e.g. "Write|Edit", "Bash")
+const REGISTRATIONS = [
+  { event: 'Stop',         matcher: '',          file: 'auto-sync.js',            timeout: 10 },
+  { event: 'PreToolUse',   matcher: 'Write|Edit', file: 'council-advisory.js',     timeout: 5 },
+  { event: 'PostToolUse',  matcher: 'Bash',       file: 'test-failure-advisor.js', timeout: 5 },
+  { event: 'PostToolUse',  matcher: 'Write|Edit', file: 'stack-file-nudge.js',     timeout: 5 },
+];
+
+let added = 0, skipped = 0, missing = 0;
+for (const r of REGISTRATIONS) {
+  const hookPath = `${hooksDir}/${r.file}`;
+  if (!fs.existsSync(hookPath)) { console.log(`  - ${r.file} (missing on disk, skipped)`); missing++; continue; }
+  const cmd = `node "${hookPath}"`;
+  s.hooks[r.event] = s.hooks[r.event] || [];
+  // Look for an existing entry that already runs this command (any matcher).
+  const already = s.hooks[r.event].some(e => (e.hooks || []).some(h => h.command === cmd));
+  if (already) { skipped++; continue; }
+  const entry = { hooks: [{ type: 'command', command: cmd, timeout: r.timeout }] };
+  if (r.matcher) entry.matcher = r.matcher;
+  s.hooks[r.event].push(entry);
+  added++;
+  console.log(`  ✓ ${r.event}${r.matcher ? '['+r.matcher+']' : ''} → ${r.file}`);
 }
+fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
+console.log(`  Summary: ${added} added, ${skipped} already present, ${missing} missing`);
 JS
 echo ""
 

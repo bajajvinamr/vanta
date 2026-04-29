@@ -40,9 +40,27 @@ function topTopics(text, max = 3) {
 }
 
 // Extract a 1-line decision summary from text following a decision marker.
+// Strips markdown noise (code blocks, headers, list bullets) so we capture
+// actual prose, not skill documentation that mentions "root cause" in passing.
 function extractDecision(text) {
-  const match = text.match(/(decided to|the bug was|root cause|fixed it|the fix was)[^.\n]{10,200}/i);
-  return match ? match[0].slice(0, 200).trim() : null;
+  // Remove fenced code blocks first — they often contain marker words.
+  const cleaned = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`\n]+`/g, ' ');
+  // Match the marker and capture up to ~200 chars of prose, but stop at
+  // markdown structure (newline + #, -, *, >, |, or another code fence).
+  const re = /(decided to|the bug was|root cause(?:\s+was)?|fixed it|the fix was)([^\n]{10,300})/i;
+  const m = cleaned.match(re);
+  if (!m) return null;
+  const candidate = (m[1] + m[2])
+    .replace(/\\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[*_`#>|-]+/g, '')  // strip leftover markdown
+    .trim();
+  // Reject if it still looks like markdown skeleton or is too generic.
+  if (/^[#\-*]/.test(candidate)) return null;
+  if (candidate.length < 20) return null;
+  return candidate.slice(0, 200);
 }
 
 // Outcome detection: did this session ship/land/resolve?
@@ -84,16 +102,42 @@ process.stdin.on('end', () => {
     const slug = path.basename(cwd || process.cwd());
     const ts = new Date().toISOString();
 
+    const sid = session_id || 'unknown';
+
+    // upsertJsonl: replace existing entry with same session_id, else append.
+    // Stop hook can fire multiple times per session (compact, /clear, end) —
+    // dedup keeps the latest tool_call count + ts per session.
+    const upsertJsonl = (file, newEntry) => {
+      let lines = [];
+      if (fs.existsSync(file)) {
+        lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+      }
+      let replaced = false;
+      const updated = lines.map(l => {
+        try {
+          const e = JSON.parse(l);
+          if (e.session_id === newEntry.session_id) {
+            replaced = true;
+            return JSON.stringify(newEntry);
+          }
+          return l;
+        } catch { return l; }
+      });
+      if (!replaced) updated.push(JSON.stringify(newEntry));
+      const tmp = file + '.tmp';
+      fs.writeFileSync(tmp, updated.join('\n') + '\n');
+      fs.renameSync(tmp, file);  // atomic on POSIX
+    };
+
     // 1. Sync queue (pending learning extraction)
-    const queueEntry = JSON.stringify({
+    upsertJsonl(QUEUE_PATH, {
       ts, cwd: cwd || process.cwd(), slug, branch,
-      session_id: session_id || 'unknown',
+      session_id: sid,
       transcript_path,
       tool_calls: toolCallCount,
       decision_marker: hasDecisionMarker,
       synced: false,
     });
-    fs.appendFileSync(QUEUE_PATH, queueEntry + '\n');
 
     // 2. Episode (durable, time-aware memory) — only if decision-marker session
     if (hasDecisionMarker) {
@@ -101,14 +145,13 @@ process.stdin.on('end', () => {
       const decision = extractDecision(transcript);
       const outcome = detectOutcome(transcript);
 
-      const episode = JSON.stringify({
+      upsertJsonl(EPISODES_PATH, {
         ts, slug, branch,
         topics,           // ["jwt", "auth"] etc.
-        decision,         // 1-line decision summary
+        decision,         // 1-line decision summary (null if extractor rejected noise)
         outcome,          // "resolved" | "blocked" | "decided" | "in-progress"
-        session_id: session_id || 'unknown',
+        session_id: sid,
       });
-      fs.appendFileSync(EPISODES_PATH, episode + '\n');
     }
   } catch (_) {
     // Never block a session from ending

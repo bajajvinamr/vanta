@@ -93,7 +93,8 @@ If no learnings are project-specific: note "Project CLAUDE.md: no project-specif
 
 **Step 6 — Mark synced sessions (scoped to current project)**
 
-Only mark entries for the CURRENT project (cwd) — never touch other projects' unsynced entries:
+Only mark entries for the CURRENT project (cwd) — never touch other projects' unsynced entries.
+Uses atomic write (tmp + rename) so a concurrent Stop hook `appendFileSync` can't be silently overwritten:
 
 ```bash
 _QUEUE=~/.vanta/sync-queue.jsonl
@@ -102,7 +103,9 @@ if [ -f "$_QUEUE" ]; then
   node -e "
 const fs=require('fs');
 const targetCwd='$_CWD';
-const lines=fs.readFileSync('$_QUEUE','utf8').trim().split('\n').filter(Boolean);
+const queue='$_QUEUE';
+// Re-read at the moment of write to minimize the race window.
+const lines=fs.readFileSync(queue,'utf8').trim().split('\n').filter(Boolean);
 let marked=0;
 const updated=lines.map(l=>{
   try{
@@ -111,7 +114,9 @@ const updated=lines.map(l=>{
     return JSON.stringify(e);
   }catch{return l;}
 });
-fs.writeFileSync('$_QUEUE',updated.join('\n')+'\n');
+const tmp=queue+'.tmp';
+fs.writeFileSync(tmp,updated.join('\n')+'\n');
+fs.renameSync(tmp,queue);
 console.log(\`  ✓ sync-queue: \${marked} entries marked synced for \${targetCwd}\`);
 "
 fi

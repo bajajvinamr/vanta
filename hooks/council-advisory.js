@@ -46,24 +46,81 @@ function getProjectSlug(cwd) {
   return path.basename(cwd);
 }
 
-// Find relevant lines in a file matching any of the topics.
+// Find relevant bullets matching any of the topics. Captures multi-line bullets
+// (a `- ` line + any indented continuation until the next bullet or blank line).
 function grepTopics(content, topics, maxLines = 3) {
   if (!content) return [];
   const re = new RegExp(`\\b(${topics.join('|')})\\b`, 'i');
-  return content.split('\n').filter(l => re.test(l)).slice(0, maxLines);
+  const lines = content.split('\n');
+  const bullets = [];
+  let buf = null;
+  const flush = () => { if (buf && re.test(buf)) bullets.push(buf.trim()); buf = null; };
+  for (const l of lines) {
+    if (/^\s*-\s/.test(l)) { flush(); buf = l; }
+    else if (buf && /^\s+\S/.test(l)) { buf += '\n' + l; }
+    else { flush(); }
+  }
+  flush();
+  return bullets.slice(0, maxLines);
 }
 
-// Extract recent decision entries (## headings + first bullet) for matching topics.
+// Parse a decision entry's metadata (Expires, Supersedes, Confidence, Scope).
+function parseMeta(body) {
+  const get = re => { const m = body.match(re); return m ? m[1].trim() : null; };
+  return {
+    expires:    get(/\*\*Expires:?\*\*\s*([^\n]+)/i),
+    supersedes: get(/\*\*Supersedes:?\*\*\s*([^\n]+)/i),
+    confidence: get(/\*\*Confidence:?\*\*\s*([^\n]+)/i),
+    scope:      get(/\*\*Scope:?\*\*\s*([^\n]+)/i),
+    decision:   get(/\*\*Decision:?\*\*\s*([^\n]+)/i),
+    verdict:    get(/\*\*Verdict:?\*\*\s*([^\n]+)/i),
+  };
+}
+
+function isExpired(expiresStr, today) {
+  if (!expiresStr) return false;
+  if (/until superseded|n\/?a|none/i.test(expiresStr)) return false;
+  const m = expiresStr.match(/(\d{4}-\d{2}-\d{2})/);
+  return !!m && m[1] < today;
+}
+
+function confidenceRank(c) {
+  if (!c) return 1;
+  if (/high/i.test(c)) return 3;
+  if (/medium|med/i.test(c)) return 2;
+  return 1;
+}
+
+// Extract live (non-expired, non-superseded) decisions matching topics.
 function relevantDecisions(content, topics, maxEntries = 2) {
   if (!content) return [];
   const re = new RegExp(`\\b(${topics.join('|')})\\b`, 'i');
-  const entries = content.split(/^## /m).slice(1); // each starts with date: topic
-  const matches = entries.filter(e => re.test(e)).slice(-maxEntries); // recent matches
-  return matches.map(e => {
-    const lines = e.split('\n').filter(Boolean);
+  const today = new Date().toISOString().slice(0, 10);
+  // Split on top-level "## " headings — each entry has heading + body.
+  const raw = content.split(/^## /m).slice(1);
+  const entries = raw.map((blob, idx) => {
+    const lines = blob.split('\n');
     const heading = lines[0] || '';
-    const decision = lines.find(l => /\*\*Decision/i.test(l)) || '';
-    return `## ${heading} — ${decision.replace(/\*\*Decision:?\*\*\s*/i, '').slice(0, 100)}`;
+    const body = lines.slice(1).join('\n');
+    const dateMatch = heading.match(/(\d{4}-\d{2}-\d{2})/);
+    return { idx, heading, body, date: dateMatch ? dateMatch[1] : '0000-00-00', meta: parseMeta(body) };
+  });
+  // Drop expired and explicitly superseded entries.
+  const supersededDates = new Set(
+    entries.map(e => e.meta.supersedes && (e.meta.supersedes.match(/\d{4}-\d{2}-\d{2}/) || [])[0]).filter(Boolean)
+  );
+  const live = entries.filter(e => !isExpired(e.meta.expires, today) && !supersededDates.has(e.date));
+  // Filter by topic match.
+  const matched = live.filter(e => re.test(e.heading) || re.test(e.body));
+  // Rank: confidence desc, then recency desc.
+  matched.sort((a, b) => {
+    const cr = confidenceRank(b.meta.confidence) - confidenceRank(a.meta.confidence);
+    return cr !== 0 ? cr : b.date.localeCompare(a.date);
+  });
+  return matched.slice(0, maxEntries).map(e => {
+    const decision = (e.meta.decision || e.meta.verdict || '').slice(0, 120);
+    const conf = e.meta.confidence ? ` [${e.meta.confidence}]` : '';
+    return `## ${e.heading.trim()}${conf} — ${decision}`;
   });
 }
 
