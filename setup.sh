@@ -32,9 +32,10 @@ deploy_skill() {
   echo "  ✓ $dst_name"
 }
 
-deploy_skill "$REPO_DIR/skills/vanta"     "vanta-run"
-deploy_skill "$REPO_DIR/skills/council"   "vanta-council"
-deploy_skill "$REPO_DIR/skills/vanta-sync" "vanta-sync"
+deploy_skill "$REPO_DIR/skills/vanta"          "vanta-run"
+deploy_skill "$REPO_DIR/skills/council"        "vanta-council"
+deploy_skill "$REPO_DIR/skills/vanta-sync"     "vanta-sync"
+deploy_skill "$REPO_DIR/skills/vanta-patterns" "vanta-patterns"
 echo ""
 
 # ── Hooks ────────────────────────────────────────────────────────────────────

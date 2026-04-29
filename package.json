@@ -2,7 +2,6 @@
   "name": "vanta",
   "version": "1.0.0",
   "description": "Personal AI dev lifecycle harness built on gstack + GSD + superpowers",
-  "type": "module",
   "license": "MIT",
   "author": "Vinamr Bajaj <bajajvinamr@gmail.com>",
   "homepage": "https://github.com/vinamr/vanta",

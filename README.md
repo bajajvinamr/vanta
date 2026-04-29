@@ -85,21 +85,40 @@ Example: ask "what do I know about PixiJS" and you get back the v8 init pattern,
 
 **The problem:** Claude forgets between sessions. You forget to run `/vanta-sync`. Learnings disappear.
 
-**The fix:** A Stop hook that fires when any session ends.
+**The fix:** A Stop hook that fires when any session ends — and writes two streams.
 
 ```
 Session ends
   → auto-sync.js reads transcript
-  → if >5 tool calls (meaningful session)
-  → appends to ~/.vanta/sync-queue.jsonl
+  → if >5 tool calls OR decision marker present (root cause / fixed it / shipped / merged…)
+    → appends to ~/.vanta/sync-queue.jsonl  (pending learning extraction)
+    → if decision marker: appends episode to ~/.vanta/episodes.jsonl
+        { ts, slug, branch, topics: ["jwt","auth"], decision: "...", outcome: "resolved" }
 
 Next /vanta session
-  → detects unsynced sessions
-  → "You have 2 sessions with unsaved learnings. /vanta-sync now?"
-  → you say yes → invariants written → Gemini picks up automatically
+  → detects unsynced sessions, surfaces queue depth
+  → "What did we discuss about X last week" → searches episodes by topic + time
 ```
 
-No manual tracking. The session brief always shows the queue depth.
+Two indexes, two access patterns:
+- **invariants** index by tool ("what's the gotcha with PixiJS")
+- **episodes** index by topic + time ("what did we decide about JWT last week")
+
+Both surface in `/recall`. No vector DB. No SaaS.
+
+---
+
+## Anticipatory memory (constraint-pack hook)
+
+The moment Claude starts to write `auth/`, `payment/`, `migration/`, or any security-sensitive path, the `council-advisory.js` hook fires *before* the edit lands and injects:
+
+```
+📌 PRIOR DECISIONS — what /council already decided about this topic
+⚠️  INVARIANTS — relevant gotchas from vinamr-invariants.md
+🔒 PROJECT GOTCHAS — what this repo's CLAUDE.md says about this topic
+```
+
+Claude doesn't have to remember to check. The constraint pack is in-context at the moment of decision. Past learnings shape present action automatically.
 
 ---
 
@@ -116,10 +135,26 @@ R2: Each model reacts to the other's findings
 
 Verdict: PASS / PASS WITH CONDITIONS / BLOCK
 → auto-logged to ~/.gstack/projects/<slug>/decisions.md
+   with metadata: confidence · scope · expires · supersedes
 → surfaces in session brief next time
+→ stale decisions decay automatically (90d tactical, 365d architectural)
 ```
 
-Council findings become institutional memory. You won't relitigate the same decisions.
+Council findings become institutional memory with TTLs. Old decisions fade out. Reversals chain via `supersedes:` so you can trace why a position changed.
+
+---
+
+## Self-governance (`/vanta-patterns`)
+
+Vanta logs everything: route hits, route misses, decisions, episodes, sync events. `/vanta-patterns` turns that telemetry into a weekly health report:
+
+- Top routes invoked
+- Top missed phrases (≥2 hits = candidate for new route)
+- Repeat topics (≥2 sessions = candidate for an invariant)
+- Sync coverage %
+- Outcome distribution (resolved / blocked / decided / in-progress)
+
+If the report flags ≥2 issues, it offers to run `/council` *on the report itself* — Vanta uses its own adversarial review process to redesign itself based on observed failures. Confirmed missed phrases become new routes automatically.
 
 ---
 
@@ -127,10 +162,10 @@ Council findings become institutional memory. You won't relitigate the same deci
 
 | Hook | Trigger | What |
 |---|---|---|
-| `council-advisory.js` | PreToolUse: Write/Edit to auth/payment/migration paths | Advisory — "run /council before this?" |
+| `council-advisory.js` | PreToolUse: Write/Edit to auth/payment/migration paths | **Constraint-pack injector** — surfaces prior decisions, invariants, and project gotchas as `additionalContext` *before* the edit |
 | `test-failure-advisor.js` | PostToolUse: Bash with test failures | Hard-stop — don't ship over broken tests |
 | `stack-file-nudge.js` | PostToolUse: Write/Edit to config files | Follow-up actions for config changes |
-| `auto-sync.js` | Stop: session end | Queue session for learning extraction |
+| `auto-sync.js` | Stop: session end | Queue session + write episodic memory (topics, decision, outcome) |
 
 ---
 
@@ -142,7 +177,7 @@ cd ~/Projects/vanta && ./setup.sh
 ```
 
 **What setup does:**
-1. Deploys three skills to `~/.claude/skills/`: `vanta-run`, `vanta-council`, `vanta-sync`
+1. Deploys four skills to `~/.claude/skills/`: `vanta-run`, `vanta-council`, `vanta-sync`, `vanta-patterns`
 2. Copies hooks to `~/.claude/hooks/`
 3. Registers Stop hook in `~/.claude/settings.json`
 4. Loads `using-vanta` as always-active context via `CLAUDE.md`
@@ -157,15 +192,23 @@ See `docs/install.md` for manual setup and dependency notes.
 
 ```
 ~/.claude/skills/
-  vanta-run/        ← /vanta: state detection, 25-route table, bootstrap, codemap
-  vanta-council/    ← /council: R1+R2 adversarial loop, decisions.md auto-log
-  vanta-sync/       ← /vanta-sync: invariant extraction, multi-model propagation
+  vanta-run/        ← /vanta: state detection, 33-route table, /recall, bootstrap
+  vanta-council/    ← /council: R1+R2 adversarial loop, decisions.md w/ metadata
+  vanta-sync/       ← /vanta-sync: invariant extraction, scoped queue clearing
+  vanta-patterns/   ← /vanta-patterns: weekly self-governance retrospective
 
 ~/.claude/hooks/
-  auto-sync.js      ← Stop hook: queues sessions > 5 tool calls
-  council-advisory.js
-  test-failure-advisor.js
-  stack-file-nudge.js
+  auto-sync.js              ← Stop hook: sync-queue + episodic memory
+  council-advisory.js       ← PreToolUse: constraint-pack injection
+  test-failure-advisor.js   ← PostToolUse: hard-stop on broken tests
+  stack-file-nudge.js       ← PostToolUse: config-file follow-ups
+
+~/.vanta/
+  sync-queue.jsonl     ← pending learning extraction
+  episodes.jsonl       ← time-aware decision log
+  routing-events.jsonl ← every successful route match
+  missed-intents.jsonl ← every routing miss (becomes new routes)
+  vanta-health.md      ← weekly retrospective output
 
 ~/Projects/vanta/
   skills/           ← Source of truth (deploys to ~/.claude/skills/)
@@ -194,3 +237,4 @@ Everything is plain markdown. No packages. No runtime. No network calls. Fails g
 | v2 | 7.5/10 | 13 routes, session brief, compound chains, direct invocations |
 | v3 | 9.4/10 | 25 routes, Stop hook auto-memory, decisions.md, staleness detection, codemap at bootstrap |
 | v3.1 | 9.6/10 | 33 routes incl. cross-project recall, scoped sync-queue, smarter Stop hook (decision markers), routing precedence rules |
+| v3.2 | 9.8/10 | Constraint-pack hook (anticipatory memory at write-time), episodic memory (`episodes.jsonl`), `/vanta-patterns` self-governance loop, decision metadata (confidence/scope/expires/supersedes), Gemini trust fix |

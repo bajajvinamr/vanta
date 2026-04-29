@@ -193,10 +193,22 @@ cat >> "$_DECISIONS" << 'ENTRY'
 **Decision:** <what was decided — one sentence>
 **Alternatives considered:** <what was rejected, why>
 **Council:** Codex: <verdict> · Gemini: <verdict or "unavailable">
+**Confidence:** <high / medium / low>     ← how strong was the agreement?
+**Scope:** <project-wide / phase-only / file-cluster: list>     ← where this applies
+**Expires:** <YYYY-MM-DD or "until superseded">     ← TTL — old decisions decay
+**Supersedes:** <prior decision date or "n/a">     ← chain reversals
 ENTRY
 ```
 
+**Metadata rules:**
+- **Confidence** = `high` if both models agreed and user accepted; `medium` if one dissent; `low` if user overruled or PARTIAL council
+- **Scope** must specify the blast radius — file paths, service boundaries, or "project-wide"
+- **Expires** defaults to 90 days for tactical decisions, 365+ for architectural; never "permanent"
+- **Supersedes** when this decision reverses or replaces an earlier one — link by date
+
 If the user amends the council verdict during discussion, note it: `**Vinamr:** <amendment>`
+
+The constraint-pack hook (council-advisory.js) ranks injected decisions by recency × confidence — high-confidence recent decisions dominate; expired ones drop off automatically.
 
 ## What Council Is Not
 

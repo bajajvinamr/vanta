@@ -208,7 +208,7 @@ rg -i --max-count 2 -l "$TOPIC" ~/.gstack/projects/*/decisions.md 2>/dev/null | 
   rg -i --max-count 2 "$TOPIC" "$f" 2>/dev/null | head -3
 done
 
-# Source 4: Project CLAUDE.md gotchas (if rg available, scan home dir Projects)
+# Source 4: Project CLAUDE.md gotchas
 echo ""
 echo "── Project Gotchas ──"
 rg -i --max-count 1 -l "$TOPIC" ~/Projects/*/CLAUDE.md 2>/dev/null | while read f; do
@@ -216,9 +216,34 @@ rg -i --max-count 1 -l "$TOPIC" ~/Projects/*/CLAUDE.md 2>/dev/null | while read 
   echo "→ $proj:"
   rg -i --max-count 1 "$TOPIC" "$f" 2>/dev/null | head -2
 done
+
+# Source 5: Episodic memory (time-aware: "what did we discuss last week")
+echo ""
+echo "── Episodes ──"
+if [ -f ~/.vanta/episodes.jsonl ]; then
+  node -e "
+const fs=require('fs');
+const topic='${TOPIC}'.toLowerCase();
+const lines=fs.readFileSync(process.env.HOME+'/.vanta/episodes.jsonl','utf8').trim().split('\n').filter(Boolean);
+const matches=lines.map(l=>{try{return JSON.parse(l);}catch{return null;}}).filter(e=>e && (
+  (e.topics||[]).some(t=>t.includes(topic)) ||
+  (e.decision||'').toLowerCase().includes(topic)
+));
+const recent=matches.sort((a,b)=>b.ts.localeCompare(a.ts)).slice(0,5);
+recent.forEach(e=>{
+  const date=e.ts.slice(0,10);
+  const proj=e.slug||'?';
+  const dec=(e.decision||'').slice(0,80);
+  console.log(\`→ \${date} [\${proj}] (\${e.outcome}): \${dec}\`);
+});
+if(recent.length===0) console.log('  (no episodic matches)');
+"
+fi
 ```
 
-After running, summarize: "Found N matches across [invariants/memory/decisions/gotchas]. Most relevant: [1-line summary]." If zero matches: "Nothing in local knowledge. This might be a fresh problem — worth capturing in `/vanta-sync` if you solve it."
+After running, summarize: "Found N matches across [invariants/memory/decisions/gotchas/episodes]. Most relevant: [1-line summary]." If zero matches: "Nothing in local knowledge. This might be a fresh problem — worth capturing in `/vanta-sync` if you solve it."
+
+**Time-aware queries:** "what did we discuss last week" / "this month" / "yesterday" — if user includes a time expression, filter episodes by ISO date prefix (e.g. last 7 days = ts >= today-7).
 
 ## Intent (state 4)
 
