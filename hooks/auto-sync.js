@@ -40,15 +40,21 @@ function topTopics(text, max = 3) {
 }
 
 // Extract a 1-line decision summary from text following a decision marker.
-// Strips markdown noise (code blocks, headers, list bullets) so we capture
-// actual prose, not skill documentation that mentions "root cause" in passing.
+// Strips markdown noise (code blocks, headers, list bullets), rejects skill-
+// documentation patterns, and demands actual prose — not just a marker phrase
+// followed by a section header.
+const SKILL_DOC_PHRASES = [
+  /\bUse when\b/i, /\bDon'?t use\b/i, /\bUse if\b/i, /\bWhen to (Run|Use)\b/i,
+  /\bMultiple subsystems\b/i, /\bEach problem\b/i, /\bNo shared state\b/i,
+  /\bUse this skill\b/i, /\bThis skill (is|will|can)\b/i,
+];
+
 function extractDecision(text) {
-  // Remove fenced code blocks first — they often contain marker words.
+  // Remove fenced code blocks and inline code first — they contain marker words.
   const cleaned = text
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`[^`\n]+`/g, ' ');
-  // Match the marker and capture up to ~200 chars of prose, but stop at
-  // markdown structure (newline + #, -, *, >, |, or another code fence).
+  // Match the marker and capture up to ~300 chars of following prose.
   const re = /(decided to|the bug was|root cause(?:\s+was)?|fixed it|the fix was)([^\n]{10,300})/i;
   const m = cleaned.match(re);
   if (!m) return null;
@@ -57,9 +63,13 @@ function extractDecision(text) {
     .replace(/\s+/g, ' ')
     .replace(/[*_`#>|-]+/g, '')  // strip leftover markdown
     .trim();
-  // Reject if it still looks like markdown skeleton or is too generic.
   if (/^[#\-*]/.test(candidate)) return null;
-  if (candidate.length < 20) return null;
+  if (candidate.length < 30) return null;  // too short = noise
+  // Reject if it looks like skill documentation
+  if (SKILL_DOC_PHRASES.some(rx => rx.test(candidate))) return null;
+  // Reject if more than 2 of these doc-section words are present together
+  const docMarkers = (candidate.match(/\b(investigation|subsystem|problem|step|phase|skill)\b/gi) || []).length;
+  if (docMarkers >= 3) return null;
   return candidate.slice(0, 200);
 }
 

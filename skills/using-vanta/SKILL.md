@@ -96,12 +96,37 @@ for p in prs:
 
 # Routing misses this week
 [ -f ~/.vanta/missed-intents.jsonl ] && _WEEK=$(date -u -d '7 days ago' +%Y-%m-%dT 2>/dev/null || date -u -v-7d +%Y-%m-%dT 2>/dev/null) && [ -n "$_WEEK" ] && _M=$(awk -v w="$_WEEK" '$0>=w' ~/.vanta/missed-intents.jsonl 2>/dev/null | wc -l | tr -d ' ') && [ "$_M" -ge 3 ] && echo "ROUTING_MISSES: $_M this week"
+
+# Pending Shadow Council reviews for this project
+_SLUG=$(basename "$PWD")
+_SHADOW=~/.gstack/projects/"$_SLUG"/.shadow_pending.md
+[ -f "$_SHADOW" ] && _SC=$(grep -c '^## ' "$_SHADOW" 2>/dev/null || echo 0) && [ "$_SC" -gt 0 ] && echo "SHADOW_PENDING: $_SC plan(s) flagged but not council-reviewed"
+
+# Decisions approaching expiry (within 30 days)
+_DEC=~/.gstack/projects/"$_SLUG"/decisions.md
+[ -f "$_DEC" ] && python3 -c "
+import re, datetime, sys
+content = open('$_DEC').read()
+today = datetime.date.today()
+warn = []
+for m in re.finditer(r'## (\\d{4}-\\d{2}-\\d{2})[^\\n]*\\n([\\s\\S]*?)(?=\\n## |\\Z)', content):
+  date, body = m.group(1), m.group(2)
+  exp = re.search(r'\\*\\*Expires:?\\*\\*\\s*(\\d{4}-\\d{2}-\\d{2})', body)
+  if exp:
+    exp_date = datetime.datetime.strptime(exp.group(1), '%Y-%m-%d').date()
+    days = (exp_date - today).days
+    if 0 <= days <= 30:
+      warn.append(f'{date} expires in {days}d')
+if warn: print('STALE_DECISION: ' + '; '.join(warn[:2]))
+" 2>/dev/null
 ```
 
 Surface in the brief if signals found:
 - `STALE_PR`: "PR #N open Xd — /review or /ship?"
 - `UNSYNCED`: shown by vanta-run Resume (already handled)
 - `ROUTING_MISSES ≥ 3`: "N routing misses this week — add routes? (check ~/.vanta/missed-intents.jsonl)"
+- `SHADOW_PENDING`: "🌑 N plan(s) flagged for council review — /council before implementing"
+- `STALE_DECISION`: "Decision <date> expires in Nd — re-evaluate or extend?"
 
 One line per signal, appended after the Routes line. Cap at 2 stale signals — don't overwhelm.
 
