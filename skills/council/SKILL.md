@@ -1,6 +1,6 @@
 ---
 name: council
-description: Adversarial multi-model review. Fires Gemini and Codex in parallel, synthesizes findings. Use before high-stakes decisions — architecture changes, security-sensitive code, large refactors, anything you'd lose sleep over.
+description: Adversarial multi-model review with convergence loop. Fires Gemini and Codex in parallel, synthesizes findings, runs R2 if P1s found. Use before high-stakes decisions — architecture changes, security-sensitive code, large refactors, anything you'd lose sleep over.
 argument-hint: "[what to review — blank uses current diff/plan]"
 user-invocable: true
 model: opus
@@ -8,7 +8,7 @@ model: opus
 
 # Council — Multi-Model Adversarial Review
 
-Fire Gemini and Codex in parallel on the same problem. Each has different training data and different blind spots. Synthesize into a single verdict.
+Fire Gemini and Codex in parallel on the same problem. Each has different training data and different blind spots. Synthesize into a single verdict. If P1 findings exist after Round 1, run Round 2 where each model reacts to the other's findings — loop until convergence (no new P1s) or 2 rounds max.
 
 ## When to Run (suggest proactively)
 
@@ -28,7 +28,7 @@ GEMINI_AVAILABLE = mcp__Multi-CLI__Ask-Gemini is in the active tool list
 CODEX_AVAILABLE  = mcp__Multi-CLI__Ask-Codex is in the active tool list
 ```
 
-- **Both available** → Full council mode (Steps 1–4 below)
+- **Both available** → Full council mode (Steps 1–5 below)
 - **One available** → Single-model council. Run that one. Label output "PARTIAL COUNCIL (one model)".
 - **Neither available** → Solo adversarial review (Step 0b below). Label output "SOLO REVIEW (Multi-CLI not configured)".
 
@@ -53,11 +53,11 @@ To configure full council: add `@osanoai/multicli` as an MCP server in `~/.claud
 
 Gather: the diff or plan, relevant files (not the whole repo), the specific question. Keep under 800KB total.
 
-## Step 2 — Fire in Parallel
+## Step 2 — Round 1: Fire in Parallel
 
 Use `mcp__Multi-CLI__Ask-Gemini` and `mcp__Multi-CLI__Ask-Codex` simultaneously.
 
-**Gemini prompt template:**
+**Gemini R1 prompt template:**
 ```
 You are doing an adversarial review. Your job is to find what Claude missed.
 Focus on: large-scale consistency, architecture patterns, hidden dependencies,
@@ -73,7 +73,7 @@ Every finding needs: file, line, quoted code, specific fix.
 Under 400 words.
 ```
 
-**Codex prompt template:**
+**Codex R1 prompt template:**
 ```
 Adversarial code review. Find what Claude missed.
 Focus on: logic errors, edge cases, race conditions, security holes,
@@ -85,30 +85,78 @@ Format: [P1]/[P2]/[P3]/[P4] + file:line + quoted code + fix.
 Under 300 words.
 ```
 
-## Step 3 — Synthesize
+## Step 3 — R1 Synthesis
 
 After both respond:
-1. Findings both agree on → highest confidence, address first
-2. Findings only one raised → still important, flag clearly
-3. Contradictions → explain why they differ, give your verdict
-4. Final verdict: PASS / PASS WITH CONDITIONS / BLOCK
+1. Collect all P1 and P2 findings
+2. Note which findings both models raised (highest confidence)
+3. If **zero P1 findings** across both → skip to Step 5 (report). No R2 needed.
+4. If **any P1 findings** → proceed to Step 4 (R2 convergence loop).
 
-## Step 4 — Report
+## Step 4 — Round 2: Convergence Loop (only if R1 has P1 findings)
+
+**Goal:** Each model reacts to the other's findings. R2 is NOT a re-review of the code — it reviews R1 findings for false positives, missed context, and newly surfaced issues.
+
+Fire both models again in parallel with their peer's R1 output:
+
+**Gemini R2 prompt:**
+```
+Round 2 — Convergence Check.
+
+You reviewed [context] in Round 1. Your peer reviewer (Codex) found these issues:
+
+[Codex R1 findings — full text]
+
+For each finding:
+1. Do you agree or dispute? (one line each)
+2. Does seeing their findings reveal anything NEW you missed in R1?
+
+Only report genuinely new findings not in your R1 output.
+If nothing new: say "R2 CLEAN — no new findings."
+Format new findings as [P1]/[P2]/[P3]/[P4]. Under 200 words.
+```
+
+**Codex R2 prompt:**
+```
+Round 2 — Convergence Check.
+
+You reviewed [context] in Round 1. Your peer reviewer (Gemini) found these issues:
+
+[Gemini R1 findings — full text]
+
+For each finding:
+1. Agree or dispute? (one line each)
+2. Anything NEW you missed in R1 after seeing their review?
+
+Only report new findings not in your R1. If nothing new: "R2 CLEAN."
+Format: [P1]/[P2]/[P3]/[P4] + file:line + fix. Under 200 words.
+```
+
+**Convergence condition:** If both R2 responses are "R2 CLEAN" (no new P1s), the loop is done. If either R2 has new P1s, record them — but do NOT fire a third round. Two rounds is the cap.
+
+## Step 5 — Report
 
 ```
 ## Council Review
 
 **Verdict:** [PASS / PASS WITH CONDITIONS / BLOCK]
 **Mode:** [FULL / PARTIAL / SOLO]
+**Rounds:** [R1 only / R1 + R2 converged / R1 + R2 new findings]
 
-### Both flagged
-- [findings with 2x confidence]
+### Confirmed by both models
+- [findings with 2x confidence — highest priority]
 
-### Gemini only
+### Gemini only (R1)
 - [findings]
 
-### Codex only
+### Codex only (R1)
 - [findings]
+
+### New in R2 (if any)
+- [findings surfaced by convergence loop]
+
+### Disputed
+- [contradictions between models + my verdict on who's right]
 
 ### My synthesis
 [1-3 sentences on what matters most and why]
@@ -116,8 +164,10 @@ After both respond:
 
 ## Latency
 
-Full council takes 2-5 minutes. Tell the user before firing: "Running council — takes a few minutes."
+- R1 only: 2–3 minutes
+- R1 + R2: 4–7 minutes
+- Tell the user before firing: "Running council — takes a few minutes. R2 fires if P1s are found."
 
 ## What Council Is Not
 
-Not a rubber stamp. If both models find nothing, say: "Council clean — no P1/P2 findings." Don't invent issues.
+Not a rubber stamp. If both models find nothing, say: "Council clean — no P1/P2 findings. R2 skipped." Don't invent issues.

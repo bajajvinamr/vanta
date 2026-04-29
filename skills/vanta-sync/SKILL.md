@@ -1,6 +1,6 @@
 ---
 name: vanta-sync
-description: End-of-milestone learning extraction. Pulls what was learned this session, distills into permanent invariants, updates global config. Run after every shipped milestone.
+description: End-of-milestone learning extraction. Pulls what was learned this session, distills into permanent invariants, writes directly to vinamr-invariants.md using the Edit tool. Run after every shipped milestone.
 argument-hint: ""
 user-invocable: true
 model: sonnet
@@ -43,6 +43,7 @@ For each learning, ask: "Is this a discovered truth about a tool, library, or de
 If yes → it's an invariant. Format:
 ```
 ## [Tool/Service Name]
+
 - [One-line specific fact]. [Why it matters / what breaks if ignored].
 ```
 
@@ -51,22 +52,33 @@ Reject:
 - Project-specific state (goes in project CLAUDE.md)
 - Things that change with version upgrades
 
-**Step 3 — Update global invariants**
+**Step 3 — Write directly to global invariants**
 
-Append new invariants to `~/.claude/rules/vinamr-invariants.md`.
-- Never overwrite existing entries
-- Check for duplicates before adding
-- Group under existing headers; create new section if needed
+Read `~/.claude/rules/vinamr-invariants.md` first. Then use the **Edit tool** to append new invariants under the appropriate section header. Do not overwrite existing entries. If no appropriate section exists, add a new `## [Tool/Service Name]` header at the end of the file.
 
-**Step 4 — Propagate**
+Example of what a correct Edit looks like — appending under an existing section:
+```
+old_string: "## Prisma\n\n- `prisma migrate deploy`..."
+new_string: "## Prisma\n\n- `prisma migrate deploy`...\n- [new invariant here]."
+```
+
+Or appending a new section at the end:
+```
+old_string: "[last line of file]"
+new_string: "[last line of file]\n\n## [New Tool]\n\n- [invariant]."
+```
+
+**Do not suggest the edit. Make the edit.** The invariants file is `~/.claude/rules/vinamr-invariants.md`. Read it, find the right section, write the change.
+
+**Step 4 — Propagate to other models**
 
 `~/.gemini/GEMINI.md` already `@imports` the invariants file — Gemini picks this up automatically.
 
-For Codex: if the invariant is relevant to build tooling, package management, or API behavior, add a short note to `~/.codex/AGENTS.md` under the relevant section.
+For Codex: if the invariant is relevant to build tooling, package management, or API behavior, use the **Edit tool** to append a short note to `~/.codex/AGENTS.md` under the relevant section.
 
 **Step 5 — Update project CLAUDE.md**
 
-If the learning is project-specific, add to the project's `CLAUDE.md` under a `## Gotchas` section.
+If the learning is project-specific, use the **Edit tool** to add it to the project's `CLAUDE.md` under a `## Gotchas` section (create the section if absent).
 
 **Step 6 — Confirm**
 
@@ -75,9 +87,9 @@ Report back:
 Vanta-Sync complete.
 
 Added [N] invariants to ~/.claude/rules/vinamr-invariants.md:
-- [list them]
+- [list them with the section they went under]
 
-Project CLAUDE.md updated: [yes/no]
+Project CLAUDE.md updated: [yes/no — if yes, what was added]
 Gemini picks this up automatically next session.
 ```
 
