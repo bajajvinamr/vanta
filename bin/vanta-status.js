@@ -103,16 +103,25 @@ function readQueues() {
     { name: 'sync-queue',     file: path.join(VANTA_DIR, 'sync-queue.jsonl'),     special: 'unsynced' },
     { name: 'episodes',       file: path.join(VANTA_DIR, 'episodes.jsonl'),       special: null      },
     { name: 'missed-intents', file: path.join(VANTA_DIR, 'missed-intents.jsonl'), special: null      },
+    // Tier 6 #16: surface staged invariants pending review so they don't
+    // pile up silently. Counts <!-- vanta-sync: --> blocks.
+    { name: 'staging-invariants', file: path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.staging.md'), special: 'staging' },
   ];
   const out = [];
   for (const q of items) {
     const st = safeStat(q.file);
     if (!st) { out.push({ name: q.name, present: false }); continue; }
     let unsynced = null;
+    let stagingCount = null;
     if (q.special === 'unsynced') {
       try {
         const raw = fs.readFileSync(q.file, 'utf8');
         unsynced = (raw.match(/"synced"\s*:\s*false/g) || []).length;
+      } catch {}
+    } else if (q.special === 'staging') {
+      try {
+        const raw = fs.readFileSync(q.file, 'utf8');
+        stagingCount = (raw.match(/<!-- vanta-sync:/g) || []).length;
       } catch {}
     }
     out.push({
@@ -122,6 +131,7 @@ function readQueues() {
       bytes: st.size,
       mtime: st.mtimeMs,
       unsynced,
+      stagingCount,
     });
   }
   return out;
@@ -250,6 +260,7 @@ function renderText() {
     const extras = [];
     if (q.unsynced != null && q.unsynced > 0) extras.push(`${q.unsynced} unsynced`);
     if (q.unsynced === 0) extras.push('all synced');
+    if (q.stagingCount != null && q.stagingCount > 0) extras.push(`${q.stagingCount} pending review`);
     console.log('  ' +
       q.name.padEnd(16) + '  ' +
       String(q.lines).padStart(4) + ' lines  ' +
@@ -312,6 +323,8 @@ function renderText() {
   const sugg = [];
   const unsynced = (queues.find(q => q.name === 'sync-queue') || {}).unsynced || 0;
   if (unsynced > 0)        sugg.push(`/vanta-sync to clear ${unsynced} unsynced session(s)`);
+  const staging = (queues.find(q => q.name === 'staging-invariants') || {}).stagingCount || 0;
+  if (staging > 0)         sugg.push(`vanta-extract-score list-staging — review ${staging} pending invariant(s)`);
   if (locks.some(l => !l.alive)) sugg.push('rm ~/.vanta/knowledge/*.lock (stale, owning pid is dead)');
   const dormantUnknown = shards.filter(s =>
     (Date.now() - s.mtime) > 30 * 86400_000 && !['little-wins','pi-perception','sales-agent-publisher','founderos','priyaa-audit','vanta'].includes(s.slug)

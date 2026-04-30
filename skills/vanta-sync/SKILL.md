@@ -52,23 +52,50 @@ Reject:
 - Project-specific state (goes in project CLAUDE.md)
 - Things that change with version upgrades
 
-**Step 3 — Write directly to global invariants**
+**Step 3 — Score each candidate, then write (Tier 6 #16)**
 
-Read `~/.claude/rules/vinamr-invariants.md` first. Then use the **Edit tool** to append new invariants under the appropriate section header. Do not overwrite existing entries. If no appropriate section exists, add a new `## [Tool/Service Name]` header at the end of the file.
+Each distilled invariant gets routed through `vanta-extract-score` BEFORE landing in the global file. This prevents wrong / duplicate / project-state entries from polluting `vinamr-invariants.md` forever, with no review gate.
 
-Example of what a correct Edit looks like — appending under an existing section:
-```
-old_string: "## Prisma\n\n- `prisma migrate deploy`..."
-new_string: "## Prisma\n\n- `prisma migrate deploy`...\n- [new invariant here]."
-```
+For every candidate (in order):
 
-Or appending a new section at the end:
-```
-old_string: "[last line of file]"
-new_string: "[last line of file]\n\n## [New Tool]\n\n- [invariant]."
+```bash
+node ~/.claude/bin/vanta-extract-score.js '<candidate text>' --existing=$HOME/.claude/rules/vinamr-invariants.md
 ```
 
-**Do not suggest the edit. Make the edit.** The invariants file is `~/.claude/rules/vinamr-invariants.md`. Read it, find the right section, write the change.
+The output is a JSON object:
+```json
+{ "route": "auto|staging|update-in-place|discard",
+  "score": 0.84,
+  "reasons": [...],
+  "dup": null }
+```
+
+Apply the route:
+
+| `route` | What you do |
+|---|---|
+| `auto` (score ≥ 0.65) | Use the **Edit tool** to append under the appropriate `## Section` header in `~/.claude/rules/vinamr-invariants.md`, **prepended with an audit comment** (see below) |
+| `staging` (0.40–0.65) | Use the **Edit tool** to append to `~/.claude/rules/vinamr-invariants.staging.md` (also with audit comment). Tell the user to review later via `vanta-extract-score list-staging` |
+| `update-in-place` (near-dup ≥ 0.8) | Read the existing matched entry from `dup` field. Either skip (already covered) or use the **Edit tool** to refine the existing line — never append a 4th rephrasing |
+| `discard` (< 0.40 or skill-doc reject) | Skip silently. Log to `~/.vanta/hook.log` if VANTA_DEBUG is set |
+
+**Audit comment** — every auto/staging write MUST be prefixed with:
+```
+<!-- vanta-sync: session=<id> ts=<ISO> confidence=<score> -->
+- <invariant text>
+```
+
+This lets `git blame` trace mistakes back to the originating session and confidence at write time. Use the auditPrefix() helper from the module:
+
+```bash
+node -e "console.log(require('vanta-extract-score').auditPrefix({ sessionId: '<sid>', confidence: 0.84 }))"
+```
+
+Or hard-code the format if calling from prose: `<!-- vanta-sync: session=<sid> ts=<iso> confidence=<n.nn> -->`.
+
+If no appropriate section exists, add a new `## [Tool/Service Name]` header at the end of the file with the audit comment + invariant directly underneath.
+
+**Do not suggest the edit. Make the edit.** Read the file, find the right section, score the candidate, write the change with audit comment.
 
 **Step 4 — Propagate to other models**
 
