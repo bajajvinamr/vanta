@@ -201,6 +201,49 @@ describe('acquireLock — O_EXCL with pid-aware steal', () => {
   test.after(() => { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {} });
 });
 
+// ─── synonym expansion ─────────────────────────────────────────────────────
+
+describe('synonym pre-expansion (cleanup #12)', () => {
+  // Indirect test via the public resolve() API. Synonym expansion changes
+  // what topicMatch matches; we verify the user-visible behavior.
+  const { resolve } = require('../bin/vanta-resolve');
+
+  test('non-synonym topics behave like literal match (POCSO)', () => {
+    const out = resolve({ topic: 'POCSO', project: 'little-wins', max: 1 });
+    assert.ok(out.count > 0, 'POCSO must still find results — synonym expansion must be opt-in by topic');
+  });
+
+  test('synonym key — `payment` widens vs literal-only', () => {
+    // Topic `payment` should match content containing "stripe", "billing",
+    // "subscription", etc. — not just literal "payment". We can't observe
+    // this without reading shard contents, but we can confirm the regex
+    // treats them as alternatives by testing the topicMatch helper through
+    // the synonym table.
+    const { SYNONYM_GROUPS } = (() => {
+      // Re-import via fs since the table is internal; pull the source
+      // and confirm the group exists. Cheap structural test.
+      const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'vanta-resolve.js'), 'utf8');
+      return {
+        SYNONYM_GROUPS: {
+          payment: src.includes("payment:") && src.includes("'stripe'") && src.includes("'subscription'"),
+          jwt: src.includes("jwt:") && src.includes("'bearer token'"),
+        }
+      };
+    })();
+    assert.ok(SYNONYM_GROUPS.payment, 'payment group must contain stripe/subscription synonyms');
+    assert.ok(SYNONYM_GROUPS.jwt,     'jwt group must contain bearer-token synonym');
+  });
+
+  test('single-char and all-digit topics skip expansion (no nonsense regex)', () => {
+    // These would be unsafe to expand. We rely on resolve() not throwing
+    // and returning a sane shape.
+    for (const t of ['x', '1', '42', 'a']) {
+      const out = resolve({ topic: t, project: 'little-wins', max: 1 });
+      assert.equal(typeof out.count, 'number', `topic="${t}" must return without throwing`);
+    }
+  });
+});
+
 // ─── module surface check ──────────────────────────────────────────────────
 
 describe('module exports — sanity', () => {

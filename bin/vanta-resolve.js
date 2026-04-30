@@ -130,12 +130,73 @@ function recencyMult(dateStr) {
   return 0.3;
 }
 
+// Cleanup #12: synonym pre-expansion. When a user queries --topic JWT, also
+// match `bearer token`, `access token`, etc. Widens recall without requiring
+// the exact term to appear in source. Conservative table — false positives
+// would silently inject foreign material via the council-advisory hook.
+//
+// Rules:
+//   - Disjoint groups only (no transitive expansion). Joining "token" into
+//     both jwt + secret would explode the regex into nonsense.
+//   - Anchor each synonym at \b boundaries.
+//   - Synonyms support spaces / hyphens via [\s-]+ tolerance.
+//   - Skip expansion for single-char or all-digit topics.
+//
+// Add new groups when a query repeatedly returns 0 results despite the
+// content existing under a different vocabulary (visible via --analyze).
+const SYNONYM_GROUPS = {
+  jwt:       ['JWT', 'JWTs', 'JSON web token', 'bearer token', 'access token', 'refresh token', 'auth token', 'id token'],
+  session:   ['session', 'session id', 'sessionid', 'session token', 'session cookie', 'JSESSIONID'],
+  auth:      ['auth', 'authn', 'authz', 'authentication', 'authorization'],
+  payment:   ['payment', 'billing', 'charge', 'invoice', 'subscription', 'stripe', 'checkout'],
+  migration: ['migration', 'schema migration', 'database migration', 'migrate', 'prisma migrate', 'drizzle-kit', 'alembic'],
+  cors:      ['CORS', 'cross-origin', 'access-control-allow', 'access-control-request'],
+  csp:       ['CSP', 'content-security-policy', 'content security policy', 'connect-src'],
+  pii:       ['PII', 'personal data', 'personal information', 'privacy', 'GDPR', 'DPDP'],
+  webhook:   ['webhook', 'webhooks', 'callback url', 'event endpoint'],
+  secret:    ['secret', 'API key', 'credential', 'private key', 'env var', 'environment variable'],
+};
+
+function expandTopic(topic) {
+  if (!topic) return [];
+  const lower = String(topic).toLowerCase().trim();
+  if (lower.length < 2) return [topic];
+  if (/^\d+$/.test(lower)) return [topic];
+  // Direct hit on a synonym group key
+  if (SYNONYM_GROUPS[lower]) return SYNONYM_GROUPS[lower];
+  // Reverse lookup — topic is one of the synonyms inside a group
+  for (const [, synonyms] of Object.entries(SYNONYM_GROUPS)) {
+    if (synonyms.some(s => s.toLowerCase() === lower)) return synonyms;
+  }
+  // No synonym match — return the topic itself for normal matching
+  return [topic];
+}
+
+// Cache compiled regex per expanded topic. Resolver reads many sources per
+// call — recompiling the same regex per source is wasted work.
+const _topicRegexCache = new Map();
+
+function _topicRegex(topic) {
+  if (_topicRegexCache.has(topic)) return _topicRegexCache.get(topic);
+  const terms = expandTopic(topic);
+  const escaped = terms.map(t =>
+    // Allow whitespace / hyphen variation between words: "bearer token" matches
+    // "bearer-token", "bearer  token", "Bearer Token". Each space in a synonym
+    // becomes [\s-]+ in the regex.
+    t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '[\\s-]+')
+  );
+  // \b only works for ASCII word chars — synonyms with phrases need (?:^|[\s.,;:!?]) boundaries.
+  const alternation = escaped.join('|');
+  const re = new RegExp(`(?:^|[^\\w-])(?:${alternation})s?(?=[^\\w-]|$)`, 'gi');
+  _topicRegexCache.set(topic, re);
+  return re;
+}
+
 function topicMatch(text, topic) {
   if (!text || !topic) return 0;
-  // Allow optional trailing 's' (plurals: JWT/JWTs, hook/hooks, token/tokens).
-  // Word-boundary on the left, optional 's' before right boundary.
-  const escaped = topic.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`\\b${escaped}s?\\b`, 'gi');
+  // Reset lastIndex on global regex (cached) before each match call.
+  const re = _topicRegex(topic);
+  re.lastIndex = 0;
   const matches = (text.match(re) || []).length;
   return matches > 0 ? Math.min(matches, 5) : 0;
 }
