@@ -19,22 +19,52 @@ Suggest without being asked when:
 - After implementing something you're not confident about
 - Before any PR that touches shared infrastructure
 
-## Step 0 — Capability Check
+## Step 0 — Capability Check + Pre-Flight Ping
 
-Before firing, check what's available:
+**Tier 6 #17 hardening.** Don't burn a full review on a model that won't respond. Two-stage gate:
 
+### 0a. Tool list check
 ```
 GEMINI_AVAILABLE = mcp__Multi-CLI__Ask-Gemini is in the active tool list
 CODEX_AVAILABLE  = mcp__Multi-CLI__Ask-Codex is in the active tool list
 ```
 
-- **Both available** → Full council mode (Steps 1–5 below)
-- **One available** → Single-model council. Run that one. Label output "PARTIAL COUNCIL (one model)".
-- **Neither available** → Solo adversarial review (Step 0b below). Label output "SOLO REVIEW (Multi-CLI not configured)".
+If neither tool is exposed → skip directly to **Step 0c — Solo Review**.
 
-### Step 0b — Solo Adversarial Review (fallback)
+### 0b. Pre-flight ping (mandatory before R1)
+For each available model, fire a tiny sanity prompt FIRST. Use the cheapest-tier model and a one-token expected response:
 
-When Multi-CLI is absent, Claude performs a structured self-review:
+- Codex ping: `mcp__Multi-CLI__Ask-Codex` with model=`gpt-5.4-mini` and prompt `Reply with the single word: ready.`
+- Gemini ping: `mcp__Multi-CLI__Ask-Gemini` with model=`gemini-2.5-flash` and prompt `Reply with the single word: ready.`
+
+Fire both pings IN PARALLEL (one tool message with two calls). Wait for both to settle.
+
+Classify each model based on ping outcome:
+
+| Outcome | Classification | Action |
+|---|---|---|
+| Returns "ready" or similar | **HEALTHY** — fire R1 with chosen review-tier model |
+| Returns 429 / capacity-exhausted / 503 / 502 | **TRANSIENT** — retry ONCE with 5s backoff; if still failing → mark UNAVAILABLE |
+| Returns auth/trust/exit-code-55 errors | **AUTH-BROKEN** — mark UNAVAILABLE, surface specific reason |
+| Returns argument-parse error (exit 2) | **INVOCATION-BROKEN** — check this skill for stale param usage; mark UNAVAILABLE |
+| Tool times out (>20s) | **HUNG** — mark UNAVAILABLE |
+
+Retry policy — 1 retry with 5s backoff applies ONLY to TRANSIENT classification. NEVER retry auth, invocation, or tool-list errors — they won't fix themselves in 5 seconds.
+
+### 0c. Cascading fallback
+
+```
+HEALTHY × 2     → FULL council  (Steps 1–5)
+HEALTHY × 1     → PARTIAL council, run the healthy one + R2 self-reaction
+                  (model reads its own R1 findings to false-positive-check)
+HEALTHY × 0     → SOLO REVIEW (Step 0d)
+```
+
+In every case, emit the `model_health` block in the final report (Step 5). The user MUST see which models were actually consulted vs which were skipped — silent degradation is the failure mode this section exists to prevent.
+
+### Step 0d — Solo Adversarial Review (fallback)
+
+When no remote model is healthy, Claude performs a structured self-review:
 
 1. Assume the role of a skeptical senior engineer who did not write this code
 2. Re-read the diff/plan/files with fresh eyes
@@ -46,12 +76,22 @@ When Multi-CLI is absent, Claude performs a structured self-review:
    - Logic errors that pass the happy path but fail on real data
 4. Report findings in the standard format below
 5. Be honest: if you find nothing, say "SOLO REVIEW — no P1/P2 findings."
+6. Label output explicitly: `Mode: SOLO (reason: <ping outcomes>)` so downstream consumers (decisions.md, vanta-resolve quality stats) don't conflate self-review with multi-model agreement.
 
 To configure full council: add `@osanoai/multicli` as an MCP server in `~/.claude/settings.json`.
 
 ## Step 1 — Pack Context
 
 Gather: the diff or plan, relevant files (not the whole repo), the specific question. Keep under 800KB total.
+
+### Model selection — primary + fallback chains (Tier 6 #17)
+
+For an architectural review (default), prefer the powerful tier. If the primary model is capacity-exhausted (TRANSIENT after retry), drop to the next in chain BEFORE marking the slot UNAVAILABLE. Document the fallback used in the model_health block.
+
+**Codex chain:** `gpt-5.4` (powerful) → `gpt-5.3-codex` (balanced) → `gpt-5.2` (balanced)
+**Gemini chain:** `gemini-3.1-pro-preview` (powerful) → `gemini-3-pro-preview` (powerful) → `gemini-2.5-pro` (balanced default)
+
+For trivial reviews where balanced is enough, start at the balanced tier directly.
 
 ## Step 2 — Round 1: Fire in Parallel
 
@@ -143,6 +183,10 @@ Format: [P1]/[P2]/[P3]/[P4] + file:line + fix. Under 200 words.
 **Mode:** [FULL / PARTIAL / SOLO]
 **Rounds:** [R1 only / R1 + R2 converged / R1 + R2 new findings]
 
+### Model health (Tier 6 #17 — mandatory)
+- Gemini: [HEALTHY (model=gemini-3.1-pro-preview, R1=Xs, R2=Ys) | UNAVAILABLE (reason)]
+- Codex:  [HEALTHY (model=gpt-5.4, R1=Xs, R2=Ys) | UNAVAILABLE (reason)]
+
 ### Confirmed by both models
 - [findings with 2x confidence — highest priority]
 
@@ -161,6 +205,8 @@ Format: [P1]/[P2]/[P3]/[P4] + file:line + fix. Under 200 words.
 ### My synthesis
 [1-3 sentences on what matters most and why]
 ```
+
+The **Model health** block is non-negotiable. Without it, the user can't tell whether a "PASS" verdict came from one model or two — and silent single-model PASS is the false-confidence failure mode Tier 6 #17 was designed to eliminate.
 
 ## Latency
 
