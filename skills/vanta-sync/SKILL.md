@@ -124,7 +124,51 @@ fi
 
 Critical: do NOT mark entries from other cwds — they belong to other projects and need their own /vanta-sync run.
 
-**Step 7 — Confirm**
+**Step 7 — Invariant→Skill Promotion (write-a-skill pattern)**
+
+After writing new invariants in Step 3, check whether any section has accumulated enough density to deserve a dedicated skill. Threshold:
+- **≥4 distinct invariants in one `## Section`**
+- All describing the **same tool / framework / library**
+- Most written within the last **90 days** (recent + active surface)
+
+If a section qualifies, propose promotion:
+
+> `## PixiJS v8` has 5 invariants accumulated. Dense enough to promote to a dedicated skill (`pixijs-v8-patterns`). Promote? [y/n]
+> 
+> Trade-off: the section stays in invariants.md (other models read it via @import). The skill adds usage examples + decision tree + pitfalls. Claude pulls it via `Skill("<name>-patterns")` instead of scanning the 3000-line invariants file.
+
+If yes, apply the **write-a-skill discipline** when generating the SKILL.md:
+
+1. **Frontmatter** — required fields, terse:
+   ```yaml
+   ---
+   name: <tool>-patterns
+   description: <one sentence — what the skill is for, when Claude should invoke>
+   argument-hint: "[optional context]"
+   user-invocable: false   # internal — Claude invokes when working with this tool
+   model: sonnet
+   ---
+   ```
+2. **Progressive disclosure** — 4 sections, scaling with depth:
+   - **TL;DR** (1-2 lines): what the skill captures, when it applies
+   - **Invariants** (the accumulated facts, formatted as a table or list with `why-it-matters`)
+   - **Usage patterns** (one concrete code example per invariant, drawn from project CLAUDE.md or session transcripts where the invariant was learned)
+   - **Pitfalls / when this skill DOESN'T apply** (off-label edge cases)
+3. **Bundled resources** — if the tool has migration scripts, config templates, or copy-paste snippets that recur, drop them in `~/.claude/skills/<name>-patterns/resources/`. Keep the SKILL.md itself short; resources are loaded on demand.
+4. **Cross-link** the invariants file: leave the section in place but add a header note:
+   ```
+   ## PixiJS v8
+   → Detailed patterns + examples: `Skill("pixijs-v8-patterns")`
+   - <existing invariants...>
+   ```
+5. **Deploy flatly** — `~/.claude/skills/<name>-patterns/SKILL.md` (one level deep — flat-skill invariant). Never nest under namespaces.
+6. **Append to vanta-sync confirm output** that a new skill was created so the user knows to restart Claude Code for skill discovery.
+
+**Why this exists**: ad-hoc invariant accumulation works until a section grows past ~5 entries — at that point reading the section costs more context than reading a focused skill. Promotion is the moment to refactor knowledge into a structured surface. Without this step, dense sections keep accumulating noise; with it, they crystallize into reusable skills.
+
+**Upstream provenance**: structural discipline (frontmatter, progressive disclosure, bundled resources) adapted from mattpocock/skills/write-a-skill (MIT) and anthropics/skills/skill-creator (Apache-2.0). Promotion-by-density threshold and the cross-link pattern are Vanta-original.
+
+**Step 8 — Confirm**
 
 Report back:
 ```
@@ -134,6 +178,7 @@ Added [N] invariants to ~/.claude/rules/vinamr-invariants.md:
 - [list them with the section they went under]
 
 Project CLAUDE.md updated: [yes/no — if yes, what was added]
+Skill promoted: [yes/no — if yes, name + path]   # new
 Gemini picks this up automatically next session.
 ```
 
