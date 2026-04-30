@@ -43,7 +43,7 @@ echo ""
 echo "Installing hooks..."
 mkdir -p "$HOOKS_DIR"
 
-for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js code-index-watch.js git-guardrails.js session-start; do
+for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js code-index-watch.js git-guardrails.js prompt-context.js tool-observer.js session-start; do
   src="$REPO_DIR/hooks/$hook"
   if [ -f "$src" ]; then
     cp "$src" "$HOOKS_DIR/$hook"
@@ -56,7 +56,7 @@ echo ""
 # ── Bin (knowledge resolver and other shared scripts) ───────────────────────
 echo "Installing shared bins..."
 mkdir -p "$BIN_DIR"
-for binfile in vanta-projects.js vanta-log.js vanta-resolve.js vanta-brief.js vanta-index-code.js vanta-status.js vanta-prune.js vanta-council-health.js vanta-council-feedback.js vanta-extract-score.js vanta-council-run.js; do
+for binfile in vanta-projects.js vanta-log.js vanta-resolve.js vanta-brief.js vanta-index-code.js vanta-status.js vanta-prune.js vanta-council-health.js vanta-council-feedback.js vanta-extract-score.js vanta-council-run.js vanta-runtime-state.js vanta-prompt-brief.js vanta-interaction-log.js; do
   src="$REPO_DIR/bin/$binfile"
   if [ -f "$src" ]; then
     cp "$src" "$BIN_DIR/$binfile"
@@ -69,31 +69,47 @@ echo ""
 # ── Hook registration in settings.json (all 4 hooks, not just Stop) ─────────
 # Without this, council-advisory.js, test-failure-advisor.js, and stack-file-nudge.js
 # exist on disk but never fire — a fresh install would silently lose 75% of the harness.
+echo "Regenerating hooks/hooks.json from manifest.json (single source of truth)..."
+node - "$REPO_DIR/hooks/manifest.json" "$REPO_DIR/hooks/hooks.json" << 'JS'
+const fs = require('fs');
+const [,, manifestPath, outPath] = process.argv;
+const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+const out = { hooks: {} };
+for (const r of m.registrations) {
+  out.hooks[r.event] = out.hooks[r.event] || [];
+  // Group by matcher within the same event so plugin install sees one entry
+  // per matcher (Claude Code merges these correctly).
+  let bucket = out.hooks[r.event].find(e => (e.matcher || '') === (r.matcher || ''));
+  if (!bucket) {
+    bucket = r.matcher ? { matcher: r.matcher, hooks: [] } : { hooks: [] };
+    out.hooks[r.event].push(bucket);
+  }
+  const cmd = r.runtime === 'bash'
+    ? `"\${CLAUDE_PLUGIN_ROOT}/hooks/${r.file}"`
+    : `node "\${CLAUDE_PLUGIN_ROOT}/hooks/${r.file}"`;
+  bucket.hooks.push({ type: 'command', command: cmd, timeout: r.timeout });
+}
+fs.writeFileSync(outPath, JSON.stringify(out, null, 2) + '\n');
+console.log('  ✓ hooks/hooks.json regenerated');
+JS
+echo ""
+
 echo "Registering hooks in settings.json..."
 
 if [ ! -f "$SETTINGS" ]; then
   echo '{"hooks":{}}' > "$SETTINGS"
 fi
 
-node - "$SETTINGS" "$HOOKS_DIR" << 'JS'
+node - "$SETTINGS" "$HOOKS_DIR" "$REPO_DIR/hooks/manifest.json" << 'JS'
 const fs = require('fs');
-const [,, settingsPath, hooksDir] = process.argv;
+const [,, settingsPath, hooksDir, manifestPath] = process.argv;
 const s = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
 s.hooks = s.hooks || {};
 
-// Each registration: event -> matcher -> hook file
-// matcher uses Claude Code's tool-name pipe syntax (e.g. "Write|Edit", "Bash")
-// SessionStart hook is bash, not node. Pass full path; setup detects by extension.
-const REGISTRATIONS = [
-  { event: 'SessionStart', matcher: '',          file: 'session-start',           timeout: 5,  runtime: 'bash' },
-  { event: 'Stop',         matcher: '',          file: 'auto-sync.js',            timeout: 10 },
-  { event: 'PreToolUse',   matcher: 'Write|Edit', file: 'council-advisory.js',     timeout: 5 },
-  { event: 'PostToolUse',  matcher: 'Bash',       file: 'test-failure-advisor.js', timeout: 5 },
-  { event: 'PostToolUse',  matcher: 'Write|Edit', file: 'stack-file-nudge.js',     timeout: 5 },
-  { event: 'PostToolUse',  matcher: 'Write|Edit', file: 'plan-watcher.js',         timeout: 5 },
-  { event: 'PostToolUse',  matcher: 'Write|Edit|NotebookEdit', file: 'code-index-watch.js', timeout: 3 },
-  { event: 'PreToolUse',   matcher: 'Bash',       file: 'git-guardrails.js',       timeout: 5 },
-];
+// Single source of truth: hooks/manifest.json — Codex council P2 fix.
+// Drift between this script + hooks/hooks.json + README was the failure
+// mode. All three now point to the manifest.
+const REGISTRATIONS = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).registrations;
 
 let added = 0, skipped = 0, missing = 0;
 for (const r of REGISTRATIONS) {
