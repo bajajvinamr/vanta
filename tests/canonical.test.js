@@ -244,6 +244,65 @@ describe('synonym pre-expansion (cleanup #12)', () => {
   });
 });
 
+// ─── git-guardrails (cleanup integration) ─────────────────────────────────
+
+describe('git-guardrails — destructive command tiering', () => {
+  const { checkCommand } = require('../hooks/git-guardrails');
+
+  test('HARD BLOCK: force-push to main/master', () => {
+    assert.equal(checkCommand('git push --force origin main').action, 'block');
+    assert.equal(checkCommand('git push --force-with-lease main').action, 'block');
+    assert.equal(checkCommand('git push -f origin master').action, 'block');
+  });
+
+  test('HARD BLOCK: --no-verify and --no-gpg-sign', () => {
+    assert.equal(checkCommand('git commit --no-verify -m x').action, 'block');
+    assert.equal(checkCommand('git push --no-verify').action, 'block');
+    assert.equal(checkCommand('git commit --no-gpg-sign').action, 'block');
+    assert.equal(checkCommand('git -c commit.gpgsign=false commit').action, 'block');
+  });
+
+  test('HARD BLOCK: rm -rf with absolute path under root', () => {
+    assert.equal(checkCommand('rm -rf /etc').action, 'block');
+    assert.equal(checkCommand('rm -rf /usr/local').action, 'block');
+  });
+
+  test('HARD BLOCK: destructive SQL', () => {
+    assert.equal(checkCommand('DROP TABLE users').action, 'block');
+    assert.equal(checkCommand('drop database production').action, 'block');
+    assert.equal(checkCommand('TRUNCATE TABLE orders').action, 'block');
+  });
+
+  test('ADVISORY: force-push to non-main branch', () => {
+    const v = checkCommand('git push --force origin feature-branch');
+    assert.equal(v.action, 'advise');
+    assert.match(v.message, /force-push detected/);
+  });
+
+  test('ADVISORY: reset --hard / checkout . / clean -f / branch -D', () => {
+    assert.equal(checkCommand('git reset --hard HEAD~1').action, 'advise');
+    assert.equal(checkCommand('git checkout .').action, 'advise');
+    assert.equal(checkCommand('git clean -fd').action, 'advise');
+    assert.equal(checkCommand('git branch -D old').action, 'advise');
+  });
+
+  test('ALLOW: safe operations', () => {
+    assert.equal(checkCommand('git status').action, 'allow');
+    assert.equal(checkCommand('git push origin feature-branch').action, 'allow');
+    assert.equal(checkCommand('git commit -m "feat: add foo"').action, 'allow');
+    assert.equal(checkCommand('npm install').action, 'allow');
+    assert.equal(checkCommand('').action, 'allow');
+    assert.equal(checkCommand(null).action, 'allow');
+  });
+
+  test('rm -rf with relative path is ADVISORY (not block)', () => {
+    // Per CLAUDE.md: "Confirm before rm -rf" — confirm, not hard-block, for
+    // relative paths. Hard-block reserved for absolute paths under /.
+    assert.equal(checkCommand('rm -rf node_modules').action, 'advise');
+    assert.equal(checkCommand('rm -rf dist').action, 'advise');
+  });
+});
+
 // ─── module surface check ──────────────────────────────────────────────────
 
 describe('module exports — sanity', () => {
