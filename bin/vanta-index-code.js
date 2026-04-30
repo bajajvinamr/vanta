@@ -477,6 +477,7 @@ function migrateLegacyIfNeeded(quiet) {
   // Tier 2 global jsonl → split into per-slug shards
   if (fs.existsSync(LEGACY_GLOBAL_JSONL)) {
     const content = readSafe(LEGACY_GLOBAL_JSONL);
+    let allShardsMigrated = true;  // Tier 5.2 (Codex): track partial failure
     if (content) {
       const byProject = {};
       for (const line of content.split('\n')) {
@@ -488,13 +489,14 @@ function migrateLegacyIfNeeded(quiet) {
         if (!slug) continue;  // skip unknowns; they'll be reindexed under raw slug
         (byProject[slug] = byProject[slug] || []).push(e);
       }
-      // Tier 5 P1 fix (Codex): migration writes shards via atomicWriteJsonl.
-      // A normal indexer that saw the migration lock and skipped could still
-      // call acquireLock(slug) and write to a shard the migrator is mid-way
-      // through. Acquire each target shard lock BEFORE the write so any
-      // concurrent indexer waits at its own acquireLock call.
       for (const [slug, entries] of Object.entries(byProject)) {
-        if (!acquireLock(slug)) continue;  // migration of this shard skipped — next --full will re-do
+        if (!acquireLock(slug)) {
+          // Tier 5.2 fix (Codex): if any shard's lock acquisition fails,
+          // DON'T rename legacy to .bak — entries for that shard would be
+          // permanently lost. Next migration run retries.
+          allShardsMigrated = false;
+          continue;
+        }
         try {
           const existing = loadShard(slug);
           const seen = new Set(existing.map(e => `${e.source}|${e.category}`));
@@ -510,7 +512,12 @@ function migrateLegacyIfNeeded(quiet) {
         }
       }
     }
-    fs.renameSync(LEGACY_GLOBAL_JSONL, LEGACY_GLOBAL_JSONL + '.bak');
+    // Only rename legacy file when EVERY shard migrated successfully.
+    if (allShardsMigrated) {
+      fs.renameSync(LEGACY_GLOBAL_JSONL, LEGACY_GLOBAL_JSONL + '.bak');
+    } else if (!quiet) {
+      process.stderr.write(`vanta-index: legacy migration partial (some shards locked); leaving ${LEGACY_GLOBAL_JSONL} for next run\n`);
+    }
   }
 
   // Tier 3 __unknown_project__ shard → re-shard by raw slug if any entries
