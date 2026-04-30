@@ -16,10 +16,23 @@ Lifecycle harness for Claude Code. Composes three frameworks into three commands
 
 ## Hooks
 
-Three hooks fire automatically:
+Hooks fire automatically:
 - `council-advisory.js` — PreToolUse advisory on auth/payment/migration/security file edits
+- `git-guardrails.js` — PreToolUse:Bash hard-block + advisory tier for destructive git/sql/rm commands
 - `test-failure-advisor.js` — PostToolUse hard-stop on failing tests/build
 - `stack-file-nudge.js` — PostToolUse follow-up actions on config file changes
+- `code-index-watch.js` — PostToolUse incremental refresh of per-project knowledge shards
+- `plan-watcher.js` — PostToolUse Shadow Council flag on sensitive plan writes
+- `auto-sync.js` — Stop hook: sync-queue + episodic memory dedup
+
+## Surface Impact Discipline
+
+**Vanta promises three commands. Every change must be classified before it lands.**
+
+- **INTERNAL MACHINERY** — does NOT add user-visible commands or skills. May add: bins under `~/.claude/bin/`, hooks under `~/.claude/hooks/`, sections inside the existing 4 skills (vanta-run, vanta-council, vanta-sync, vanta-patterns), pure code in `bin/*.js`, tests, docs, invariants. **No surface budget impact.**
+- **NEW USER SURFACE** — adds: a new top-level skill (`Skill("vanta-foo")`), a new slash command, a new prompt the user must memorize, a new mandatory step in an existing flow that wasn't there before. **Must justify against the three-command promise.** The bar is high — most additions should be internal machinery.
+
+When opening a PR or commit that adds capability, name the classification explicitly in the commit body. Reviewers (council, code-reviewer agents) MUST flag surface-creep — silent expansion is the failure mode this rule exists to prevent.
 
 ## Gotchas
 
