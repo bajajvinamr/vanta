@@ -271,19 +271,38 @@ function readCodeKnowledge(topic, activeProject, max = 20) {
   const active = canonProject(activeProject);
   if (!active) return [];
 
-  const shardFile = path.join(dir, `${slugForFilesystem(active)}.jsonl`);
-  if (!fs.existsSync(shardFile)) {
-    // Final-tier compatibility: Tier 2 legacy file still exists if migration
-    // hasn't run. Read it once, scoped to the active project.
-    const legacy = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
-    if (fs.existsSync(legacy)) {
-      return _readCodeKnowledgeFromFile(legacy, topic, max, active)
-        .filter(r => canonProject(r.project) === active);
-    }
-    return [];
+  // Cleanup #4: alias-shard merge. The same logical project can have multiple
+  // shard files when an alias slug existed before its keyword regex was added
+  // to PROJECT_KEYWORDS — e.g. bajajvinamr-vanta.jsonl + vanta.jsonl both hold
+  // entries for the canonical "vanta" project.
+  //
+  // Fold-on-read: scan every shard file in the dir, canonicalize its filename
+  // slug, and merge contents from any shard whose canon matches the active
+  // project. Each entry is still filtered by canonProject(entry.project) ===
+  // active inside _readCodeKnowledgeFromFile via the filter below — so a
+  // contaminated shard (entries from multiple projects) doesn't bleed.
+  const out = [];
+  let shards = [];
+  try { shards = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')); } catch { shards = []; }
+  for (const f of shards) {
+    const fileSlug = f.slice(0, -'.jsonl'.length);
+    if (canonProject(fileSlug) !== active) continue;
+    const shardFile = path.join(dir, f);
+    const entries = _readCodeKnowledgeFromFile(shardFile, topic, max, active)
+      .filter(r => canonProject(r.project) === active);
+    for (const e of entries) out.push(e);
+    if (out.length >= max * 3) break;  // overshoot for ranking, capped
   }
+  if (out.length > 0) return out;
 
-  return _readCodeKnowledgeFromFile(shardFile, topic, max, active);
+  // Final-tier compatibility: Tier 2 legacy file still exists if migration
+  // hasn't run. Read it once, scoped to the active project.
+  const legacy = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
+  if (fs.existsSync(legacy)) {
+    return _readCodeKnowledgeFromFile(legacy, topic, max, active)
+      .filter(r => canonProject(r.project) === active);
+  }
+  return [];
 }
 
 function _readCodeKnowledgeFromFile(file, topic, max, fallbackSlug) {
