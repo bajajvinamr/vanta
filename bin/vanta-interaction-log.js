@@ -53,6 +53,46 @@ function _rotate(file) {
 
 const FILE_EXT_RE = /\.([a-z][a-z0-9]{0,5})\b/i;
 
+// Codex R2 P2 privacy fix: bash_verb must NEVER carry filesystem paths.
+// Previous impl (`/^[\w./-]+/`) captured `/Users/vinamr/Projects/...` whole,
+// leaking absolute paths into ~/.vanta/interactions.jsonl. New rule:
+//   1. Take the first token of the trimmed command.
+//   2. If it contains `/`, reduce to basename — paths never survive.
+//   3. If the basename is on the allowlist, emit it verbatim.
+//   4. Otherwise emit 'other' — we record that *some* command ran, not which.
+// Result: every entry in the log is one of ~30 known verbs OR the literal
+// string 'other'. No path component, no project name, no script name from
+// outside the allowlist ever lands on disk.
+const BASH_VERB_ALLOWLIST = new Set([
+  'git', 'npm', 'npx', 'node', 'pnpm', 'yarn', 'bun',
+  'python', 'python3', 'pip', 'pip3', 'uv', 'pipx',
+  'cargo', 'rustc', 'go', 'java', 'mvn', 'gradle',
+  'ls', 'cd', 'pwd', 'mkdir', 'cp', 'mv', 'rm', 'cat',
+  'echo', 'find', 'grep', 'rg', 'fd', 'awk', 'sed',
+  'curl', 'wget', 'ssh', 'scp', 'rsync',
+  'docker', 'kubectl', 'gcloud', 'aws', 'gh', 'glab',
+  'make', 'cmake', 'bash', 'sh', 'zsh', 'env', 'export',
+  'chmod', 'chown', 'tar', 'zip', 'unzip', 'open',
+  'jq', 'yq', 'tr', 'sort', 'uniq', 'wc', 'head', 'tail',
+  'true', 'false', 'test', 'sleep', 'kill', 'ps',
+]);
+
+function _normalizeBashVerb(command) {
+  if (typeof command !== 'string') return null;
+  // First token = up to first whitespace. We deliberately do NOT match
+  // shell metacharacters; "cd /Users/.. && git status" splits at the first
+  // space, leaving us with "cd" — exactly what we want.
+  const firstToken = command.trim().split(/\s+/, 1)[0];
+  if (!firstToken) return null;
+  // Strip path components — `/Users/x/script.sh` → `script.sh`.
+  const base = firstToken.includes('/')
+    ? firstToken.slice(firstToken.lastIndexOf('/') + 1)
+    : firstToken;
+  // Tail: 'git', 'node', 'rg' → keep. '.sh' or 'unknown-bin' → 'other'.
+  if (BASH_VERB_ALLOWLIST.has(base)) return base;
+  return 'other';
+}
+
 function shapeOfArgs(tool, input) {
   if (!input || typeof input !== 'object') return { keys: [], ext: null };
   const keys = Object.keys(input).slice(0, 10);
@@ -65,12 +105,8 @@ function shapeOfArgs(tool, input) {
       break;
     }
   }
-  // For Bash, capture only the first token (command verb).
   let bashVerb = null;
-  if (tool === 'Bash' && typeof input.command === 'string') {
-    const m = input.command.trim().match(/^[\w./-]+/);
-    bashVerb = m ? m[0].slice(0, 32) : null;
-  }
+  if (tool === 'Bash') bashVerb = _normalizeBashVerb(input.command);
   return { keys, ext, bashVerb };
 }
 

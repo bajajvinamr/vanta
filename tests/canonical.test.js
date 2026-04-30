@@ -997,6 +997,26 @@ describe('vanta-prompt-brief — classifier + brief generator', () => {
     assert.equal(m.buildBrief({ prompt: 'review this diff' }), null);
     assert.equal(m.buildBrief({ prompt: 'hello there' }), null);
   });
+
+  test('buildBrief never emits route hints (Codex R2 P3)', () => {
+    // Brief output must be factual recall only — no "/ship", "/investigate",
+    // "/council", "/recall" imperative arrows. The user already knows the
+    // three commands; the always-on layer's job is recall, not routing.
+    const probes = [
+      'ship the always-on layer',
+      'investigate why this fails',
+      'plan the architecture for X',
+      'do we have prior art on Y',
+    ];
+    for (const p of probes) {
+      const b = m.buildBrief({ prompt: p });
+      if (!b) continue;  // null is fine
+      assert.equal(b.includes('→ /ship'),         false, 'no /ship hint');
+      assert.equal(b.includes('→ /investigate'),  false, 'no /investigate hint');
+      assert.equal(b.includes('→ /council'),      false, 'no /council hint');
+      assert.equal(b.includes('vanta-resolve --topic'), false, 'no /recall hint');
+    }
+  });
 });
 
 // ─── interaction-log (universal observer) ────────────────────────────────────
@@ -1025,6 +1045,21 @@ describe('vanta-interaction-log — telemetry shape extraction', () => {
     assert.equal(s.bashVerb, 'git');
     // No trailing args leaked.
     assert.equal(s.bashVerb.includes('push'), false);
+  });
+
+  test('shapeOfArgs normalizes paths to basename then allowlists (Codex R2 P2)', () => {
+    const m = fresh();
+    // Absolute path → basename. Unknown basename → 'other' (no path leak).
+    const s1 = m.shapeOfArgs('Bash', { command: '/Users/vinamr/Projects/vanta/bin/foo.sh arg1' });
+    assert.equal(s1.bashVerb, 'other');
+    assert.equal(s1.bashVerb.includes('Users'), false);
+    assert.equal(s1.bashVerb.includes('/'), false);
+    // Allowlist entry survives: `/usr/local/bin/git` → `git`.
+    const s2 = m.shapeOfArgs('Bash', { command: '/usr/local/bin/git status' });
+    assert.equal(s2.bashVerb, 'git');
+    // Compound command: only the first verb is captured.
+    const s3 = m.shapeOfArgs('Bash', { command: 'cd /Users/vinamr/secret-project && npm install' });
+    assert.equal(s3.bashVerb, 'cd');
   });
 
   test('logEvent + audit roundtrip', () => {
@@ -1062,6 +1097,52 @@ describe('vanta-interaction-log — telemetry shape extraction', () => {
 
     delete process.env.VANTA_DIR_OVERRIDE;
     fs.rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
+// ─── resolver result cache (Codex R2 P2) ───────────────────────────────────
+
+describe('vanta-resolve — result cache', () => {
+  // Use a fresh require each test so process-local cache state is isolated
+  // between assertions. (Module cache holds across tests; we reach in via
+  // clearCache() rather than blowing up require.cache.)
+  const resolver = require('../bin/vanta-resolve');
+
+  test('clearCache exists and is idempotent', () => {
+    // Prove the surface — these two calls must not throw.
+    assert.equal(typeof resolver.clearCache, 'function');
+    resolver.clearCache();
+    resolver.clearCache();
+  });
+
+  test('repeated identical resolve() calls return the same object reference (cache hit)', () => {
+    resolver.clearCache();
+    const a = resolver.resolve({ topic: 'jwt', project: 'pi-perception', max: 1 });
+    const b = resolver.resolve({ topic: 'jwt', project: 'pi-perception', max: 1 });
+    // Strict object identity proves the result came from cache, not re-fetched.
+    assert.strictEqual(a, b, 'second call must hit the cache');
+  });
+
+  test('different cache keys do not collide', () => {
+    resolver.clearCache();
+    const a = resolver.resolve({ topic: 'jwt', project: 'pi-perception', max: 1 });
+    const b = resolver.resolve({ topic: 'jwt', project: 'little-wins',   max: 1 });
+    // Different project = different key = different cache entry. Identity may
+    // or may not differ (both could legitimately return empty results, which
+    // is the same object literal under v8 some of the time), so check the
+    // project field on the returned value.
+    assert.equal(a.project, 'pi-perception');
+    assert.equal(b.project, 'little-wins');
+  });
+
+  test('clearCache forces refetch', () => {
+    resolver.clearCache();
+    const a = resolver.resolve({ topic: 'jwt', project: 'pi-perception', max: 1 });
+    resolver.clearCache();
+    const b = resolver.resolve({ topic: 'jwt', project: 'pi-perception', max: 1 });
+    // After clearCache, a and b are recomputed — different object identity
+    // even if value-equal.
+    assert.notStrictEqual(a, b, 'after clearCache the second call must NOT be a cache hit');
   });
 });
 

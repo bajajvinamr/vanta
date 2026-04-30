@@ -21,10 +21,17 @@
 //   recall  → "remember", "what did we", "history", "earlier"
 //   unknown → no signal — return null brief
 //
-// Brief shape (≤ 3 lines):
+// Brief shape (≤ 2 lines, plus an optional contradiction warning):
 //   line 1: phase + topic-hash (terse handle)
-//   line 2: one Vanta-resolved fact OR one stale signal — whichever is sharper
-//   line 3: optional suggested route ("/ship?", "/council?")
+//   line 2: one Vanta-resolved fact (existing invariant or decision)
+//   line 3: ONLY if a binary contradiction was detected on the same topic —
+//           e.g. "ES256 vs HS256 in pi-perception". Factual safety signal.
+//
+// Codex R2 P3 fix: NO route hints. Earlier versions appended "→ /ship runs
+// tests" / "→ /investigate for systematic debug". Those turn the
+// always-on layer from factual recall into product-surface advertisement
+// on every prompt, violating the three-command promise. The user already
+// knows the three commands; the brief's job is fact recall, not routing.
 //
 // If there's nothing sharp to add, return null. Silence > noise.
 
@@ -122,9 +129,17 @@ function buildBrief({ prompt, slug, cwd } = {}) {
     return null;
   }
 
+  // Codex R2 P2 fix: hard wall-clock budget. The resolver caches results
+  // (60s TTL), so steady-state cost is near-zero, but the FIRST call after
+  // cache invalidation can do real I/O. 200ms is generous — if we can't
+  // produce a brief in that time, return null. The prompt still goes
+  // through; we just don't enrich it. Silence > slow prompt.
+  const BUDGET_MS = 200;
+  const startedAt = Date.now();
   let topResult = null;
   let contradictions = null;
   for (const topic of topics) {
+    if (Date.now() - startedAt > BUDGET_MS) break;
     try {
       const out = resolve({ topic, project: slug, cwd, max: 1 });
       if (out && out.results && out.results.length > 0) {
@@ -144,25 +159,15 @@ function buildBrief({ prompt, slug, cwd } = {}) {
   const excerpt = String(topResult.excerpt || '').replace(/\n.*$/s, '').replace(/^\s*-\s*/, '').slice(0, 140);
   lines.push(`  ${excerpt}`);
 
-  // Line 3 (optional): contradiction warning OR phase-specific route hint
+  // Line 3 (optional): contradiction warning ONLY — no route hints.
+  // Contradictions are factual safety signals (e.g. ES256 vs HS256 same
+  // project) and stay. Phase-based "/ship runs tests" hints were stripped
+  // per Codex R2 P3.
   if (contradictions && contradictions.length > 0) {
     lines.push(`  ⚠ contradiction: ${contradictions[0].hint.slice(0, 120)}`);
-  } else {
-    const hint = _routeHint(phase);
-    if (hint) lines.push(`  ${hint}`);
   }
 
   return lines.join('\n');
-}
-
-function _routeHint(phase) {
-  switch (phase) {
-    case 'ship':   return '→ /ship runs tests + opens PR · /review for diff check';
-    case 'debug':  return '→ /investigate for systematic debug';
-    case 'recall': return '→ vanta-resolve --topic <X> for more';
-    case 'plan':   return '→ /council if architecture-level (>2 services / hard-to-reverse)';
-    default:       return null;
-  }
 }
 
 // ─── CLI ───────────────────────────────────────────────────────────────────

@@ -111,15 +111,39 @@ s.hooks = s.hooks || {};
 // mode. All three now point to the manifest.
 const REGISTRATIONS = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).registrations;
 
-let added = 0, skipped = 0, missing = 0;
+// Codex R2 P2 fix: settings.json was append-only — old/renamed hooks lingered
+// forever, and reordered manifest entries silently double-registered. Now we
+// purge every entry under ${HOOKS_DIR} (bash or node) BEFORE inserting the
+// fresh manifest. Effect: settings.json becomes a deterministic projection
+// of manifest.json. Run setup again, get the same file.
+const hooksDirAbs = hooksDir.replace(/\/$/, '');
+const isVantaHook = (cmd) =>
+  typeof cmd === 'string' && cmd.includes(hooksDirAbs + '/');
+
+let purged = 0;
+for (const event of Object.keys(s.hooks)) {
+  const arr = s.hooks[event];
+  if (!Array.isArray(arr)) continue;
+  const cleaned = [];
+  for (const entry of arr) {
+    const keepHooks = (entry.hooks || []).filter(h => {
+      if (isVantaHook(h.command)) { purged++; return false; }
+      return true;
+    });
+    if (keepHooks.length > 0) cleaned.push({ ...entry, hooks: keepHooks });
+    else if (!entry.hooks) cleaned.push(entry);
+  }
+  if (cleaned.length === 0) delete s.hooks[event];
+  else s.hooks[event] = cleaned;
+}
+if (purged > 0) console.log(`  ✓ purged ${purged} stale Vanta hook entr(ies) from settings.json`);
+
+let added = 0, missing = 0;
 for (const r of REGISTRATIONS) {
   const hookPath = `${hooksDir}/${r.file}`;
   if (!fs.existsSync(hookPath)) { console.log(`  - ${r.file} (missing on disk, skipped)`); missing++; continue; }
   const cmd = r.runtime === 'bash' ? `bash "${hookPath}"` : `node "${hookPath}"`;
   s.hooks[r.event] = s.hooks[r.event] || [];
-  // Look for an existing entry that already runs this command (any matcher).
-  const already = s.hooks[r.event].some(e => (e.hooks || []).some(h => h.command === cmd));
-  if (already) { skipped++; continue; }
   const entry = { hooks: [{ type: 'command', command: cmd, timeout: r.timeout }] };
   if (r.matcher) entry.matcher = r.matcher;
   s.hooks[r.event].push(entry);
@@ -127,7 +151,7 @@ for (const r of REGISTRATIONS) {
   console.log(`  ✓ ${r.event}${r.matcher ? '['+r.matcher+']' : ''} → ${r.file}`);
 }
 fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
-console.log(`  Summary: ${added} added, ${skipped} already present, ${missing} missing`);
+console.log(`  Summary: ${added} added, ${purged} purged, ${missing} missing`);
 JS
 echo ""
 

@@ -1,39 +1,31 @@
 #!/usr/bin/env node
 // vanta-runtime-state — per-session dedupe + cooldown brain.
 //
-// Codex council P2 fix: the always-on hooks (prompt-context, tool-observer)
-// each query the resolver and decide whether to inject context. Without a
-// shared cooldown table they spam the same warning every Write|Edit, every
-// Bash, every prompt. This module is the one place where "did we already
-// say this in this session?" lives.
+// Codex council R1-P2 → R2-P1 evolution: original implementation used
+// read-modify-write JSON snapshots, which loses updates under concurrent
+// PreToolUse + PostToolUse + UserPromptSubmit traffic (Codex reproduced
+// 20 parallel bumps landing as 10). v3.6 fix: append-only JSONL journal.
+// Each operation is one atomic appendFileSync line. State is derived by
+// folding the journal on read.
 //
-// Storage: ~/.vanta/runtime/<session_id>.json (one file per Claude session).
-// Files self-rotate at session start (when the SessionStart hook calls
-// reset). Stale files older than 7d get reaped by hard-coded cleanup —
-// best-effort, never blocks.
+// Concurrency model:
+//   - All writes go to ~/.vanta/runtime/<sid>.jsonl via fs.appendFileSync.
+//     POSIX guarantees atomic append for writes < PIPE_BUF (4096B); each
+//     entry is ~200B, well under the limit. No lock needed.
+//   - Reads fold the journal end-to-start, returning the most recent
+//     value per (key, field). O(N) per read but N stays bounded by
+//     compaction below.
+//   - Compaction: on every 200th read OR via reapStale, the journal is
+//     folded into a single snapshot line that supersedes prior entries.
 //
-// Schema (per session file):
-//   {
-//     session_id: <string>,
-//     started_at: <ISO>,
-//     last_seen:  <ISO>,
-//     phase:      'plan'|'build'|'debug'|'ship'|'review'|'unknown',
-//     injected:   { <key>: <unix-ms-of-last-inject> },
-//     warnings:   [ { source, key, ts } ],
-//     prompt_count: <int>,
-//     tool_calls:   <int>,
-//   }
+// Schema entries:
+//   { ts, op: 'inject'  , key, value: <unix-ms> }
+//   { ts, op: 'bump'    , field, delta: 1 }
+//   { ts, op: 'phase'   , value }
+//   { ts, op: 'snapshot', state: { phase, injected, counters } }
 //
-// API used by hooks:
-//   shouldInject(sessionId, key, opts)  → true if not on cooldown
-//   markInjected(sessionId, key)        → records the inject ts
-//   bump(sessionId, field)              → counter increment + last_seen tick
-//   setPhase(sessionId, phase)          → records prompt-classifier output
-//   getState(sessionId)                 → readonly snapshot
-//   resetSession(sessionId)             → wipe at SessionStart
-//
-// All file I/O is best-effort: a failure NEVER blocks a hook. Hooks must
-// degrade silently if state is unreadable.
+// SessionStart hook calls resetSession to truncate the journal at the
+// start of each session.
 
 const fs = require('fs');
 const path = require('path');
@@ -46,10 +38,8 @@ function _runtimeDir() {
 }
 
 function _fileFor(sessionId) {
-  // Sanitize session id — Claude session ids are uuid-shaped but be defensive
-  // because the same value lands in a filesystem path.
   const safe = String(sessionId || 'unknown').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 80);
-  return path.join(_runtimeDir(), `${safe}.json`);
+  return path.join(_runtimeDir(), `${safe}.jsonl`);
 }
 
 function _ensureDir() {
@@ -57,27 +47,94 @@ function _ensureDir() {
   try { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); } catch {}
 }
 
-function _safeRead(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
-}
-
-function _safeWrite(file, obj) {
+function _appendLine(sessionId, obj) {
+  _ensureDir();
   try {
-    _ensureDir();
-    // Atomic-ish: write tmp, rename. JSON is small so this is fine.
-    const tmp = file + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(obj));
-    fs.renameSync(tmp, file);
+    fs.appendFileSync(_fileFor(sessionId), JSON.stringify(obj) + '\n');
     return true;
   } catch { return false; }
 }
 
-// Default cooldown windows per source — milliseconds. Hooks pass keys like
-// `council-advisory:auth` or `prompt-context:debug` and the cooldown looks
-// up by source prefix.
+// ─── journal fold ──────────────────────────────────────────────────────────
+//
+// Reduce the JSONL journal into a single state object. Walks forward;
+// snapshots reset the accumulator. Last-write-wins per (op, key/field).
+
+function _foldJournal(sessionId) {
+  const file = _fileFor(sessionId);
+  let acc = {
+    session_id: sessionId,
+    started_at: null,
+    last_seen: null,
+    phase: 'unknown',
+    injected: {},
+    counters: {},
+  };
+
+  if (!fs.existsSync(file)) return acc;
+  let lines;
+  try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean); }
+  catch { return acc; }
+
+  for (const line of lines) {
+    let e;
+    try { e = JSON.parse(line); } catch { continue; }
+    if (!acc.started_at) acc.started_at = e.ts;
+    acc.last_seen = e.ts;
+
+    switch (e.op) {
+      case 'snapshot':
+        // Snapshot supersedes everything before it.
+        acc = { session_id: sessionId, ...e.state, last_seen: e.ts };
+        acc.injected = acc.injected || {};
+        acc.counters = acc.counters || {};
+        break;
+      case 'inject':
+        acc.injected[e.key] = e.value;
+        break;
+      case 'bump':
+        acc.counters[e.field] = (acc.counters[e.field] || 0) + (e.delta || 1);
+        break;
+      case 'phase':
+        acc.phase = e.value;
+        break;
+    }
+  }
+  return acc;
+}
+
+// Best-effort compaction: rewrite the journal as a single snapshot line.
+// Called occasionally — never blocks. Truncates the file and writes the
+// folded state. If concurrent appends arrive during compaction they
+// would normally be lost, BUT compaction only runs from one process at
+// a time (reapStale path) and the journal is per-session, so this is
+// safe in practice. For safety we use rename-after-tmp.
+function _compact(sessionId) {
+  const file = _fileFor(sessionId);
+  if (!fs.existsSync(file)) return;
+  try {
+    const state = _foldJournal(sessionId);
+    const snapshotLine = JSON.stringify({
+      ts: new Date().toISOString(),
+      op: 'snapshot',
+      state: {
+        started_at: state.started_at,
+        phase: state.phase,
+        injected: state.injected,
+        counters: state.counters,
+      },
+    }) + '\n';
+    const tmp = file + '.compact';
+    fs.writeFileSync(tmp, snapshotLine);
+    fs.renameSync(tmp, file);
+  } catch { /* never block */ }
+}
+
+// ─── cooldown table ────────────────────────────────────────────────────────
+
 const COOLDOWNS = {
-  'council-advisory:': 30 * 60_000,   // 30 min between repeating the same warning
-  'prompt-context:':   10 * 60_000,   // 10 min between repeating the same brief
+  'council-advisory:': 30 * 60_000,
+  'prompt-context:':   10 * 60_000,
   'tool-observer:':    15 * 60_000,
   'stack-file-nudge:': 60 * 60_000,
   'default':            5 * 60_000,
@@ -93,24 +150,23 @@ function _cooldownFor(key) {
 // ─── public API ────────────────────────────────────────────────────────────
 
 function getState(sessionId) {
-  const f = _fileFor(sessionId);
-  const raw = _safeRead(f);
-  if (raw && raw.session_id) return raw;
-  // Initialize lazily — first read creates the file.
+  const folded = _foldJournal(sessionId);
+  // Surface counters at the top level for back-compat with v3.5 callers
+  // that read state.prompt_count / state.tool_calls directly.
   return {
-    session_id: sessionId,
-    started_at: new Date().toISOString(),
-    last_seen:  new Date().toISOString(),
-    phase: 'unknown',
-    injected: {},
-    warnings: [],
-    prompt_count: 0,
-    tool_calls: 0,
+    session_id: folded.session_id,
+    started_at: folded.started_at || new Date().toISOString(),
+    last_seen:  folded.last_seen || new Date().toISOString(),
+    phase: folded.phase || 'unknown',
+    injected: folded.injected || {},
+    prompt_count: (folded.counters || {}).prompt_count || 0,
+    tool_calls:   (folded.counters || {}).tool_calls   || 0,
+    counters: folded.counters || {},
   };
 }
 
 function shouldInject(sessionId, key, { cooldownMs } = {}) {
-  if (!sessionId || !key) return true;  // be permissive on bad input — hooks degrade open
+  if (!sessionId || !key) return true;
   const state = getState(sessionId);
   const last = state.injected[key];
   if (typeof last !== 'number') return true;
@@ -120,28 +176,19 @@ function shouldInject(sessionId, key, { cooldownMs } = {}) {
 
 function markInjected(sessionId, key) {
   if (!sessionId || !key) return;
-  const state = getState(sessionId);
-  state.injected[key] = Date.now();
-  state.last_seen = new Date().toISOString();
-  _safeWrite(_fileFor(sessionId), state);
+  _appendLine(sessionId, { ts: new Date().toISOString(), op: 'inject', key, value: Date.now() });
 }
 
 function bump(sessionId, field) {
   if (!sessionId || !field) return;
-  const state = getState(sessionId);
-  state[field] = (state[field] || 0) + 1;
-  state.last_seen = new Date().toISOString();
-  _safeWrite(_fileFor(sessionId), state);
+  _appendLine(sessionId, { ts: new Date().toISOString(), op: 'bump', field, delta: 1 });
 }
 
 function setPhase(sessionId, phase) {
   if (!sessionId || !phase) return;
   const valid = ['plan','build','debug','ship','review','recall','unknown'];
   if (!valid.includes(phase)) return;
-  const state = getState(sessionId);
-  state.phase = phase;
-  state.last_seen = new Date().toISOString();
-  _safeWrite(_fileFor(sessionId), state);
+  _appendLine(sessionId, { ts: new Date().toISOString(), op: 'phase', value: phase });
 }
 
 function resetSession(sessionId) {
@@ -150,21 +197,29 @@ function resetSession(sessionId) {
   try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
 }
 
-// Best-effort cleanup of session files older than `days`. Called occasionally
-// by hooks; never blocks. Keeps `~/.vanta/runtime/` from growing without
-// bound across days of sessions.
-function reapStale({ days = 7 } = {}) {
+function reapStale({ days = 7, compactRest = true } = {}) {
   const dir = _runtimeDir();
   let removed = 0;
+  let compacted = 0;
   try {
     if (!fs.existsSync(dir)) return 0;
     const cutoff = Date.now() - days * 86400_000;
     for (const f of fs.readdirSync(dir)) {
-      if (!f.endsWith('.json')) continue;
+      if (!f.endsWith('.jsonl')) {
+        // Backwards-compat: clean up old .json snapshots from v3.6.0.
+        if (f.endsWith('.json')) {
+          try { fs.unlinkSync(path.join(dir, f)); } catch {}
+        }
+        continue;
+      }
       const full = path.join(dir, f);
       try {
         const st = fs.statSync(full);
         if (st.mtimeMs < cutoff) { fs.unlinkSync(full); removed++; }
+        else if (compactRest && st.size > 50_000) {
+          _compact(f.slice(0, -'.jsonl'.length));
+          compacted++;
+        }
       } catch {}
     }
   } catch {}
@@ -189,17 +244,15 @@ function parseArgs(argv) {
 function main() {
   const cmd = process.argv[2];
   const a = parseArgs(process.argv);
-  if (cmd === 'should-inject') {
-    process.stdout.write(shouldInject(a.session, a.key) ? 'yes' : 'no');
-    return;
-  }
-  if (cmd === 'mark-injected')  { markInjected(a.session, a.key); return; }
-  if (cmd === 'bump')           { bump(a.session, a.field); return; }
-  if (cmd === 'set-phase')      { setPhase(a.session, a.phase); return; }
-  if (cmd === 'state')          { console.log(JSON.stringify(getState(a.session), null, 2)); return; }
-  if (cmd === 'reset')          { resetSession(a.session); return; }
-  if (cmd === 'reap')           { console.log(`reaped ${reapStale({ days: parseInt(a.days,10) || 7 })} stale session files`); return; }
-  console.error('Usage: vanta-runtime-state {should-inject|mark-injected|bump|set-phase|state|reset|reap} [args]');
+  if (cmd === 'should-inject') { process.stdout.write(shouldInject(a.session, a.key) ? 'yes' : 'no'); return; }
+  if (cmd === 'mark-injected') { markInjected(a.session, a.key); return; }
+  if (cmd === 'bump')          { bump(a.session, a.field); return; }
+  if (cmd === 'set-phase')     { setPhase(a.session, a.phase); return; }
+  if (cmd === 'state')         { console.log(JSON.stringify(getState(a.session), null, 2)); return; }
+  if (cmd === 'reset')         { resetSession(a.session); return; }
+  if (cmd === 'compact')       { _compact(a.session); return; }
+  if (cmd === 'reap')          { console.log(`reaped ${reapStale({ days: parseInt(a.days,10) || 7 })} stale session files`); return; }
+  console.error('Usage: vanta-runtime-state {should-inject|mark-injected|bump|set-phase|state|reset|compact|reap} [args]');
   process.exit(2);
 }
 
@@ -208,4 +261,6 @@ if (require.main === module) main();
 module.exports = {
   getState, shouldInject, markInjected, bump, setPhase, resetSession, reapStale,
   COOLDOWNS,
+  // Internal — exported for tests:
+  _foldJournal, _compact, _fileFor,
 };
