@@ -543,6 +543,90 @@ describe('vanta-council-feedback — record/attribute/stats', () => {
   });
 });
 
+// ─── extract-score (Tier 6 #16) ─────────────────────────────────────────────
+
+describe('vanta-extract-score — invariant candidate gating', () => {
+  const { scoreCandidate, routeCandidate, jaccard, auditPrefix } =
+    require('../bin/vanta-extract-score');
+
+  test('jaccard handles empty + identity', () => {
+    assert.equal(jaccard('', ''), 0);
+    assert.equal(jaccard('foo bar baz', 'foo bar baz'), 1);
+    assert.ok(jaccard('foo bar baz', 'foo bar qux') > 0.4, 'shared > different');
+  });
+
+  test('skill-doc phrasing hard-rejects (score 0, route discard)', () => {
+    const r = routeCandidate('Step 1: invoke this skill before creative work.');
+    assert.equal(r.route, 'discard');
+    assert.equal(r.score, 0);
+    assert.ok(r.hardReject, 'hardReject flag set');
+    assert.ok(r.reasons.some(x => x.includes('skill-doc-reject')));
+  });
+
+  test('well-formed invariant w/ backticks routes auto', () => {
+    const r = routeCandidate(
+      'Use `ES256` asymmetric JWTs for pi-perception auth. `HS256` symmetric keys will fail silently.'
+    );
+    assert.equal(r.route, 'auto');
+    assert.ok(r.score >= 0.65, `score ${r.score} should be ≥ 0.65 for auto`);
+  });
+
+  test('PII / project state routes discard', () => {
+    // No backticks, no decision markers, no failure framing — just project state.
+    const r = routeCandidate('child_name: Aanya, age 7, attended screening at DPS Bangalore on 2026-04-12.');
+    assert.ok(['discard', 'staging'].includes(r.route),
+      `PII routed to ${r.route} — should be discard or staging, never auto`);
+    assert.notEqual(r.route, 'auto');
+  });
+
+  test('near-duplicate routes update-in-place', () => {
+    const existing = [
+      'Use `ES256` asymmetric JWTs for pi-perception auth. `HS256` keys fail silently.',
+    ];
+    // Same fact, slightly rephrased — should be caught as dup, not appended.
+    const r = routeCandidate(
+      'Use `ES256` asymmetric JWTs for pi-perception authentication. `HS256` keys fail silently.',
+      { existing }
+    );
+    assert.equal(r.route, 'update-in-place');
+    assert.ok(r.dup);
+    assert.ok(r.dup.similarity >= 0.8);
+  });
+
+  test('auditPrefix includes session id, ts, confidence', () => {
+    const p = auditPrefix({ sessionId: 'abc-123', confidence: 0.87, ts: '2026-04-30T07:55:00Z' });
+    assert.match(p, /<!-- vanta-sync:/);
+    assert.match(p, /session=abc-123/);
+    assert.match(p, /confidence=0\.87/);
+    assert.match(p, /ts=2026-04-30T07:55:00Z/);
+  });
+
+  test('auditPrefix tolerates missing fields without throwing', () => {
+    const p = auditPrefix({});
+    assert.ok(p.includes('session=unknown'));
+    assert.ok(p.includes('confidence=unknown'));
+  });
+
+  test('empty / non-string input returns score 0', () => {
+    assert.equal(scoreCandidate('').score, 0);
+    assert.equal(scoreCandidate('   ').score, 0);
+    assert.equal(scoreCandidate(null).score, 0);
+    assert.equal(scoreCandidate(undefined).score, 0);
+  });
+
+  test('partial-dup applies negative score adjustment', () => {
+    // Similar but not duplicate — share 4 tokens, swap a few words.
+    // jaccard target: 0.5–0.8 range.
+    const existing = ['Use ES256 asymmetric JWTs for pi-perception auth code.'];
+    const r = scoreCandidate(
+      'Use ES256 asymmetric tokens for pi-perception auth servers.',
+      { existing }
+    );
+    const matchedDup = r.reasons.some(x => x.includes('dup'));
+    assert.ok(matchedDup, `expected partial-dup signal, got reasons: ${r.reasons.join(' | ')}`);
+  });
+});
+
 // ─── module surface check ──────────────────────────────────────────────────
 
 describe('module exports — sanity', () => {
