@@ -219,21 +219,36 @@ See `docs/install.md` for manual setup and dependency notes.
   vanta-patterns/   ← /vanta-patterns: weekly self-governance retrospective
 
 ~/.claude/bin/
-  vanta-resolve.js  ← canonical knowledge query layer (one ranked index over 5 sources)
+  vanta-projects.js   ← single source of truth for project keywords + slug canon
+  vanta-resolve.js    ← canonical knowledge query layer (one ranked index over 5 sources)
+  vanta-index-code.js ← code-knowledge indexer (per-project shards, lockfile, atomic write)
+  vanta-status.js     ← single-screen health summary across shards/queues/hooks
+  vanta-prune.js      ← archive dormant project shards (reversible)
+  vanta-log.js        ← shared hook logger (~/.vanta/hook.log)
+  vanta-brief.js      ← session-start brief generator
 
 ~/.claude/hooks/
   auto-sync.js              ← Stop hook: sync-queue + episodic memory (deduped by session_id)
-  council-advisory.js       ← PreToolUse: constraint-pack via vanta-resolve
+  council-advisory.js       ← PreToolUse: constraint-pack via vanta-resolve (logs query feedback)
   plan-watcher.js           ← PostToolUse: Shadow Council flag on sensitive plans
   test-failure-advisor.js   ← PostToolUse: hard-stop on broken tests
   stack-file-nudge.js       ← PostToolUse: config-file follow-ups
+  code-index-watch.js       ← PostToolUse: incremental shard refresh on file edits
 
 ~/.vanta/
-  sync-queue.jsonl     ← pending learning extraction
-  episodes.jsonl       ← time-aware decision log
-  routing-events.jsonl ← every successful route match
-  missed-intents.jsonl ← every routing miss (becomes new routes)
-  vanta-health.md      ← weekly retrospective output
+  sync-queue.jsonl       ← pending learning extraction
+  episodes.jsonl         ← time-aware decision log
+  routing-events.jsonl   ← every successful route match
+  missed-intents.jsonl   ← every routing miss (becomes new routes)
+  query-log.jsonl        ← v3.4: every resolve() call (shape-only, used by --analyze)
+  hook.log               ← v3.4: hook errors and warnings (rotated at 1000 lines)
+  vanta-health.md        ← weekly retrospective output
+  knowledge/             ← v3.4: per-project shards (one .jsonl + .cursor.json per slug)
+    little-wins.jsonl
+    little-wins.cursor.json
+    pi-perception.jsonl
+    pi-perception.cursor.json
+    .archive/            ← vanta-prune destination (reversible)
 
 ~/Projects/vanta/
   skills/           ← Source of truth (deploys to ~/.claude/skills/)
@@ -244,6 +259,24 @@ See `docs/install.md` for manual setup and dependency notes.
 Everything is plain markdown. No packages. No runtime. No network calls. Fails gracefully when gstack or GSD aren't installed — degrades to the available frameworks.
 
 ---
+
+## Storage assumptions
+
+`~/.vanta/` and `~/.gstack/` MUST live on a local filesystem. Two reasons:
+
+1. **`O_EXCL` is not reliable on NFS.** The shard lockfile (`<slug>.lock`)
+   relies on `open(O_EXCL)` to grant exclusive access. NFSv3 silently grants
+   the same lock to multiple writers — concurrent indexer fires would clobber
+   each other's writes. NFSv4 with delegations is better but still not
+   guaranteed. Vanta's lock semantics are POSIX-on-local-disk only.
+
+2. **Atomic rename across NFS mount boundaries can fail with EXDEV.** The
+   indexer writes via `tmp + rename`; if the temp file lands on one filesystem
+   and the target on another, rename returns EXDEV and the write is lost.
+
+If you genuinely need cross-machine state, sync a snapshot (e.g., via a
+nightly rsync to S3 / Dropbox), don't share the live tree. The cost of
+sharing is silent corruption; the cost of snapshotting is a few seconds.
 
 ## What Vanta is not
 
@@ -264,3 +297,4 @@ Everything is plain markdown. No packages. No runtime. No network calls. Fails g
 | v3.1 | 9.6/10 | 33 routes incl. cross-project recall, scoped sync-queue, smarter Stop hook (decision markers), routing precedence rules |
 | v3.2 | 9.8/10 | Constraint-pack hook (anticipatory memory at write-time), episodic memory (`episodes.jsonl`), `/vanta-patterns` self-governance loop, decision metadata (confidence/scope/expires/supersedes), Gemini trust fix |
 | v3.3 | 9.9/10 | `bin/vanta-resolve.js` canonical knowledge index (replaces 5 separate greps with one ranked query, expiry+supersession-aware), Shadow Council via `plan-watcher.js` (pre-emptive governance at plan-write time), Stop hook dedup by session_id, decision-extractor strips markdown, install bug fixed (all 4 hooks now register, not just Stop) |
+| v3.4 | 9.95/10 | **Per-project shards** (`~/.vanta/knowledge/<slug>.jsonl`) eliminate the O(N) write race on the global jsonl — each project gets its own shard, cursor, and O_EXCL lockfile with PID-aware steal. **3-layer pattern architecture**: BASELINE (universal) + PROJECT_SPECIFIC (curated table) + CLAUDE.md `## Sensitive Patterns` (user-defined). **Alias-shard fold-on-read** so `bajajvinamr-vanta.jsonl` and `vanta.jsonl` merge under the canonical slug at query time. **`vanta-status`** for single-screen health (shards, queues, hook errors, stuck locks, suggestions). **`vanta-prune`** for reversible archival of dormant projects. **Synonym pre-expansion** widens recall (`--topic JWT` matches `bearer token`, `access token`, etc.). **Query-log + `--analyze`** for shape-only observability of resolver calls (top topics, zero-result ratio, foreign-bleed counts, score percentiles). **Hook logging** via `~/.vanta/hook.log` — broken hooks no longer rot invisibly. **17+ tests** lock canonProject + pathRank + lock semantics. |
