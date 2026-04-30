@@ -111,14 +111,36 @@ s.hooks = s.hooks || {};
 // mode. All three now point to the manifest.
 const REGISTRATIONS = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).registrations;
 
-// Codex R2 P2 fix: settings.json was append-only — old/renamed hooks lingered
-// forever, and reordered manifest entries silently double-registered. Now we
-// purge every entry under ${HOOKS_DIR} (bash or node) BEFORE inserting the
-// fresh manifest. Effect: settings.json becomes a deterministic projection
-// of manifest.json. Run setup again, get the same file.
+// Codex R2 P2 + R3 P2 fix: settings.json was append-only — old/renamed hooks
+// lingered forever, and reordered manifest entries silently double-registered.
+// We purge BEFORE inserting the fresh manifest.
+//
+// R3 narrowed the purge: the original `cmd.includes(hooksDir + '/')` would
+// match user-authored hooks placed under ~/.claude/hooks/ that are NOT part
+// of Vanta. Now we only purge commands that name a file currently or
+// historically managed by Vanta. The historical list is the union of the
+// current manifest plus a stable retired-hooks list (so renames flush
+// cleanly without nuking unrelated hooks).
 const hooksDirAbs = hooksDir.replace(/\/$/, '');
-const isVantaHook = (cmd) =>
-  typeof cmd === 'string' && cmd.includes(hooksDirAbs + '/');
+const RETIRED_HOOKS = [
+  // Add filenames of hooks Vanta no longer ships but may have written
+  // to settings.json in earlier setup runs. Empty today; reserve for
+  // future renames so a `setup.sh` always cleans up after itself.
+];
+const VANTA_HOOK_NAMES = new Set([
+  ...REGISTRATIONS.map(r => r.file),
+  ...RETIRED_HOOKS,
+]);
+const isVantaHook = (cmd) => {
+  if (typeof cmd !== 'string') return false;
+  // Command shape from setup: `bash "<dir>/<file>"` or `node "<dir>/<file>"`.
+  // Match the file basename strictly — substring match would catch unrelated
+  // hooks under the same dir.
+  const pattern = new RegExp(`["'\\s]${hooksDirAbs.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}/([^"'\\s]+)`);
+  const m = cmd.match(pattern);
+  if (!m) return false;
+  return VANTA_HOOK_NAMES.has(m[1]);
+};
 
 let purged = 0;
 for (const event of Object.keys(s.hooks)) {

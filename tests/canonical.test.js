@@ -945,6 +945,38 @@ describe('vanta-runtime-state — per-session cooldown brain', () => {
     delete process.env.VANTA_DIR_OVERRIDE;
     fs.rmSync(tmp, { recursive: true, force: true });
   });
+
+  test('compact skips live (non-quiescent) journals — Codex R3 P1', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rs-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = fresh();
+
+    // Build a journal with many entries.
+    for (let i = 0; i < 50; i++) m.bump('live', 'tool_calls');
+    const dir = path.join(tmp, 'runtime');
+    const file = path.join(dir, 'live.jsonl');
+    const sizeBefore = fs.statSync(file).size;
+    const linesBefore = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).length;
+    assert.equal(linesBefore, 50);
+
+    // Live = mtime within QUIESCE_MS. Compact must NOT rewrite the file.
+    m._compact('live');
+    const linesAfter = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).length;
+    assert.equal(linesAfter, 50, 'live compaction must be a no-op');
+
+    // Backdate the file past QUIESCE_MS — now compact should fold the journal.
+    const old = (Date.now() - 60_000) / 1000;
+    fs.utimesSync(file, old, old);
+    m._compact('live');
+    const folded = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    assert.equal(folded.length, 1, 'quiescent compaction folds to 1 snapshot line');
+    const snap = JSON.parse(folded[0]);
+    assert.equal(snap.op, 'snapshot');
+    assert.equal(snap.state.counters.tool_calls, 50);
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
 });
 
 // ─── prompt-brief (UserPromptSubmit classifier) ─────────────────────────────
@@ -1062,6 +1094,20 @@ describe('vanta-interaction-log — telemetry shape extraction', () => {
     assert.equal(s3.bashVerb, 'cd');
   });
 
+  test('shapeOfArgs strips VAR=value env prefix (Codex R3 P3)', () => {
+    const m = fresh();
+    // NODE_ENV=test pnpm test → pnpm (env assignment skipped).
+    assert.equal(m.shapeOfArgs('Bash', { command: 'NODE_ENV=test pnpm test' }).bashVerb, 'pnpm');
+    // Stacked assignments still resolve to the real verb.
+    assert.equal(m.shapeOfArgs('Bash', { command: 'A=1 B=2 npm run dev' }).bashVerb, 'npm');
+    // env wrapper is also stripped.
+    assert.equal(m.shapeOfArgs('Bash', { command: 'env FOO=bar git status' }).bashVerb, 'git');
+    // sudo wrapper.
+    assert.equal(m.shapeOfArgs('Bash', { command: 'sudo npm install -g foo' }).bashVerb, 'npm');
+    // Wrapper with no following allowlisted verb falls through to 'other'.
+    assert.equal(m.shapeOfArgs('Bash', { command: 'env FOO=bar /opt/custom/wat' }).bashVerb, 'other');
+  });
+
   test('logEvent + audit roundtrip', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-il-'));
     process.env.VANTA_DIR_OVERRIDE = tmp;
@@ -1144,6 +1190,28 @@ describe('vanta-resolve — result cache', () => {
     // even if value-equal.
     assert.notStrictEqual(a, b, 'after clearCache the second call must NOT be a cache hit');
   });
+
+  test('cache busts when project CLAUDE.md (gotchas) mtime changes — Codex R3 P2', () => {
+    // Simulate the R3 case: cache hits forever even after editing decisions/
+    // gotchas. With the source-version vector, touching CLAUDE.md must bust.
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-resolve-'));
+    const claudeMd = path.join(tmpdir, 'CLAUDE.md');
+    fs.writeFileSync(claudeMd, '# test\n');
+
+    resolver.clearCache();
+    const a = resolver.resolve({ topic: 'jwt', project: 'pi-perception', cwd: tmpdir, max: 1 });
+    // Cache hit immediately after — same vector.
+    const b = resolver.resolve({ topic: 'jwt', project: 'pi-perception', cwd: tmpdir, max: 1 });
+    assert.strictEqual(a, b, 'identical inputs and unchanged sources must be a cache hit');
+
+    // Touch the gotchas file — vector changes → cache must bust.
+    const future = (Date.now() + 5_000) / 1000;
+    fs.utimesSync(claudeMd, future, future);
+    const c = resolver.resolve({ topic: 'jwt', project: 'pi-perception', cwd: tmpdir, max: 1 });
+    assert.notStrictEqual(a, c, 'gotchas mtime change must invalidate the cache');
+
+    fs.rmSync(tmpdir, { recursive: true, force: true });
+  });
 });
 
 // ─── module surface check ──────────────────────────────────────────────────
@@ -1164,4 +1232,34 @@ describe('module exports — sanity', () => {
     assert.equal(typeof m.scoreResult, 'function');
     assert.equal(typeof m.detectContradictions, 'function');
   });
+});
+
+// ─── hook syntax check (Codex R3 P1 test gap) ──────────────────────────────
+//
+// R3 caught a syntax error in hooks/tool-observer.js (duplicate `const event`)
+// that the existing test suite would never have caught — none of the bin
+// modules import the hook entry points. The hooks ARE the always-on layer;
+// if any of them fails to parse, the layer is dead on the user's machine.
+// Run `node --check` on every node-runtime hook listed in the manifest.
+
+describe('hooks — syntax sanity (Codex R3)', () => {
+  const { execFileSync } = require('node:child_process');
+  const manifestPath = path.join(__dirname, '..', 'hooks', 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const nodeHooks = manifest.registrations
+    .filter(r => r.runtime === 'node')
+    .map(r => r.file);
+  const unique = [...new Set(nodeHooks)];
+
+  for (const file of unique) {
+    test(`${file} parses cleanly`, () => {
+      const full = path.join(__dirname, '..', 'hooks', file);
+      assert.ok(fs.existsSync(full), `hook file must exist: ${full}`);
+      // node --check exits 0 on parse success, non-zero on SyntaxError.
+      // execFileSync throws on non-zero exit — assert by absence of throw.
+      assert.doesNotThrow(() => {
+        execFileSync(process.execPath, ['--check', full], { stdio: 'pipe' });
+      }, `node --check failed on ${file}`);
+    });
+  }
 });

@@ -103,16 +103,32 @@ function _foldJournal(sessionId) {
   return acc;
 }
 
-// Best-effort compaction: rewrite the journal as a single snapshot line.
-// Called occasionally — never blocks. Truncates the file and writes the
-// folded state. If concurrent appends arrive during compaction they
-// would normally be lost, BUT compaction only runs from one process at
-// a time (reapStale path) and the journal is per-session, so this is
-// safe in practice. For safety we use rename-after-tmp.
-function _compact(sessionId) {
+// Compaction: rewrite the journal as a single snapshot line.
+//
+// Codex R3 P1 fix — the original implementation had a lost-update window:
+//   1. _foldJournal() reads the journal end-state.
+//   2. Hook A appends a new line via fs.appendFileSync (atomic, < PIPE_BUF).
+//   3. We rename tmp → file. The line from step 2 is gone.
+//
+// Mitigation: only compact files that are quiescent — last modified more
+// than QUIESCE_MS ago. A live session is appending every few seconds, so
+// it never qualifies. Stale session files (post-Stop hook) DO qualify and
+// can be compacted safely. `force: true` overrides for tests.
+//
+// Acceptance trade: live sessions never compact. They are bounded by
+// reapStale's age cutoff; if a file grows huge mid-session, it gets
+// compacted after the session ends. That's fine — fold cost is O(N) and
+// N is bounded by hook fire rate × session length, which is small.
+const QUIESCE_MS = 10_000;
+
+function _compact(sessionId, { force = false } = {}) {
   const file = _fileFor(sessionId);
   if (!fs.existsSync(file)) return;
   try {
+    if (!force) {
+      const st = fs.statSync(file);
+      if (Date.now() - st.mtimeMs < QUIESCE_MS) return;  // live — skip.
+    }
     const state = _foldJournal(sessionId);
     const snapshotLine = JSON.stringify({
       ts: new Date().toISOString(),

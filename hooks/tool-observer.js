@@ -70,8 +70,6 @@ async function main() {
   let phase = 'unknown';
   try { const s = rs(); if (s) phase = s.getState(sessionId).phase || 'unknown'; } catch {}
 
-  const event = data.hook_event_name === 'PostToolUse' ? 'post' : 'pre';
-
   // Codex R2 P3 fix: bump only on `pre`. Pre + Post under the same matcher
   // double-counted every tool call. `tool_calls` should mean attempts; the
   // post side captures the success/failure bit (logged separately).

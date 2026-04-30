@@ -595,7 +595,7 @@ function detectContradictions(results) {
 }
 
 // ─── Main resolver ──────────────────────────────────────────────────────────
-// ─── Result cache (Codex R2 P2 fix) ────────────────────────────────────────
+// ─── Result cache (Codex R2 P2 + R3 P2 fix) ────────────────────────────────
 //
 // The always-on prompt-context hook calls resolve() once or twice per user
 // prompt. Without caching, every keystroke-submitted prompt re-reads the
@@ -606,43 +606,67 @@ function detectContradictions(results) {
 //   - In-process Map (per-CLI-invocation OR per-hook-process — both are
 //     short-lived; caching across processes wasn't worth the disk/IO).
 //   - Key: ${topic}|${project}|${cwd}|${max}|${includeForeign}|${log}
-//   - TTL: 60s wall-clock — short enough that vanta-sync edits propagate
-//     before users notice. (vanta-sync runs offline; users editing
-//     invariants by hand can call clearCache() or wait 60s.)
-//   - Mtime invalidation: cache the mtime of the invariants file at
-//     write time; on read, bust if mtime changed. Cheap stat() per hit.
-//   - LRU bounded at 64 entries — Map preserves insertion order, oldest
-//     evicted on overflow. 64 covers typical session unique queries.
+//   - TTL: 60s wall-clock floor — short enough that vanta-sync edits
+//     propagate before users notice.
+//   - **Source-version vector** (R3 P2 fix): cache mtime of every file the
+//     resolver consults: invariants, decisions for the project, project
+//     CLAUDE.md (gotchas), code-knowledge.jsonl, episodes.jsonl, and
+//     ~/.claude/projects/-Users-vinamr/memory/. Any change in any source
+//     busts the cached entry. Each source is one stat() call — cheap.
+//   - LRU bounded at 64 entries — Map preserves insertion order.
 //
-// Why not invalidate per-source? Most cache hits are within the same
-// prompt-burst. 60s TTL handles staleness; mtime check handles in-session
-// invariant edits (the most likely staleness vector).
+// Earlier impl only watched the invariants file. R3 caught: editing
+// decisions.md, gotchas, or running the indexer wouldn't invalidate the
+// cache, so the next prompt-context call would return stale results
+// for up to 60s.
 const _resolveCache = new Map();
 const _RESOLVE_CACHE_TTL = 60_000;
 const _RESOLVE_CACHE_MAX = 64;
 const INVARIANTS_FILE = path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.md');
+const CODE_KNOWLEDGE_FILE = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
+const EPISODES_FILE = path.join(os.homedir(), '.vanta', 'episodes.jsonl');
+const MEMORY_DIR = path.join(os.homedir(), '.claude', 'projects', '-Users-vinamr', 'memory');
 
-function _invariantsMtime() {
-  try { return fs.statSync(INVARIANTS_FILE).mtimeMs; } catch { return 0; }
+function _mtime(p) { try { return fs.statSync(p).mtimeMs; } catch { return 0; } }
+function _dirMtime(p) {
+  // Directory mtime — changes when files inside are added/removed/renamed.
+  // Doesn't catch in-place edits to memory files; we sample the index file
+  // (MEMORY.md) below to cover that.
+  try { return fs.statSync(p).mtimeMs; } catch { return 0; }
 }
 
-function _cacheGet(key) {
+function _sourceVector({ project, cwd }) {
+  const slug = project ? slugForFilesystem(project) : '';
+  const decisionsFile = slug ? path.join(os.homedir(), '.gstack', 'projects', slug, 'decisions.md') : '';
+  const gotchasFile   = cwd  ? path.join(cwd, 'CLAUDE.md') : '';
+  // Concatenate stable mtime stamps. Any file change → different vector.
+  return [
+    _mtime(INVARIANTS_FILE),
+    decisionsFile ? _mtime(decisionsFile) : 0,
+    gotchasFile   ? _mtime(gotchasFile)   : 0,
+    _mtime(CODE_KNOWLEDGE_FILE),
+    _mtime(EPISODES_FILE),
+    _dirMtime(MEMORY_DIR),
+    _mtime(path.join(MEMORY_DIR, 'MEMORY.md')),
+  ].join(':');
+}
+
+function _cacheGet(key, ctx) {
   const hit = _resolveCache.get(key);
   if (!hit) return null;
   if (Date.now() - hit.ts > _RESOLVE_CACHE_TTL) { _resolveCache.delete(key); return null; }
-  if (hit.mtime !== _invariantsMtime()) { _resolveCache.delete(key); return null; }
+  if (hit.vector !== _sourceVector(ctx)) { _resolveCache.delete(key); return null; }
   // Touch — move to end for LRU behavior.
   _resolveCache.delete(key); _resolveCache.set(key, hit);
   return hit.value;
 }
 
-function _cacheSet(key, value) {
+function _cacheSet(key, value, ctx) {
   if (_resolveCache.size >= _RESOLVE_CACHE_MAX) {
-    // Evict oldest (Map iteration order = insertion order).
     const oldest = _resolveCache.keys().next().value;
     if (oldest) _resolveCache.delete(oldest);
   }
-  _resolveCache.set(key, { ts: Date.now(), mtime: _invariantsMtime(), value });
+  _resolveCache.set(key, { ts: Date.now(), vector: _sourceVector(ctx), value });
 }
 
 function clearCache() { _resolveCache.clear(); }
@@ -652,7 +676,8 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = f
   // Cache key: include `log` so cached calls don't accidentally suppress
   // logging when a logged caller hits a no-log cache entry.
   const cacheKey = `${topic}|${project || ''}|${cwd || ''}|${max}|${includeForeign}|${log}`;
-  const cached = _cacheGet(cacheKey);
+  const cacheCtx = { project, cwd };
+  const cached = _cacheGet(cacheKey, cacheCtx);
   if (cached) return cached;
 
   const all = [
@@ -698,7 +723,7 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = f
       })),
     });
   }
-  _cacheSet(cacheKey, out);
+  _cacheSet(cacheKey, out, cacheCtx);
   return out;
 }
 
