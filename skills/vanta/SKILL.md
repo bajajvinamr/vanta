@@ -33,6 +33,8 @@ Check in order:
 
 When starting fresh:
 
+**Apply the Low-Confidence Gate first** (see "Low-Confidence Intent Mode" below). If the user's stated intent is vague ("make me an app", "build something", "let's start"), DO NOT proceed to GSD/superpowers/native planning yet. Run grill-mode (3-4 reductive questions) until the intent is one clear sentence, then route to the appropriate planning path below.
+
 **If GSD is available:**
 1. Run `/gsd-new-project` to initialize `.planning/`
 2. Run `/gsd-plan-phase` to break the project into phases
@@ -216,9 +218,37 @@ After running, summarize: "Found N matches. Most relevant: [1-line summary]." If
 
 When given an argument that did not match routing:
 1. Treat as a feature/task description
-2. Check if it fits current phase or needs a new phase
-3. Plan with GSD (`/gsd-plan-phase`) if available, else describe the steps inline
-4. Execute
+2. **Apply the Low-Confidence Gate (below)** — if intent is ambiguous, grill before planning
+3. Check if it fits current phase or needs a new phase
+4. Plan with GSD (`/gsd-plan-phase`) if available, else describe the steps inline
+5. Execute
+
+## Low-Confidence Intent Mode (internal — fires on ambiguous input)
+
+**Distinct from `Skill("brainstorming")`:** brainstorming is GENERATIVE (explore the design space once intent is clear). Grill-mode is REDUCTIVE (narrow ambiguous intent to a single clear ask BEFORE generation). Different lifecycle phase — never confuse them.
+
+**Internal only.** The user never types `/grill-me`. Grill-mode is the response shape vanta-run picks when intent is ambiguous, not a separate invocation. Keeps the three-command surface intact.
+
+**Triggers — fire grill-mode when ANY:**
+- Bootstrap intent is vague: "make me an app", "build something", "let's start"
+- Argument given but routing missed AND it isn't a clear feature description (heuristic: <5 words, no technical nouns, no verb-object structure)
+- Two or more routes match with same specificity AND no collision rule applies
+- User says "I don't know what I want" / "you decide" / "whatever you think"
+
+**Protocol:**
+1. **ONE question per turn**, never two. Wait for the answer before asking the next.
+2. Each question PRUNES the decision tree. No "tell me more about your idea" — ask binary or 3-option choices.
+3. **Question order — SCOPE → STAKES → SHAPE → STACK** (cap at 4):
+   - **SCOPE**: "Is this (a) a brand-new app, (b) a feature in an existing repo, or (c) a one-off script/automation?"
+   - **STAKES**: "Will this serve real users in production, or is it internal/exploratory/learning?"
+   - **SHAPE**: "Frontend / backend / full-stack / data-and-AI pipeline?"
+   - **STACK**: only if scope=new-app AND user has no preference: "Default stack (Next.js + Hono + Postgres) or different?"
+4. After 3-4 questions max: **restate the intent in one sentence** and ask "Got it — proceed?" If yes → route to bootstrap or appropriate skill. If user adds detail → refine, then proceed.
+5. **Bail-out**: if the user signals impatience ("just do it", "stop asking", "you pick"), drop to best-guess mode immediately. Pick the most-likely interpretation, state the assumption, proceed.
+
+**Why grill-mode beats guessing:** 3 binary questions take 60 seconds. Wrong-direction implementation takes 30 minutes to recover from. The cost is one perceived speed bump; the value is avoiding "this is not what I wanted" mid-build.
+
+**Upstream provenance:** Pattern adapted from mattpocock/skills/grill-me (MIT). The reductive-questioning shape is the borrowed primitive; the SCOPE→STAKES→SHAPE→STACK sequence and the 4-question cap are Vanta-original (matched to the user's "ship > perfect" working mode).
 
 ## Proactive Suggestions (always active)
 
