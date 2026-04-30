@@ -77,18 +77,36 @@ const BASH_VERB_ALLOWLIST = new Set([
   'true', 'false', 'test', 'sleep', 'kill', 'ps',
 ]);
 
+// R3 P3: leading `VAR=value` env assignments + wrapper verbs like `env`
+// hid the real command behind 'other'. Strip them, then look up the
+// real first executable token. `NODE_ENV=test pnpm test` → `pnpm`.
+const VAR_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const WRAPPERS = new Set(['env', 'command', 'builtin', 'time', 'nice', 'nohup', 'exec', 'sudo']);
+
 function _normalizeBashVerb(command) {
   if (typeof command !== 'string') return null;
-  // First token = up to first whitespace. We deliberately do NOT match
-  // shell metacharacters; "cd /Users/.. && git status" splits at the first
-  // space, leaving us with "cd" — exactly what we want.
-  const firstToken = command.trim().split(/\s+/, 1)[0];
-  if (!firstToken) return null;
+  // Tokenize on whitespace — shell metacharacters left alone; "cd /Users/x &&
+  // git status" still splits cleanly at the first space and we end up with
+  // "cd". We take up to ~6 tokens because env-prefixes can stack
+  // (`A=1 B=2 sudo env C=3 git status` — silly but possible).
+  const tokens = command.trim().split(/\s+/).slice(0, 6);
+  let i = 0;
+  // Strip leading VAR=value pairs.
+  while (i < tokens.length && VAR_ASSIGN_RE.test(tokens[i])) i++;
+  let token = tokens[i];
+  if (!token) return null;
   // Strip path components — `/Users/x/script.sh` → `script.sh`.
-  const base = firstToken.includes('/')
-    ? firstToken.slice(firstToken.lastIndexOf('/') + 1)
-    : firstToken;
-  // Tail: 'git', 'node', 'rg' → keep. '.sh' or 'unknown-bin' → 'other'.
+  const baseOf = (t) => t.includes('/') ? t.slice(t.lastIndexOf('/') + 1) : t;
+  let base = baseOf(token);
+  // Skip wrapper verbs and recurse over their args (`sudo env A=1 git x`
+  // → `git`). Bounded by tokens.length so we always terminate.
+  while (WRAPPERS.has(base) && i + 1 < tokens.length) {
+    i++;
+    while (i < tokens.length && VAR_ASSIGN_RE.test(tokens[i])) i++;
+    if (i >= tokens.length) break;
+    token = tokens[i];
+    base = baseOf(token);
+  }
   if (BASH_VERB_ALLOWLIST.has(base)) return base;
   return 'other';
 }
