@@ -129,7 +129,11 @@ function loadProjectPatterns(projectRoot) {
       try {
         const re = new RegExp(reSrc, 'gi');
         out.push({ cat: cat.trim(), re, why });
-      } catch { /* invalid regex: skip */ }
+      } catch (err) {
+        // Tier 5 P3 (Codex): silent swallow created invisible coverage gaps.
+        // Warn to stderr (only path that gets through quiet mode is critical).
+        process.stderr.write(`vanta-index: invalid regex in ${path.relative(projectRoot, filePath) || filePath}: ${reSrc} — ${err.message}\n`);
+      }
     }
   }
   return out;
@@ -484,16 +488,26 @@ function migrateLegacyIfNeeded(quiet) {
         if (!slug) continue;  // skip unknowns; they'll be reindexed under raw slug
         (byProject[slug] = byProject[slug] || []).push(e);
       }
+      // Tier 5 P1 fix (Codex): migration writes shards via atomicWriteJsonl.
+      // A normal indexer that saw the migration lock and skipped could still
+      // call acquireLock(slug) and write to a shard the migrator is mid-way
+      // through. Acquire each target shard lock BEFORE the write so any
+      // concurrent indexer waits at its own acquireLock call.
       for (const [slug, entries] of Object.entries(byProject)) {
-        const existing = loadShard(slug);
-        const seen = new Set(existing.map(e => `${e.source}|${e.category}`));
-        const merged = [...existing];
-        for (const e of entries) {
-          const k = `${e.source}|${e.category}`;
-          if (!seen.has(k)) { merged.push(e); seen.add(k); }
+        if (!acquireLock(slug)) continue;  // migration of this shard skipped — next --full will re-do
+        try {
+          const existing = loadShard(slug);
+          const seen = new Set(existing.map(e => `${e.source}|${e.category}`));
+          const merged = [...existing];
+          for (const e of entries) {
+            const k = `${e.source}|${e.category}`;
+            if (!seen.has(k)) { merged.push(e); seen.add(k); }
+          }
+          atomicWriteJsonl(shardPath(slug), merged);
+          migrated += entries.length;
+        } finally {
+          releaseLock(slug);
         }
-        atomicWriteJsonl(shardPath(slug), merged);
-        migrated += entries.length;
       }
     }
     fs.renameSync(LEGACY_GLOBAL_JSONL, LEGACY_GLOBAL_JSONL + '.bak');
