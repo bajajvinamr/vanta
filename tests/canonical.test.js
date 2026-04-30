@@ -529,12 +529,13 @@ describe('vanta-council-feedback — record/attribute/stats', () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  test('matchOpen() finds open findings with topic + jaccard match', () => {
+  test('matchOpen() returns STRONG match when jaccard ≥ 0.25', () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cf-'));
     process.env.VANTA_DIR_OVERRIDE = tmp;
     cf = freshModule();
 
-    // Two findings: one matches an incoming invariant, one doesn't.
+    // High-overlap invariant: shares "ES256", "HS256", "JWT/JWTs", "must"
+    // → jaccard well above 0.25 = STRONG.
     cf.record({
       topic: 'auth', slug: 'pi-perception', councilRun: '2026-04-30T00:00:00Z',
       findingText: 'JWT secrets must be ES256 not HS256', priority: 'P1', model: 'codex',
@@ -546,12 +547,42 @@ describe('vanta-council-feedback — record/attribute/stats', () => {
 
     const matches = cf.matchOpen({
       slug: 'pi-perception',
-      invariant: 'Use ES256 asymmetric JWTs for pi-perception auth',
+      invariant: 'JWT secrets must be ES256 not HS256 in pi-perception',
     });
     assert.ok(matches.length >= 1, 'should find the JWT match');
-    // Top match should be the auth finding, not CORS.
+    assert.equal(matches[0].strength, 'strong');
     assert.equal(matches[0].topic, 'auth');
-    assert.ok(matches[0].similarity > 0 || matches[0].topicHit);
+    assert.ok(matches[0].similarity >= 0.25, `jaccard ${matches[0].similarity} should be ≥ 0.25`);
+
+    process.env.VANTA_DIR_OVERRIDE = '';
+    delete process.env.VANTA_DIR_OVERRIDE;
+  });
+
+  test('matchOpen() does NOT auto-attribute on topic-hit-only (Codex P1 fix)', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cf-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    cf = freshModule();
+
+    cf.record({
+      topic: 'auth', slug: 'x', councilRun: '2026-04-30T00:00:00Z',
+      findingText: 'completely unrelated SAML metadata thing', priority: 'P1', model: 'codex',
+    });
+
+    // Generic invariant containing "auth" but with zero lexical overlap
+    // with the finding excerpt. Old behavior: topicHit alone returned this
+    // as a match → would auto-TP. New behavior: jaccard is too low for
+    // even 'weak' tier (< 0.10), so no match returned.
+    const matches = cf.matchOpen({
+      slug: 'x',
+      invariant: 'Always validate user input before storing in auth tokens',
+    });
+    // Topic-hit alone with very low Jaccard should NOT return a match.
+    // If something does come back, it MUST be flagged as 'weak' so the
+    // caller knows not to auto-attribute.
+    for (const m of matches) {
+      assert.notEqual(m.strength, 'strong',
+        'topic-hit-only must never reach STRONG — would corrupt the accuracy dataset');
+    }
 
     process.env.VANTA_DIR_OVERRIDE = '';
     delete process.env.VANTA_DIR_OVERRIDE;
@@ -622,6 +653,110 @@ describe('vanta-council-feedback — record/attribute/stats', () => {
     const s = cf.stats({ days: 30 });
     assert.equal(s.tp, 1, 'latest-wins flips fp → tp');
     assert.equal(s.fp, 0);
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
+// ─── council-run (Codex Tier-6 P2 fix) ──────────────────────────────────────
+
+describe('vanta-council-run — machine-checked artifact', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  let tmp;
+
+  function freshModule() {
+    delete require.cache[require.resolve('../bin/vanta-council-run')];
+    return require('../bin/vanta-council-run');
+  }
+
+  test('start() returns ISO timestamp', () => {
+    const m = freshModule();
+    const ts = m.start({ slug: 'x', topic: 'auth' });
+    assert.match(ts, /^\d{4}-\d{2}-\d{2}T/);
+    assert.ok(Math.abs(Date.parse(ts) - Date.now()) < 5000);
+  });
+
+  test('start() rejects missing slug or topic', () => {
+    const m = freshModule();
+    assert.throws(() => m.start({}), /requires/);
+    assert.throws(() => m.start({ slug: 'x' }), /requires/);
+  });
+
+  test('finish() writes a complete record + last() reads it', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cr-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = freshModule();
+
+    const ts = m.start({ slug: 'pi-perception', topic: 'auth' });
+    m.finish({
+      ts, slug: 'pi-perception', topic: 'auth',
+      mode: 'FULL',
+      models_attempted: ['codex@gpt-5.4', 'gemini@gemini-3.1-pro-preview'],
+      models_used: ['codex@gpt-5.4', 'gemini@gemini-3.1-pro-preview'],
+      finding_hashes: ['sha256:abc', 'sha256:def'],
+      verdict: 'PASS_WITH_CONDITIONS',
+    });
+
+    const r = m.last({ slug: 'pi-perception' });
+    assert.equal(r.mode, 'FULL');
+    assert.equal(r.verdict, 'PASS_WITH_CONDITIONS');
+    assert.equal(r.finding_hashes.length, 2);
+    assert.equal(r.models_used.length, 2);
+    assert.equal(r.rounds, 1);
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('finish() rejects invalid mode + verdict', () => {
+    const m = freshModule();
+    assert.throws(() => m.finish({
+      ts: '2026-04-30T00:00:00Z', slug: 'x', topic: 't',
+      mode: 'INVALID', models_attempted: [], models_used: [], verdict: 'PASS',
+    }), /mode must be one of/);
+    assert.throws(() => m.finish({
+      ts: '2026-04-30T00:00:00Z', slug: 'x', topic: 't',
+      mode: 'FULL', models_attempted: [], models_used: [], verdict: 'BAD',
+    }), /verdict must be one of/);
+  });
+
+  test('audit() surfaces degradation signal — partial rate', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cr-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = freshModule();
+
+    // 3 runs: 1 FULL, 2 PARTIAL → partial_rate = 0.67
+    for (const mode of ['FULL', 'PARTIAL', 'PARTIAL']) {
+      const ts = m.start({ slug: 'x', topic: 't' });
+      m.finish({
+        ts, slug: 'x', topic: 't', mode,
+        models_attempted: ['codex'], models_used: ['codex'],
+        verdict: 'PASS',
+      });
+    }
+    const a = m.audit({ days: 90 });
+    assert.equal(a.total, 3);
+    assert.equal(a.mode_distribution.FULL, 1);
+    assert.equal(a.mode_distribution.PARTIAL, 2);
+    assert.ok(Math.abs(a.partial_rate - 0.67) < 0.01);
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('last() filters by slug', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cr-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = freshModule();
+
+    m.finish({ ts: '2026-04-30T00:00:00Z', slug: 'a', topic: 't', mode: 'FULL', models_attempted: [], models_used: [], verdict: 'PASS' });
+    m.finish({ ts: '2026-04-30T00:00:01Z', slug: 'b', topic: 't', mode: 'FULL', models_attempted: [], models_used: [], verdict: 'PASS' });
+    assert.equal(m.last({ slug: 'a' }).slug, 'a');
+    assert.equal(m.last({ slug: 'b' }).slug, 'b');
+    assert.equal(m.last({}).slug, 'b'); // most recent overall
 
     delete process.env.VANTA_DIR_OVERRIDE;
     fs.rmSync(tmp, { recursive: true, force: true });

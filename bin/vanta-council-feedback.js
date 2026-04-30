@@ -123,11 +123,17 @@ function attribute({ hash, outcome, evidence }) {
 // Match criteria (ALL must hold):
 //   - finding.slug === slug
 //   - finding ts within last 14 days (default; --days N to override)
-//   - topic OR excerpt overlap with invariant text (Jaccard ≥ 0.25
-//     on word-set, or topic substring match in invariant)
+//   - lexical overlap: word-set Jaccard ≥ 0.25 (the primary signal)
 //
-// Returns array of { hash, finding_excerpt, topic, model, similarity }
-// sorted by similarity desc. Caller picks the top match for attribute().
+// Match modes (council Tier 6 #15 → Codex P1 fix):
+//   - 'strong' (default): jaccard ≥ 0.25 — caller may auto-attribute the top match
+//   - 'weak'  (topic-hit-only assist): jaccard 0.10–0.25 + topic substring hit —
+//     surfaced for HUMAN review only. Topic alone is too generic (any invariant
+//     mentioning "auth" matches every auth-topic finding) and auto-TP'ing on
+//     this signal silently corrupts the accuracy dataset.
+//
+// `strength` field on each result tells the caller what they're looking at.
+// vanta-sync Step 8 only auto-attributes 'strong' matches.
 function matchOpen({ slug, invariant, days = 14 } = {}) {
   if (!slug || !invariant) {
     throw new Error('matchOpen() requires: slug, invariant');
@@ -145,27 +151,37 @@ function matchOpen({ slug, invariant, days = 14 } = {}) {
 
   const matches = [];
   for (const f of open) {
-    const topicHit = (invariant.toLowerCase().includes(String(f.topic || '').toLowerCase())
-      && (f.topic || '').length >= 3) ? 1 : 0;
+    const topicStr = String(f.topic || '');
+    const topicHit = (topicStr.length >= 3 &&
+      invariant.toLowerCase().includes(topicStr.toLowerCase())) ? 1 : 0;
     const excerptTokens = tokenize(f.finding_excerpt || '');
     let inter = 0;
     for (const t of invTokens) if (excerptTokens.has(t)) inter++;
     const union = invTokens.size + excerptTokens.size - inter;
     const jaccard = union === 0 ? 0 : inter / union;
-    if (jaccard >= 0.25 || topicHit) {
-      matches.push({
-        hash: f.finding_hash,
-        finding_excerpt: f.finding_excerpt,
-        topic: f.topic,
-        model: f.model,
-        priority: f.priority,
-        similarity: Math.round(jaccard * 100) / 100,
-        topicHit: !!topicHit,
-        ts: f.ts,
-      });
-    }
+
+    let strength;
+    if (jaccard >= 0.25)                       strength = 'strong';
+    else if (jaccard >= 0.10 && topicHit)      strength = 'weak';
+    else                                       continue;
+
+    matches.push({
+      hash: f.finding_hash,
+      finding_excerpt: f.finding_excerpt,
+      topic: f.topic,
+      model: f.model,
+      priority: f.priority,
+      similarity: Math.round(jaccard * 100) / 100,
+      topicHit: !!topicHit,
+      strength,
+      ts: f.ts,
+    });
   }
-  matches.sort((a, b) => b.similarity - a.similarity);
+  // Strong matches first, then weak — tiebreak by similarity desc.
+  matches.sort((a, b) => {
+    if (a.strength !== b.strength) return a.strength === 'strong' ? -1 : 1;
+    return b.similarity - a.similarity;
+  });
   return matches;
 }
 
@@ -281,16 +297,24 @@ function cliMatchOpen() {
     console.log(`No open findings match (slug=${a.slug}, ${days}d window).`);
     return;
   }
-  console.log(`${matches.length} open finding(s) match within ${days}d:`);
+  const strong = matches.filter(m => m.strength === 'strong');
+  const weak = matches.filter(m => m.strength === 'weak');
+  console.log(`${matches.length} open finding(s) match within ${days}d (${strong.length} strong, ${weak.length} weak):`);
   for (const m of matches) {
-    console.log(`  [${m.priority}] ${m.hash} · ${m.model} · sim=${m.similarity}${m.topicHit ? ' (topic-hit)' : ''}`);
+    const tag = m.strength === 'strong' ? 'STRONG' : 'weak  ';
+    console.log(`  [${tag}] [${m.priority}] ${m.hash} · ${m.model} · sim=${m.similarity}${m.topicHit ? ' (topic-hit)' : ''}`);
     console.log(`     topic=${m.topic} ts=${m.ts.slice(0,10)}`);
     console.log(`     "${m.finding_excerpt.slice(0, 120)}"`);
   }
   console.log('');
-  console.log('Attribute the top match:');
-  const top = matches[0];
-  console.log(`  vanta-council-feedback attribute --hash ${top.hash} --outcome true-positive --evidence "..."`);
+  if (strong.length > 0) {
+    const top = strong[0];
+    console.log('Attribute the top STRONG match:');
+    console.log(`  vanta-council-feedback attribute --hash ${top.hash} --outcome true-positive --evidence "..."`);
+  } else {
+    console.log('No STRONG matches — weak ones surfaced for human review only.');
+    console.log('Auto-attribution on weak matches would corrupt the accuracy dataset (topic substring is too generic).');
+  }
 }
 
 function cliStats() {

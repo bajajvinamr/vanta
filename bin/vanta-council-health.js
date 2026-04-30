@@ -120,22 +120,37 @@ function checkMcpRegistration() {
 
 function checkGeminiTrust(mcpEnv) {
   // Reliable signals (in order):
-  //   1. GEMINI_CLI_TRUST_WORKSPACE in the Multi-CLI MCP env — most reliable
-  //   2. trust=true or non-empty trustedFolders in ~/.gemini/settings.json
-  //   3. Recent successful Multi-CLI Gemini calls in vanta query-log (proof
-  //      it's actually working, even if config heuristics aren't matched)
+  //   1. GEMINI_CLI_TRUST_WORKSPACE=true in the MCP env — applies to all dirs
+  //   2. settings.trust === true — global "trust everything" flag
+  //   3. trustedFolders contains the CURRENT cwd or one of its ancestors
+  //
+  // Codex council Tier 6 P2 fix: previously any non-empty trustedFolders array
+  // returned ok=true, even if the current repo wasn't trusted. That made
+  // vanta-status report "ready" while /council still died with exit 55 in
+  // this directory.
   const envTrust = mcpEnv && (mcpEnv.GEMINI_CLI_TRUST_WORKSPACE === 'true' || mcpEnv.GEMINI_CLI_TRUST_WORKSPACE === true);
   if (envTrust) return { ok: true, source: 'mcp-env' };
 
   const settings = safeJSON(path.join(os.homedir(), '.gemini', 'settings.json'));
-  const settingsTrust = settings && (settings.trust === true || (Array.isArray(settings.trustedFolders) && settings.trustedFolders.length > 0));
-  if (settingsTrust) return { ok: true, source: 'gemini-settings' };
+  if (settings && settings.trust === true) return { ok: true, source: 'gemini-settings.trust=true' };
 
-  // Empirical fallback: if Gemini has been successfully invoked recently
-  // (Multi-CLI returned non-error), trust must already be configured somehow.
-  // We can't directly observe this without a query log — leave as a heuristic
-  // for the future. For now: if config heuristics fail, warn but don't error
-  // (the user may have it configured via a method we don't recognize).
+  // Cwd-aware trustedFolders check: walk up from cwd looking for an exact match.
+  if (settings && Array.isArray(settings.trustedFolders) && settings.trustedFolders.length > 0) {
+    const cwd = process.cwd();
+    const trusted = new Set(settings.trustedFolders.map(f => path.resolve(f.replace(/^~/, os.homedir()))));
+    let dir = cwd;
+    while (dir && dir !== '/') {
+      if (trusted.has(dir)) return { ok: true, source: `trustedFolders[${dir}]` };
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return {
+      ok: false,
+      reason: `trustedFolders has ${settings.trustedFolders.length} entries but none cover ${cwd}; council will exit 55 here. Set GEMINI_CLI_TRUST_WORKSPACE=true in MCP env or add this directory to trustedFolders.`,
+    };
+  }
+
   return {
     ok: false,
     reason: 'GEMINI_CLI_TRUST_WORKSPACE not set in MCP env; ~/.gemini/settings.json has no trust config. Council MAY still work if trust was configured another way; if Gemini exits 55 in council, set GEMINI_CLI_TRUST_WORKSPACE=true in the Multi-CLI MCP env block.',

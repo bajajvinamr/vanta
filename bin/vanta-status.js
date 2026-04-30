@@ -222,6 +222,27 @@ function readCouncilFeedback() {
   return null;
 }
 
+// Codex P2 fix: read council-runs.jsonl for machine-checked degradation data
+// instead of trusting prose model_health blocks in the report text.
+let _councilRunsAudit = null;
+function readCouncilRunsAudit() {
+  if (_councilRunsAudit !== null) return _councilRunsAudit;
+  for (const p of [
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-council-run.js'),
+    path.join(os.homedir(), 'Projects', 'vanta', 'bin', 'vanta-council-run.js'),
+  ]) {
+    try {
+      const m = require(p);
+      if (m && m.audit) {
+        _councilRunsAudit = { audit: m.audit({ days: 90 }), last: m.last() };
+        return _councilRunsAudit;
+      }
+    } catch {}
+  }
+  _councilRunsAudit = null;
+  return null;
+}
+
 function renderText() {
   const shards   = readShards();
   const queues   = readQueues();
@@ -329,10 +350,26 @@ function renderText() {
       ? `✓ trust ok (${council.gemini.source})`
       : '⚠ ' + council.gemini.reason.slice(0, 60)));
     console.log('  Codex:      ' + (council.codex.ok ? '✓ config present' : '✗ ' + council.codex.reason));
-    if (council.lastCouncil) {
+    // Prefer the machine-checked council-runs.jsonl over decisions.md prose.
+    const runsAudit = readCouncilRunsAudit();
+    if (runsAudit && runsAudit.last) {
+      const r = runsAudit.last;
+      const flags = [];
+      if (r.mode !== 'FULL') flags.push(r.mode);
+      if (r.fallbacks && r.fallbacks.length) flags.push(`${r.fallbacks.length} fallback${r.fallbacks.length === 1 ? '' : 's'}`);
+      console.log(`  Last run:   ${r.ts.slice(0, 10)} · ${r.topic.slice(0, 40)} · ${r.verdict}${flags.length ? ' · ⚠ ' + flags.join(', ') : ''}`);
+    } else if (council.lastCouncil) {
       console.log(`  Last run:   ${council.lastCouncil.date} · ${council.lastCouncil.topic.slice(0, 50)}`);
     } else {
       console.log('  Last run:   — none for this project');
+    }
+    if (runsAudit && runsAudit.audit && runsAudit.audit.total > 0) {
+      const a = runsAudit.audit;
+      const partial = Math.round(a.partial_rate * 100);
+      const fallback = Math.round(a.fallback_rate * 100);
+      if (partial > 20 || fallback > 20) {
+        console.log(`  Degradation: ${a.total} run(s) in 90d · ${partial}% PARTIAL · ${fallback}% had fallbacks · check vanta-council-run audit`);
+      }
     }
     // Tier 6 #15: per-model accuracy if any feedback has accumulated.
     const feedback = readCouncilFeedback();
@@ -361,7 +398,9 @@ function renderText() {
   const unsynced = (queues.find(q => q.name === 'sync-queue') || {}).unsynced || 0;
   if (unsynced > 0)        sugg.push(`/vanta-sync to clear ${unsynced} unsynced session(s)`);
   const staging = (queues.find(q => q.name === 'staging-invariants') || {}).stagingCount || 0;
-  if (staging > 0)         sugg.push(`vanta-extract-score list-staging — review ${staging} pending invariant(s)`);
+  // Surface Impact Discipline: don't suggest a new command name. The next
+  // /vanta-sync run is responsible for clearing staging — say that instead.
+  if (staging > 0)         sugg.push(`/vanta-sync to review ${staging} staged invariant(s)`);
   if (locks.some(l => !l.alive)) sugg.push('rm ~/.vanta/knowledge/*.lock (stale, owning pid is dead)');
   const dormantUnknown = shards.filter(s =>
     (Date.now() - s.mtime) > 30 * 86400_000 && !['little-wins','pi-perception','sales-agent-publisher','founderos','priyaa-audit','vanta'].includes(s.slug)
