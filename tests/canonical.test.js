@@ -303,6 +303,36 @@ describe('git-guardrails — destructive command tiering', () => {
   });
 });
 
+// ─── council-health (Tier 6 #17) ───────────────────────────────────────────
+
+describe('vanta-council-health — pre-flight readiness', () => {
+  const { gather, summarize } = require('../bin/vanta-council-health');
+
+  test('gather returns expected shape', () => {
+    const s = gather();
+    assert.ok(s.ts, 'ts present');
+    assert.ok(typeof s.mcp === 'object', 'mcp present');
+    assert.ok(typeof s.gemini === 'object', 'gemini present');
+    assert.ok(typeof s.codex === 'object', 'codex present');
+    // mcp may or may not be registered depending on test env — both are valid
+    assert.ok(typeof s.mcp.registered === 'boolean', 'mcp.registered is boolean');
+  });
+
+  test('summarize produces single-line output', () => {
+    const s = gather();
+    const line = summarize(s);
+    assert.ok(typeof line === 'string', 'summary is string');
+    assert.ok(!line.includes('\n'), 'summary is single-line');
+    assert.ok(line.startsWith('council:'), 'summary starts with council:');
+  });
+
+  test('does not throw on missing files', () => {
+    // gather() must not crash when ~/.gemini, ~/.codex, etc. are absent —
+    // returns structured "not ok" reasons instead.
+    assert.doesNotThrow(() => gather());
+  });
+});
+
 // ─── module surface check ──────────────────────────────────────────────────
 
 describe('module exports — sanity', () => {

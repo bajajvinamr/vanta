@@ -177,11 +177,29 @@ function readLocks() {
 
 // ── render ─────────────────────────────────────────────────────────────────
 
+// Tier 6 #17: surface council readiness as one of the health signals.
+let _councilHealth = null;
+function readCouncilHealth() {
+  if (_councilHealth !== null) return _councilHealth;
+  for (const p of [
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-council-health.js'),
+    path.join(os.homedir(), 'Projects', 'vanta', 'bin', 'vanta-council-health.js'),
+  ]) {
+    try {
+      const m = require(p);
+      if (m && m.gather) { _councilHealth = m.gather(); return _councilHealth; }
+    } catch {}
+  }
+  _councilHealth = null;
+  return null;
+}
+
 function renderText() {
   const shards   = readShards();
   const queues   = readQueues();
   const hookErr  = readHookErrors();
   const locks    = readLocks();
+  const council  = readCouncilHealth();
 
   if (FLAG_QUIET) {
     const totalEntries = shards.reduce((s, x) => s + x.entries, 0);
@@ -192,6 +210,7 @@ function renderText() {
     if (unsynced)  parts.push(`${unsynced} unsynced`);
     if (errs)      parts.push(`${errs} hook errors${SINCE_MIN ? ` (${SINCE_MIN}m)` : ''}`);
     if (stuck)     parts.push(`${stuck} stuck lock`);
+    if (council && !council.mcp.registered) parts.push('council unavailable');
     console.log('vanta: ' + parts.join(' · '));
     return;
   }
@@ -271,6 +290,24 @@ function renderText() {
     console.log('');
   }
 
+  // Council readiness (Tier 6 #17)
+  if (council) {
+    console.log('COUNCIL');
+    console.log('  Multi-CLI:  ' + (council.mcp.registered
+      ? `✓ registered (${council.mcp.scope}${council.mcp.scope === 'project' ? ': ' + council.mcp.projectPath : ''})`
+      : '✗ ' + council.mcp.reason.slice(0, 80)));
+    console.log('  Gemini:     ' + (council.gemini.ok
+      ? `✓ trust ok (${council.gemini.source})`
+      : '⚠ ' + council.gemini.reason.slice(0, 60)));
+    console.log('  Codex:      ' + (council.codex.ok ? '✓ config present' : '✗ ' + council.codex.reason));
+    if (council.lastCouncil) {
+      console.log(`  Last run:   ${council.lastCouncil.date} · ${council.lastCouncil.topic.slice(0, 50)}`);
+    } else {
+      console.log('  Last run:   — none for this project');
+    }
+    console.log('');
+  }
+
   // Suggestions
   const sugg = [];
   const unsynced = (queues.find(q => q.name === 'sync-queue') || {}).unsynced || 0;
@@ -282,6 +319,8 @@ function renderText() {
   if (dormantUnknown.length) sugg.push(`vanta-prune candidates: ${dormantUnknown.map(s => s.slug).join(', ')}`);
   const errSources = Object.keys(hookErr.counts || {});
   if (errSources.length) sugg.push(`tail ~/.vanta/hook.log to debug: ${errSources.join(', ')}`);
+  if (council && !council.mcp.registered) sugg.push('install Multi-CLI MCP before /council can fire (vanta-council-health for details)');
+  if (council && council.mcp.registered && !council.gemini.ok) sugg.push('council may run partial — set GEMINI_CLI_TRUST_WORKSPACE=true in MCP env');
 
   if (sugg.length) {
     console.log('SUGGESTIONS');
