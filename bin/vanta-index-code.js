@@ -52,21 +52,107 @@ const MAX_FILES_PER_RUN = 5_000;
 const LOCK_MAX_RETRIES = 10;
 const LOCK_RETRY_MS = 100;
 
-// Detection patterns — each (category, regex, why) triple.
-const SENSITIVE_PATTERNS = [
-  { cat: 'child-safety',  re: /\b(POCSO|COPPA|safeguard(?:ing)?|child[- ]safe|mandatory[- ]report|incident[- ]rout)/gi, why: 'Child-safety boundary — POCSO §19/§21 reporting, mandatory incident routing.' },
-  { cat: 'output-filter', re: /\b(filterOutput|outputFilter|output[- ]filter|filter[- ]veto|llm[- ]safe(?:ty)?|output[- ]gate)\b/gi, why: 'LLM output filter — final veto gate. Regression here = unfiltered LLM reaches child.' },
-  { cat: 'consent',       re: /\b(DPDP|parental[- ]consent|guardian[- ]consent|child[- ]pii|EU[- ]region|india[- ]region)\b/gi, why: 'DPDP Rules 2025 — child PII region restriction, parental consent flow.' },
-  { cat: 'auth-boundary', re: /\b(SUPABASE_SERVICE_ROLE_KEY|service[- ]role|middleware\.ts|withAuth|requireAuth|requireRole|getSession|auth\.uid)\b/g, why: 'Auth boundary — service-role usage, middleware, role gating.' },
-  { cat: 'pii',           re: /\b(child_name|parent_phone|school_name|dob|date[- ]of[- ]birth|guardian_email|aadhaar|aadhar|pan_number)\b/gi, why: 'PII field — DPDP §11 territory, must be region-locked and encrypted at rest.' },
-  { cat: 'tz-cron',       re: /\b(TZ=Asia\/Kolkata|cron[- ]schedule|node[- ]cron|new CronJob|scheduleAt|sendWindow)\b/gi, why: 'Timezone-sensitive cron — TZ=Asia/Kolkata is load-bearing for IST send windows.' },
-  { cat: 'red-team',      re: /\b(red[- ]team|MALICIOUS_LLM|adversarial[- ]eval|attack[- ]corpus|RED_TEAM=1)\b/gi, why: 'Red-team harness — must run green before any Mitthu/safety-layer change.' },
-  { cat: 'two-signal',    re: /\btwo[- ]signal\b|\bpaired[- ]sensors?\b|\bcorrobor(?:ate|ation)\b/gi, why: 'Two-signal rule — clinical claim requires ≥2 independent paradigms agreeing.' },
-  { cat: 'norms-gate',    re: /\b(indian[- ]norms?|cbse[- ]norms?|norms[- ]gate|age[- ]band|band[- ]baseline|isParadigmEnabled)\b/gi, why: 'Norms gate — age-band enablement, single source of truth for paradigm dispatch.' },
+// Detection patterns — three layers, merged at index time:
+//
+//   1. BASELINE_PATTERNS — universal across all projects (auth, secrets, PII,
+//      TZ, red-team). Apply regardless of project.
+//   2. PROJECT_SPECIFIC_PATTERNS — curated per known project. LW gets POCSO/
+//      DPDP/two-signal/output-filter; pi-perception gets 12-dim/perception
+//      vocabulary; etc. Lives in code so updates ship via repo.
+//   3. CLAUDE.md `## Sensitive Patterns` — user-defined additions, loaded
+//      from project CLAUDE.md at index time. Lets users extend without code
+//      changes.
+//
+// Council Tier 4 finding: hardcoding LW patterns in the baseline made the
+// indexer effectively LW-only for non-LW projects. This 3-layer structure
+// fixes that: baseline is generic, per-project is curated and switchable,
+// CLAUDE.md is the user extension surface.
+const BASELINE_PATTERNS = [
+  { cat: 'auth-boundary', re: /\b(SUPABASE_SERVICE_ROLE_KEY|SERVICE_ROLE_KEY|service[- ]role|middleware\.ts|withAuth|requireAuth|requireRole|getSession|auth\.uid|JWT_SECRET)\b/g, why: 'Auth boundary — service-role usage, middleware, role gating, JWT secrets.' },
+  { cat: 'pii',           re: /\b(date[- ]of[- ]birth|guardian_email|aadhaar|aadhar|pan_number|ssn|tax_id|passport_number)\b/gi, why: 'PII field — region-locked + encrypted at rest, must not log in plain text.' },
+  { cat: 'tz-cron',       re: /\b(TZ=[A-Za-z_/]+|cron[- ]schedule|node[- ]cron|new CronJob|scheduleAt|sendWindow)\b/g, why: 'Timezone-sensitive cron — TZ env var is load-bearing for scheduled jobs.' },
+  { cat: 'red-team',      re: /\b(red[- ]team|adversarial[- ]eval|attack[- ]corpus|RED_TEAM=1)\b/gi, why: 'Red-team / adversarial harness — must pass before merging changes near it.' },
+  { cat: 'secrets',       re: /\b(API_KEY|SECRET_KEY|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN|process\.env\.[A-Z_]+_(KEY|SECRET|TOKEN))\b/g, why: 'Secret value — never log, never commit, validate presence at boot.' },
 ];
 
-function patternsHash() {
-  const sig = SENSITIVE_PATTERNS.map(p => `${p.cat}|${p.re.source}|${p.re.flags}|${p.why}`).join('\n');
+// Curated per-project patterns. Keyed by canonical slug from vanta-projects.
+// Add a new project's patterns here when its domain has stable boundary
+// concepts that should be queryable across the whole codebase.
+const PROJECT_SPECIFIC_PATTERNS = {
+  'little-wins': [
+    { cat: 'child-safety',  re: /\b(POCSO|COPPA|safeguard(?:ing)?|child[- ]safe|mandatory[- ]report|incident[- ]rout)/gi, why: 'Child-safety boundary — POCSO §19/§21 reporting, mandatory incident routing.' },
+    { cat: 'output-filter', re: /\b(filterOutput|outputFilter|output[- ]filter|filter[- ]veto|llm[- ]safe(?:ty)?|output[- ]gate)\b/gi, why: 'LLM output filter — final veto gate. Regression here = unfiltered LLM reaches child.' },
+    { cat: 'consent',       re: /\b(DPDP|parental[- ]consent|guardian[- ]consent|child[- ]pii|EU[- ]region|india[- ]region)\b/gi, why: 'DPDP Rules 2025 — child PII region restriction, parental consent flow.' },
+    { cat: 'pii-lw',        re: /\b(child_name|parent_phone|school_name|dob)\b/gi, why: 'LW-specific PII — region-locked, never logged, encrypted at rest.' },
+    { cat: 'two-signal',    re: /\btwo[- ]signal\b|\bpaired[- ]sensors?\b|\bcorrobor(?:ate|ation)\b/gi, why: 'Two-signal rule — clinical claim requires ≥2 independent paradigms agreeing.' },
+    { cat: 'norms-gate',    re: /\b(indian[- ]norms?|cbse[- ]norms?|norms[- ]gate|age[- ]band|band[- ]baseline|isParadigmEnabled)\b/gi, why: 'Norms gate — age-band enablement, single source of truth for paradigm dispatch.' },
+  ],
+  'pi-perception': [
+    { cat: '12-dim',        re: /\b(12[- ]dim|twelve[- ]dim|perception[- ]intelligence|pi[- ]score)\b/gi, why: '12-dim perception scoring — calibration is load-bearing.' },
+  ],
+  // Add other projects here as they grow domain-specific patterns.
+  // 'sales-agent-publisher': [ ... ],
+  // 'founderos': [ ... ],
+};
+
+// Read project-specific patterns from CLAUDE.md `## Sensitive Patterns` section.
+// Format (one per line):
+//   - <regex> → <category> [optional: | <why explanation>]
+// Example LW CLAUDE.md:
+//   ## Sensitive Patterns
+//   - POCSO|COPPA|safeguard → child-safety | POCSO §19/§21 mandatory reporting
+//   - DPDP|parental[- ]consent|child[- ]pii → consent | DPDP child PII region restriction
+//   - filterOutput|output[- ]filter → output-filter | LLM output veto gate
+//
+// Patterns are case-insensitive (added 'gi' flags).
+// Returns array of {cat, re, why} compatible with BASELINE_PATTERNS.
+function loadProjectPatterns(projectRoot) {
+  const out = [];
+  // Walk all CLAUDE.md files (root + subdirs) for sections.
+  for (const filePath of walkClaudeMd(projectRoot)) {
+    const content = readSafe(filePath);
+    if (!content) continue;
+    const m = content.match(/^##\s+Sensitive Patterns\s*$([\s\S]*?)(?=\n##\s|\n*$)/m);
+    if (!m) continue;
+    const section = m[1];
+    for (const rawLine of section.split('\n')) {
+      const line = rawLine.trim();
+      if (!line.startsWith('-')) continue;
+      const body = line.slice(1).trim();
+      // Split: <regex> → <category> [| <why>]
+      const arrowParts = body.split(/\s*[→]\s*/);
+      if (arrowParts.length < 2) continue;
+      const reSrc = arrowParts[0].trim();
+      const rest = arrowParts.slice(1).join('→').trim();
+      const [cat, ...whyParts] = rest.split(/\s*\|\s*/);
+      const why = whyParts.join(' | ').trim() || `Project pattern from ${path.basename(filePath)}: ${cat}`;
+      try {
+        const re = new RegExp(reSrc, 'gi');
+        out.push({ cat: cat.trim(), re, why });
+      } catch { /* invalid regex: skip */ }
+    }
+  }
+  return out;
+}
+
+// Effective patterns for a project = baseline + project-curated + CLAUDE.md.
+// Order matters for category labelling but not correctness — duplicates by
+// category are fine; distinct entries fire independently.
+function effectivePatterns(slug, projectRoot) {
+  const projCurated = PROJECT_SPECIFIC_PATTERNS[slug] || [];
+  return [...BASELINE_PATTERNS, ...projCurated, ...loadProjectPatterns(projectRoot)];
+}
+
+// Backwards compat for tests / dump / external imports — kept as a
+// reference to the baseline only (project patterns are dynamic).
+const SENSITIVE_PATTERNS = BASELINE_PATTERNS;
+
+// Hash includes the active patterns (baseline + project) so cursor drift is
+// detected when EITHER the baseline changes OR the project's CLAUDE.md
+// `## Sensitive Patterns` section is edited.
+function patternsHash(patterns) {
+  const arr = patterns || SENSITIVE_PATTERNS;
+  const sig = arr.map(p => `${p.cat}|${p.re.source}|${p.re.flags}|${p.why}`).join('\n');
   return crypto.createHash('sha256').update(sig).digest('hex').slice(0, 16);
 }
 
@@ -108,13 +194,26 @@ function cursorPath(slug) { return path.join(KNOWLEDGE_DIR, `${slugForFilesystem
 function lockPath(slug)   { return path.join(KNOWLEDGE_DIR, `${slugForFilesystem(slug)}.lock`); }
 
 // ─── Shard locking ──────────────────────────────────────────────────────────
-// Advisory file lock via O_EXCL. Codex Tier 3 P2 + Gemini Tier 3 P1 fix:
-// atomic rename prevents torn files, but two same-project hook fires can
-// still both read the shard, both write, and last-writer-wins drops entries.
-// O_EXCL + retry serializes those.
+// Advisory file lock via O_EXCL. Tier 3/4/5 evolution:
+//   Atomic rename alone wasn't enough — two same-project hook fires both
+//   read, both write, last-writer-wins. Lock serializes them.
 //
-// Stale-lock heuristic: if lock file exists and is >5s old, assume crashed
-// holder and steal it. Indexer runs are <1s in practice so this is safe.
+// Tier 5 hardening (Codex P2): stale-lock steal now also checks PID liveness.
+// Pure time-based steal (>5s) was risky for slow --full runs on large
+// projects. With PID check: if the holder PID still exists, we wait;
+// only kill the lock when the process is genuinely gone OR exceeded a
+// generous safety threshold (60s, well beyond any realistic run).
+function _isPidAlive(pid) {
+  if (!pid || typeof pid !== 'number') return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+function _readLockMeta(file) {
+  const c = readSafe(file);
+  if (!c) return null;
+  try { return JSON.parse(c); } catch { return null; }
+}
+
 function acquireLock(slug) {
   const file = lockPath(slug);
   for (let attempt = 0; attempt < LOCK_MAX_RETRIES; attempt++) {
@@ -125,13 +224,17 @@ function acquireLock(slug) {
       return true;
     } catch (err) {
       if (err.code !== 'EEXIST') return false;
-      // Steal stale lock
+      // Stale-lock steal — Tier 5: PID-aware.
       const st = statSafe(file);
-      if (st && Date.now() - st.mtimeMs > 5000) {
-        try { fs.unlinkSync(file); } catch {}
-        continue;
+      const meta = _readLockMeta(file);
+      if (st) {
+        const ageMs = Date.now() - st.mtimeMs;
+        const holderAlive = meta && _isPidAlive(meta.pid);
+        if (!holderAlive || ageMs > 60_000) {
+          try { fs.unlinkSync(file); } catch {}
+          continue;
+        }
       }
-      // Sync sleep — hook context has no event loop pressure
       const t = Date.now() + LOCK_RETRY_MS;
       while (Date.now() < t) { /* spin */ }
     }
@@ -248,7 +351,7 @@ function* walkClaudeMd(root) {
 }
 
 // ─── Extractors ─────────────────────────────────────────────────────────────
-function extractFromSource(filePath, projectRoot, projectSlug) {
+function extractFromSource(filePath, projectRoot, projectSlug, sensitivePatterns) {
   const content = readSafe(filePath);
   if (!content) return [];
   const lines = content.split('\n');
@@ -256,7 +359,7 @@ function extractFromSource(filePath, projectRoot, projectSlug) {
   const seen = new Set();
   const rank = pathRank(filePath);
 
-  for (const { cat, re, why } of SENSITIVE_PATTERNS) {
+  for (const { cat, re, why } of sensitivePatterns) {
     re.lastIndex = 0;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
@@ -281,6 +384,11 @@ function extractFromSource(filePath, projectRoot, projectSlug) {
       out.push({
         kind: 'code',
         project: projectSlug,
+        // Tier 5 P1 fix: same-slug collision. Two repos both resolving to
+        // slug "vanta" share vanta.jsonl. Without a per-root field, the
+        // indexer's filter would drop entries from the other repo. Including
+        // projectRoot lets the shard hold both repos' entries side-by-side.
+        projectRoot,
         category: cat,
         why,
         source: `${rel}:${i+1}`,
@@ -312,6 +420,7 @@ function extractFromClaudeMd(filePath, projectRoot, projectSlug) {
         const push = (snippet) => out.push({
           kind: 'claude-md',
           project: projectSlug,
+          projectRoot,  // Tier 5 P1: same-slug collision fix
           category: `claude-md:${curSection.toLowerCase().replace(/\s+/g, '-')}`,
           why: `Project gotcha from ${rel} § ${curSection}`,
           source: `${rel}:${curStart}`,
@@ -352,6 +461,13 @@ function extractFromClaudeMd(filePath, projectRoot, projectSlug) {
 // Both get processed if found, then renamed to .bak.
 function migrateLegacyIfNeeded(quiet) {
   ensureKnowledgeDir();
+  // Tier 5 P2: migration writes shards via atomicWriteJsonl. Two parallel
+  // runs (e.g. two indexers triggered by simultaneous edits in different
+  // tmux panes) could both migrate, doubling entries. Guard with a single
+  // global migration lock — first run does the work, others skip.
+  const migrationLock = path.join(KNOWLEDGE_DIR, '.migration.lock');
+  if (!acquireMigrationLock(migrationLock)) return;
+
   let migrated = 0;
 
   // Tier 2 global jsonl → split into per-slug shards
@@ -416,6 +532,29 @@ function migrateLegacyIfNeeded(quiet) {
   if (!quiet && migrated > 0) {
     process.stdout.write(`Migrated ${migrated} legacy entries to per-slug shards.\n`);
   }
+  try { fs.unlinkSync(migrationLock); } catch {}
+}
+
+// Migration lock — non-retrying. Either we get it or we skip migration.
+// If another run is migrating, by the time it's done the legacy files are
+// renamed to .bak, so on next run migration is a no-op.
+function acquireMigrationLock(file) {
+  try {
+    const fd = fs.openSync(file, 'wx');
+    fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+    fs.closeSync(fd);
+    return true;
+  } catch (err) {
+    if (err.code !== 'EEXIST') return false;
+    // Stale (>120s) → steal. Migration shouldn't take that long.
+    const st = statSafe(file);
+    const meta = _readLockMeta(file);
+    if (st && (Date.now() - st.mtimeMs > 120_000 || !(meta && _isPidAlive(meta.pid)))) {
+      try { fs.unlinkSync(file); } catch {}
+      return acquireMigrationLock(file);
+    }
+    return false;
+  }
 }
 
 // ─── Index runner ───────────────────────────────────────────────────────────
@@ -435,12 +574,15 @@ function runIndex({ cwd, project, full, quiet, singleFile }) {
   }
 
   try {
-    // Patterns hash — drift detection.
+    // Tier 5: patterns now include project-defined additions from CLAUDE.md
+    // `## Sensitive Patterns` section. Hash covers both baseline + project,
+    // so editing the section auto-triggers --full on next run.
+    const projectPatterns = effectivePatterns(slug, projectRoot);
     const cursor = loadCursor(slug);
-    const curHash = patternsHash();
+    const curHash = patternsHash(projectPatterns);
     if (cursor.patternsHash !== curHash && !singleFile) {
       if (!quiet && cursor.patternsHash) {
-        process.stdout.write(`SENSITIVE_PATTERNS changed (was ${cursor.patternsHash} → now ${curHash}); forcing --full.\n`);
+        process.stdout.write(`Patterns changed (was ${cursor.patternsHash} → now ${curHash}); forcing --full.\n`);
       }
       full = true;
     }
@@ -454,7 +596,7 @@ function runIndex({ cwd, project, full, quiet, singleFile }) {
       if (fs.existsSync(abs)) {
         const ext = path.extname(abs);
         if (path.basename(abs) === 'CLAUDE.md') entries = extractFromClaudeMd(abs, projectRoot, slug);
-        else if (SOURCE_EXTS.has(ext))         entries = extractFromSource(abs, projectRoot, slug);
+        else if (SOURCE_EXTS.has(ext))         entries = extractFromSource(abs, projectRoot, slug, projectPatterns);
         const st = statSafe(abs);
         if (st) cursor.files[abs] = st.mtimeMs;
       } else {
@@ -467,7 +609,7 @@ function runIndex({ cwd, project, full, quiet, singleFile }) {
         const st = statSafe(f);
         if (!st) continue;
         if (!full && cursor.files[f] === st.mtimeMs) continue;
-        const entries = extractFromSource(f, projectRoot, slug);
+        const entries = extractFromSource(f, projectRoot, slug, projectPatterns);
         filesProcessed.push(f);
         allEntries.push(...entries);
         cursor.files[f] = st.mtimeMs;
@@ -484,12 +626,28 @@ function runIndex({ cwd, project, full, quiet, singleFile }) {
     }
 
     // Read-modify-write the shard. Lock is held, so safe.
+    // Tier 5 P1: same-slug collision fix. When two repos share a shard
+    // (both resolve to slug "vanta"), entries from OTHER project roots must
+    // be preserved. Filter only entries whose projectRoot matches THIS run.
     const existing = loadShard(slug);
     const reprocessedSources = new Set();
     for (const f of filesProcessed) reprocessedSources.add(path.relative(projectRoot, f));
-    const kept = existing.filter(e => !reprocessedSources.has((e.source || '').split(':')[0]));
+    const kept = existing.filter(e => {
+      // Different project root → keep untouched (sibling repo's entries)
+      if (e.projectRoot && e.projectRoot !== projectRoot) return true;
+      // Same project root → drop if its source file was reprocessed this run
+      const sourceFile = (e.source || '').split(':')[0];
+      return !reprocessedSources.has(sourceFile);
+    });
+    // --full mode: drop entries whose source no longer exists, but only for
+    // THIS project root. Sibling repo entries stay (they'll be cleaned by
+    // their own --full run).
     const finalExisting = full
-      ? kept.filter(e => fs.existsSync(path.join(projectRoot, (e.source || '').split(':')[0])))
+      ? kept.filter(e => {
+          if (e.projectRoot && e.projectRoot !== projectRoot) return true;
+          const sourceFile = (e.source || '').split(':')[0];
+          return fs.existsSync(path.join(projectRoot, sourceFile));
+        })
       : kept;
     const finalEntries = [...finalExisting, ...allEntries];
     atomicWriteJsonl(shardPath(slug), finalEntries);
