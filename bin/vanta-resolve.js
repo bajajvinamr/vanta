@@ -40,6 +40,11 @@ const TODAY = new Date().toISOString().slice(0, 10);
 // score higher. Both councils flagged this as the v3.4 safety prerequisite.
 const FOREIGN_PENALTY = 0.15;
 const GLOBAL_PROJECT = '__global__';
+// Tier 3 — Gemini P1 fix. Index entries with no recognized project keyword
+// are tagged with this token, NOT GLOBAL_PROJECT. Resolver treats them as
+// foreign (penalized/dropped), preventing silent bleed when PROJECT_KEYWORDS
+// drifts between resolver + indexer.
+const UNKNOWN_PROJECT = '__unknown_project__';
 
 // Project-keyword index. Used to tag invariants and memory entries with the
 // project they belong to. Slugs match gstack convention: <user>-<repo>.
@@ -295,11 +300,46 @@ function readGotchas(cwd, topic) {
   return out;
 }
 
-// Read code-knowledge from ~/.vanta/code-knowledge.jsonl (Tier 2 indexer output).
-// Entries are project-tagged at index time, so cross-project bleed is structural,
-// not topical. Topic match runs against snippet + context + category + why.
-function readCodeKnowledge(topic, max = 20) {
-  const file = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
+// Read code-knowledge from ~/.vanta/knowledge/<slug>.jsonl shards (Tier 3).
+// Tier 2 used a single global jsonl which scaled O(N) with all projects;
+// per-project shards keep the hot path O(N entries in this project only).
+//
+// When activeProject is provided, read ONLY that shard (fast path, used by
+// council-advisory and /recall in a project context). When unset, read all
+// shards (rare — only for cross-project debugging).
+function readCodeKnowledge(topic, activeProject, max = 20) {
+  const dir = path.join(os.homedir(), '.vanta', 'knowledge');
+  if (!fs.existsSync(dir)) {
+    // Fallback: read legacy global file if Tier 2 was used and not yet migrated
+    const legacy = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
+    if (!fs.existsSync(legacy)) return [];
+    return _readCodeKnowledgeFromFile(legacy, topic, max, null);
+  }
+  const out = [];
+  const active = canonProject(activeProject);
+  const filesToRead = [];
+  if (active) {
+    // Active project shard only — hot path, fast.
+    const shardName = active.replace(/[^a-z0-9_.-]/gi, '_');
+    const shard = path.join(dir, `${shardName}.jsonl`);
+    if (fs.existsSync(shard)) filesToRead.push({ file: shard, slug: active });
+  } else {
+    // No active project — read everything for cross-project debug
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.endsWith('.jsonl')) continue;
+        filesToRead.push({ file: path.join(dir, f), slug: f.replace(/\.jsonl$/, '') });
+      }
+    } catch { /* ignore */ }
+  }
+  for (const { file, slug } of filesToRead) {
+    out.push(..._readCodeKnowledgeFromFile(file, topic, max, slug));
+    if (out.length >= max * 3) break;
+  }
+  return out;
+}
+
+function _readCodeKnowledgeFromFile(file, topic, max, fallbackSlug) {
   const content = readSafe(file);
   if (!content) return [];
   const out = [];
@@ -308,15 +348,22 @@ function readCodeKnowledge(topic, max = 20) {
     let e; try { e = JSON.parse(line); } catch { continue; }
     const haystack = [e.snippet, e.context, e.category, e.why].filter(Boolean).join(' ');
     if (topicMatch(haystack, topic) === 0) continue;
+    // Project tag: trust the entry's own project field; fall back to shard
+    // filename slug. Indexer tags unknown projects as UNKNOWN_PROJECT, NOT
+    // GLOBAL_PROJECT (Gemini P1 fix).
+    let project = e.project;
+    if (!project || project === GLOBAL_PROJECT) project = fallbackSlug || UNKNOWN_PROJECT;
     out.push({
       source: 'code',
-      // Use category as section so it groups in formatText output
       section: e.category,
       excerpt: e.snippet + (e.context ? `\n  context: ${e.context.slice(0, 160)}` : '') + (e.why ? `\n  why: ${e.why}` : ''),
       date: (e.ts || '').slice(0, 10),
       path: file,
       sourceLocation: e.source,
-      project: canonProject(e.project) || e.project || GLOBAL_PROJECT,
+      // Path-based rank multiplier from indexer — Codex P3 fix.
+      // page.tsx + tests get <1.0; real implementation code = 1.0.
+      pathRank: typeof e.pathRank === 'number' ? e.pathRank : 1.0,
+      project: canonProject(project) || project,
     });
     if (out.length >= max * 3) break;
   }
@@ -385,7 +432,11 @@ function scoreResult(r, topic) {
   const cm = CONFIDENCE_MULT[r.confidence || 'unknown'] || 1.0;
   const rm = recencyMult(r.date);
   const tm = topicMatch(r.excerpt + ' ' + (r.section || ''), topic);
-  return Math.round((sw * cm * rm + tm * 0.5) * 100) / 100;
+  // pathRank — applied to code entries only (defaults to 1.0 elsewhere).
+  // Codex P3 fix: page.tsx page-copy + __tests__ pattern descriptions get
+  // <1.0 multiplier so real implementation code outranks them.
+  const pr = typeof r.pathRank === 'number' ? r.pathRank : 1.0;
+  return Math.round((sw * cm * rm * pr + tm * 0.5) * 100) / 100;
 }
 
 // Apply project-scope filter. activeProject = canonical slug of the active project.
@@ -398,20 +449,28 @@ function applyProjectScope(results, activeProject, includeForeign) {
   const active = canonProject(activeProject);
   const out = [];
   for (const r of results) {
-    const rp = canonProject(r.project) || GLOBAL_PROJECT;
+    const rp = canonProject(r.project) || UNKNOWN_PROJECT;
+    // UNKNOWN_PROJECT entries (Gemini P1 fix) are treated as foreign — they
+    // came from an unindexed slug and should not silently land in queries.
+    // Only includeForeign opt-in surfaces them, with FOREIGN_PENALTY applied.
     if (!active || rp === GLOBAL_PROJECT) {
       r.scope_match = 'global';
       out.push(r);
     } else if (rp === active) {
       r.scope_match = 'scoped';
       out.push(r);
+    } else if (rp === UNKNOWN_PROJECT) {
+      r.scope_match = 'unknown';
+      if (includeForeign) {
+        r.score *= FOREIGN_PENALTY;
+        out.push(r);
+      }
     } else {
       r.scope_match = 'foreign';
       if (includeForeign) {
         r.score *= FOREIGN_PENALTY;
         out.push(r);
       }
-      // Default: drop foreign entirely. Never lands in constraint pack or /recall.
     }
   }
   return out;
@@ -424,7 +483,7 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false }) {
     ...readInvariants(topic, cwd),
     ...readDecisions(project, topic),
     ...readGotchas(cwd, topic),
-    ...readCodeKnowledge(topic),
+    ...readCodeKnowledge(topic, project),
     ...readEpisodes(topic),
     ...readMemory(topic),
   ];
@@ -463,7 +522,7 @@ function formatText(out) {
     : `${out.count} result(s) for "${out.topic}":`;
   const lines = [header, ''];
   const icon = { invariant: '⚠️ ', decision: '📌', gotcha: '🔒', code: '▤', episode: '🧠', memory: '💭' };
-  const scopeIcon = { scoped: '◉', global: '○', foreign: '⊗' };
+  const scopeIcon = { scoped: '◉', global: '○', foreign: '⊗', unknown: '?' };
   for (const r of out.results) {
     // Provenance: show canonical project tag and scope match status.
     // ⊗ = foreign (other project), ◉ = scoped to active, ○ = global.
