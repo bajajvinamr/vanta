@@ -333,6 +333,138 @@ describe('vanta-council-health — pre-flight readiness', () => {
   });
 });
 
+// ─── council-feedback (Tier 6 #15) ─────────────────────────────────────────
+
+describe('vanta-council-feedback — record/attribute/stats', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  // Each test gets its own temp VANTA_DIR_OVERRIDE so writes don't pollute
+  // the real ~/.vanta logs.
+  let tmp;
+  let cf;
+
+  function freshModule() {
+    // Clear require cache so module re-reads env on load. Module path overrides
+    // are dynamic via _vantaDir(), so we just have to reset the env per test.
+    delete require.cache[require.resolve('../bin/vanta-council-feedback')];
+    return require('../bin/vanta-council-feedback');
+  }
+
+  test('findingHash is deterministic + 16 hex chars + sha256: prefix', () => {
+    cf = freshModule();
+    const h1 = cf.findingHash('JWT must be ES256');
+    const h2 = cf.findingHash('JWT must be ES256');
+    const h3 = cf.findingHash('JWT must be HS256');
+    assert.equal(h1, h2, 'same input → same hash');
+    assert.notEqual(h1, h3, 'different input → different hash');
+    assert.match(h1, /^sha256:[0-9a-f]{16}$/);
+  });
+
+  test('record() writes a well-shaped entry', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cf-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    cf = freshModule();
+
+    const entry = cf.record({
+      topic: 'auth',
+      slug: 'pi-perception',
+      councilRun: '2026-04-30T07:55:00Z',
+      findingText: 'JWT secrets must be ES256',
+      priority: 'P1',
+      model: 'codex',
+    });
+
+    assert.equal(entry.topic, 'auth');
+    assert.equal(entry.slug, 'pi-perception');
+    assert.equal(entry.priority, 'P1');
+    assert.equal(entry.model, 'codex');
+    assert.equal(entry.round, 1, 'round defaults to 1');
+    assert.equal(entry.mode, 'FULL', 'mode defaults to FULL');
+    assert.equal(entry.consensus_strategy, 'two-different-models', 'default council strategy');
+    assert.equal(entry.verdict, 'raised');
+    assert.equal(entry.outcome, null);
+    assert.match(entry.finding_hash, /^sha256:[0-9a-f]{16}$/);
+
+    const written = fs.readFileSync(path.join(tmp, 'council-feedback.jsonl'), 'utf8');
+    assert.ok(written.includes('"finding_hash"'), 'JSONL line on disk');
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('record() rejects missing required fields', () => {
+    cf = freshModule();
+    assert.throws(() => cf.record({ topic: 'auth' }), /requires/);
+    assert.throws(() => cf.record({}), /requires/);
+  });
+
+  test('attribute() rejects invalid outcome', () => {
+    cf = freshModule();
+    assert.throws(() => cf.attribute({ hash: 'sha256:abc', outcome: 'maybe' }),
+      /outcome must be one of/);
+  });
+
+  test('stats() rolls up tp/fp/pending per model+priority', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cf-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    cf = freshModule();
+
+    // Two findings: one resolved as TP, one left pending.
+    const e1 = cf.record({
+      topic: 'auth', slug: 'pi-perception', councilRun: '2026-04-30T07:55:00Z',
+      findingText: 'JWT must be ES256', priority: 'P1', model: 'codex',
+    });
+    cf.record({
+      topic: 'auth', slug: 'pi-perception', councilRun: '2026-04-30T07:55:00Z',
+      findingText: 'Add CSRF on /login', priority: 'P2', model: 'gemini',
+    });
+    cf.attribute({
+      hash: e1.finding_hash, outcome: 'true-positive', evidence: 'invariant added',
+    });
+
+    const s = cf.stats({ days: 30 });
+    assert.equal(s.total_findings, 2);
+    assert.equal(s.tp, 1);
+    assert.equal(s.pending, 1);
+
+    const codexBucket = s.by_model_priority.find(b => b.model === 'codex');
+    assert.equal(codexBucket.tp, 1);
+    assert.equal(codexBucket.accuracy, 1, 'codex P1 accuracy = 1.0 (1 TP / 1 judged)');
+
+    const geminiBucket = s.by_model_priority.find(b => b.model === 'gemini');
+    assert.equal(geminiBucket.pending, 1);
+    assert.equal(geminiBucket.accuracy, null, 'no judged findings → null accuracy');
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('stats() latest resolution wins on duplicate hash', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cf-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    cf = freshModule();
+
+    const e = cf.record({
+      topic: 'auth', slug: 'x', councilRun: '2026-04-30T00:00:00Z',
+      findingText: 'flip-flop', priority: 'P1', model: 'codex',
+    });
+    cf.attribute({ hash: e.finding_hash, outcome: 'false-positive' });
+    // Sleep a tick to ensure the next ts is strictly later.
+    const later = new Date(Date.now() + 5).toISOString();
+    fs.appendFileSync(path.join(tmp, 'council-feedback-resolved.jsonl'),
+      JSON.stringify({ ts: later, finding_hash: e.finding_hash, outcome: 'true-positive' }) + '\n');
+
+    const s = cf.stats({ days: 30 });
+    assert.equal(s.tp, 1, 'latest-wins flips fp → tp');
+    assert.equal(s.fp, 0);
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
 // ─── module surface check ──────────────────────────────────────────────────
 
 describe('module exports — sanity', () => {
