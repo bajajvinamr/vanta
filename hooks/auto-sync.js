@@ -16,6 +16,18 @@ const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
 
+// Cleanup #11: lazy logger.
+let _vlog;
+function vlog() {
+  if (_vlog) return _vlog;
+  for (const p of [
+    path.join(process.env.HOME || '', '.claude', 'bin', 'vanta-log.js'),
+    path.join(process.env.HOME || '', 'Projects', 'vanta', 'bin', 'vanta-log.js'),
+  ]) { try { _vlog = require(p); return _vlog; } catch {} }
+  _vlog = { info: () => {}, warn: () => {}, error: () => {} };
+  return _vlog;
+}
+
 const VANTA_DIR = path.join(os.homedir(), '.vanta');
 const QUEUE_PATH = path.join(VANTA_DIR, 'sync-queue.jsonl');
 const EPISODES_PATH = path.join(VANTA_DIR, 'episodes.jsonl');
@@ -163,8 +175,9 @@ process.stdin.on('end', () => {
         session_id: sid,
       });
     }
-  } catch (_) {
-    // Never block a session from ending
+  } catch (err) {
+    // Never block a session from ending — but log so silent breakage is visible.
+    vlog().error('auto-sync', err && err.message || String(err));
   }
   process.exit(0);
 });

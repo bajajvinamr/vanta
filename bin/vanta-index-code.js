@@ -27,7 +27,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
-const { canonProject, isKnownProject, slugForFilesystem } = require('./vanta-projects');
+const { canonProject, isKnownProject, slugForFilesystem, projectPatternsFor } = require('./vanta-projects');
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const VANTA_DIR = path.join(os.homedir(), '.vanta');
@@ -75,25 +75,9 @@ const BASELINE_PATTERNS = [
   { cat: 'secrets',       re: /\b(API_KEY|SECRET_KEY|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN|process\.env\.[A-Z_]+_(KEY|SECRET|TOKEN))\b/g, why: 'Secret value — never log, never commit, validate presence at boot.' },
 ];
 
-// Curated per-project patterns. Keyed by canonical slug from vanta-projects.
-// Add a new project's patterns here when its domain has stable boundary
-// concepts that should be queryable across the whole codebase.
-const PROJECT_SPECIFIC_PATTERNS = {
-  'little-wins': [
-    { cat: 'child-safety',  re: /\b(POCSO|COPPA|safeguard(?:ing)?|child[- ]safe|mandatory[- ]report|incident[- ]rout)/gi, why: 'Child-safety boundary — POCSO §19/§21 reporting, mandatory incident routing.' },
-    { cat: 'output-filter', re: /\b(filterOutput|outputFilter|output[- ]filter|filter[- ]veto|llm[- ]safe(?:ty)?|output[- ]gate)\b/gi, why: 'LLM output filter — final veto gate. Regression here = unfiltered LLM reaches child.' },
-    { cat: 'consent',       re: /\b(DPDP|parental[- ]consent|guardian[- ]consent|child[- ]pii|EU[- ]region|india[- ]region)\b/gi, why: 'DPDP Rules 2025 — child PII region restriction, parental consent flow.' },
-    { cat: 'pii-lw',        re: /\b(child_name|parent_phone|school_name|dob)\b/gi, why: 'LW-specific PII — region-locked, never logged, encrypted at rest.' },
-    { cat: 'two-signal',    re: /\btwo[- ]signal\b|\bpaired[- ]sensors?\b|\bcorrobor(?:ate|ation)\b/gi, why: 'Two-signal rule — clinical claim requires ≥2 independent paradigms agreeing.' },
-    { cat: 'norms-gate',    re: /\b(indian[- ]norms?|cbse[- ]norms?|norms[- ]gate|age[- ]band|band[- ]baseline|isParadigmEnabled)\b/gi, why: 'Norms gate — age-band enablement, single source of truth for paradigm dispatch.' },
-  ],
-  'pi-perception': [
-    { cat: '12-dim',        re: /\b(12[- ]dim|twelve[- ]dim|perception[- ]intelligence|pi[- ]score)\b/gi, why: '12-dim perception scoring — calibration is load-bearing.' },
-  ],
-  // Add other projects here as they grow domain-specific patterns.
-  // 'sales-agent-publisher': [ ... ],
-  // 'founderos': [ ... ],
-};
+// Curated per-project patterns moved to bin/vanta-projects.js (Tier 5 cleanup #2).
+// PROJECT_KEYWORDS + PROJECT_SPECIFIC_PATTERNS now live in one module so
+// adding a new project edits a single file. Use projectPatternsFor(slug).
 
 // Read project-specific patterns from CLAUDE.md `## Sensitive Patterns` section.
 // Format (one per line):
@@ -143,8 +127,7 @@ function loadProjectPatterns(projectRoot) {
 // Order matters for category labelling but not correctness — duplicates by
 // category are fine; distinct entries fire independently.
 function effectivePatterns(slug, projectRoot) {
-  const projCurated = PROJECT_SPECIFIC_PATTERNS[slug] || [];
-  return [...BASELINE_PATTERNS, ...projCurated, ...loadProjectPatterns(projectRoot)];
+  return [...BASELINE_PATTERNS, ...projectPatternsFor(slug), ...loadProjectPatterns(projectRoot)];
 }
 
 // Backwards compat for tests / dump / external imports — kept as a

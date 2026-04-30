@@ -15,6 +15,22 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
+// Cleanup #11: log unexpected errors so silently-broken hooks become visible.
+// Logger lives at ~/.claude/bin/vanta-log.js (deployed by setup.sh) or repo
+// fallback. Loading is best-effort — if it fails, we still don't block.
+let _vlog;
+function vlog() {
+  if (_vlog) return _vlog;
+  for (const p of [
+    path.join(process.env.HOME || '', '.claude', 'bin', 'vanta-log.js'),
+    path.join(process.env.HOME || '', 'Projects', 'vanta', 'bin', 'vanta-log.js'),
+  ]) {
+    try { _vlog = require(p); return _vlog; } catch {}
+  }
+  _vlog = { info: () => {}, warn: () => {}, error: () => {} };
+  return _vlog;
+}
+
 const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.py', '.rs', '.go']);
 
 function exitOk() { process.stdout.write('{}'); process.exit(0); }
@@ -89,9 +105,15 @@ async function main() {
       stdio: ['ignore', 'ignore', 'ignore'],
       timeout: 1000,
     });
-  } catch { /* swallow — never block the user */ }
+  } catch (err) {
+    // Cleanup #11: log so broken indexer doesn't rot invisibly.
+    vlog().error('code-index-watch', `indexer failed for ${filePath}: ${err.message}`);
+  }
 
   exitOk();
 }
 
-main().catch(() => exitOk());
+main().catch(err => {
+  vlog().error('code-index-watch', `unhandled: ${err && err.message || err}`);
+  exitOk();
+});

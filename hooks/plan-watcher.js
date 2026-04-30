@@ -18,6 +18,18 @@ const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
 
+// Cleanup #11: lazy logger so silent breakage becomes visible at ~/.vanta/hook.log.
+let _vlog;
+function vlog() {
+  if (_vlog) return _vlog;
+  for (const p of [
+    path.join(process.env.HOME || '', '.claude', 'bin', 'vanta-log.js'),
+    path.join(process.env.HOME || '', 'Projects', 'vanta', 'bin', 'vanta-log.js'),
+  ]) { try { _vlog = require(p); return _vlog; } catch {} }
+  _vlog = { info: () => {}, warn: () => {}, error: () => {} };
+  return _vlog;
+}
+
 // Map sensitive keywords found in the plan to council topics.
 const SENSITIVE_TOPICS = [
   { re: /\b(jwt|oauth|auth(n|z)?|authentication|authorization|credential|password|token)\b/i, topic: 'auth' },
@@ -92,7 +104,8 @@ process.stdin.on('end', () => {
       },
     };
     process.stdout.write(JSON.stringify(result));
-  } catch (_) {
+  } catch (err) {
+    vlog().error('plan-watcher', err && err.message || String(err));
     process.exit(0);
   }
 });
