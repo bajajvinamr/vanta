@@ -125,6 +125,34 @@ The `## Vanta Protocol` section in `~/.claude/CLAUDE.md` encodes the proactive t
 
 ---
 
+## v3.4 — Operator Tools
+
+In addition to the three commands, v3.4 ships read-only operator bins under
+`~/.claude/bin/`:
+
+| Tool | Purpose |
+|---|---|
+| `vanta-status` | Single-screen health: shards / queues / hook errors / stuck locks / suggestions. `--json` for scripts, `--quiet` for prompts. |
+| `vanta-prune` | Archive dormant project shards (reversible via `--restore <slug>`). Two-signal classifier — won't archive a quiet shard if the project tree was touched recently. |
+| `vanta-resolve --analyze` | Query-log diagnostics: top topics, zero-result ratio, foreign-bleed events, top-1 score p50/p90, source mix, index gaps (topics returning nothing ≥50% of attempts). |
+
+All three are read-only on a local filesystem. None network. Safe anywhere.
+
+## Storage Assumptions
+
+`~/.vanta/` and `~/.gstack/` must live on a local filesystem (HFS+, APFS, ext4,
+btrfs, ZFS). Two reasons:
+
+1. **`O_EXCL` is not reliable on NFS.** The shard lockfile relies on
+   `open(O_EXCL)` to grant exclusive access. NFSv3 silently grants the lock
+   to multiple writers; concurrent indexer fires clobber each other's writes.
+2. **Atomic rename across mount boundaries fails with EXDEV.** The indexer's
+   `tmp + rename` pattern requires same-filesystem operation. If your home
+   dir is on NFS but `/tmp` is local, writes are lost.
+
+For cross-machine state, sync a snapshot (rsync, S3) instead of sharing the
+live tree.
+
 ## Setup
 
 See `docs/install.md` for step-by-step install.
