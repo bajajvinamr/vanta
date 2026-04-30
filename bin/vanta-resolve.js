@@ -595,8 +595,66 @@ function detectContradictions(results) {
 }
 
 // ─── Main resolver ──────────────────────────────────────────────────────────
+// ─── Result cache (Codex R2 P2 fix) ────────────────────────────────────────
+//
+// The always-on prompt-context hook calls resolve() once or twice per user
+// prompt. Without caching, every keystroke-submitted prompt re-reads the
+// invariants file, walks decisions/, parses code-knowledge.jsonl, etc. —
+// the resolver became the dominant cost of the always-on layer.
+//
+// Cache strategy:
+//   - In-process Map (per-CLI-invocation OR per-hook-process — both are
+//     short-lived; caching across processes wasn't worth the disk/IO).
+//   - Key: ${topic}|${project}|${cwd}|${max}|${includeForeign}|${log}
+//   - TTL: 60s wall-clock — short enough that vanta-sync edits propagate
+//     before users notice. (vanta-sync runs offline; users editing
+//     invariants by hand can call clearCache() or wait 60s.)
+//   - Mtime invalidation: cache the mtime of the invariants file at
+//     write time; on read, bust if mtime changed. Cheap stat() per hit.
+//   - LRU bounded at 64 entries — Map preserves insertion order, oldest
+//     evicted on overflow. 64 covers typical session unique queries.
+//
+// Why not invalidate per-source? Most cache hits are within the same
+// prompt-burst. 60s TTL handles staleness; mtime check handles in-session
+// invariant edits (the most likely staleness vector).
+const _resolveCache = new Map();
+const _RESOLVE_CACHE_TTL = 60_000;
+const _RESOLVE_CACHE_MAX = 64;
+const INVARIANTS_FILE = path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.md');
+
+function _invariantsMtime() {
+  try { return fs.statSync(INVARIANTS_FILE).mtimeMs; } catch { return 0; }
+}
+
+function _cacheGet(key) {
+  const hit = _resolveCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > _RESOLVE_CACHE_TTL) { _resolveCache.delete(key); return null; }
+  if (hit.mtime !== _invariantsMtime()) { _resolveCache.delete(key); return null; }
+  // Touch — move to end for LRU behavior.
+  _resolveCache.delete(key); _resolveCache.set(key, hit);
+  return hit.value;
+}
+
+function _cacheSet(key, value) {
+  if (_resolveCache.size >= _RESOLVE_CACHE_MAX) {
+    // Evict oldest (Map iteration order = insertion order).
+    const oldest = _resolveCache.keys().next().value;
+    if (oldest) _resolveCache.delete(oldest);
+  }
+  _resolveCache.set(key, { ts: Date.now(), mtime: _invariantsMtime(), value });
+}
+
+function clearCache() { _resolveCache.clear(); }
+
 function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = false }) {
   if (!topic) return { topic: null, results: [], error: 'topic required' };
+  // Cache key: include `log` so cached calls don't accidentally suppress
+  // logging when a logged caller hits a no-log cache entry.
+  const cacheKey = `${topic}|${project || ''}|${cwd || ''}|${max}|${includeForeign}|${log}`;
+  const cached = _cacheGet(cacheKey);
+  if (cached) return cached;
+
   const all = [
     ...readInvariants(topic, cwd),
     ...readDecisions(project, topic),
@@ -640,6 +698,7 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = f
       })),
     });
   }
+  _cacheSet(cacheKey, out);
   return out;
 }
 
@@ -829,4 +888,4 @@ async function main() {
 }
 
 if (require.main === module) main();
-module.exports = { resolve, scoreResult, analyzeLog, detectContradictions };
+module.exports = { resolve, scoreResult, analyzeLog, detectContradictions, clearCache };
