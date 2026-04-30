@@ -527,6 +527,73 @@ function _logQuery(entry) {
   } catch { /* never block resolve() on log failure */ }
 }
 
+// ─── Contradiction detection (Tier 6 #14) ──────────────────────────────────
+//
+// Cross-source contradiction signal. The resolver pulls from 6 sources; they
+// can disagree silently and inject contradictory facts into the council
+// CONSTRAINT PACK. This detector flags binary-opposition pairs explicitly so
+// the LLM sees disagreement instead of treating both halves as truth.
+//
+// Conservative by design: false positives are noise (every Write|Edit hook
+// pays the cost), false negatives are the actual bug we ship. Confidence
+// floor of 0.7 — if the heuristic isn't sure, stay quiet.
+//
+// Decisions are pre-filtered for supersession by readDecisions(), so a
+// SUPERSEDED stale decision can't reach this detector at all. That handles
+// the "stale-but-flagged" case for free.
+const BINARY_PAIRS = [
+  // pi-perception's actual past bug — the one this whole feature exists for.
+  { tokens: ['ES256', 'HS256'], context: null,            confidence: 0.9 },
+  // PixiJS context required — "sync" and "async" are too generic on their own.
+  { tokens: ['v7', 'v8'],       context: ['pixi'],        confidence: 0.85 },
+  { tokens: ['sync', 'async'],  context: ['pixi'],        confidence: 0.75 },
+  // generic but high-stakes
+  { tokens: ['include', 'exclude'], context: null,        confidence: 0.7 },
+  // CommonJS vs ES modules conflict (recurrent in stack-and-skills.md)
+  { tokens: ['CommonJS', 'ESM'], context: null,           confidence: 0.85 },
+  // HTTP migration vs deploy — burned us in Prisma invariants
+  { tokens: ['migrate dev', 'migrate deploy'], context: ['prisma'], confidence: 0.9 },
+];
+
+// Looser sources are reduced because they often discuss BOTH options
+// conversationally (e.g., an episode noting "we tried HS256 first, then ES256").
+const LOOSE_SOURCES = new Set(['episode', 'memory']);
+
+function detectContradictions(results) {
+  const out = [];
+  const seen = new Set();
+  for (const pair of BINARY_PAIRS) {
+    const [tA, tB] = pair.tokens;
+    const reA = new RegExp(`\\b${tA.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    const reB = new RegExp(`\\b${tB.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    const hasA = results.filter(r => reA.test(r.excerpt || '') && !reB.test(r.excerpt || ''));
+    const hasB = results.filter(r => reB.test(r.excerpt || '') && !reA.test(r.excerpt || ''));
+    for (const a of hasA) {
+      for (const b of hasB) {
+        if (pair.context) {
+          const ctxRe = new RegExp(pair.context.join('|'), 'i');
+          const aCtx = ctxRe.test(a.excerpt || '') || ctxRe.test(a.section || '');
+          const bCtx = ctxRe.test(b.excerpt || '') || ctxRe.test(b.section || '');
+          if (!aCtx || !bCtx) continue;
+        }
+        let conf = pair.confidence;
+        if (LOOSE_SOURCES.has(a.source) || LOOSE_SOURCES.has(b.source)) conf -= 0.2;
+        if (conf < 0.7) continue;
+        const key = [a.source, b.source, (a.excerpt || '').slice(0, 40), (b.excerpt || '').slice(0, 40)].join('|');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          pair: [a, b],
+          type: 'binary',
+          confidence: Math.round(conf * 100) / 100,
+          hint: `"${tA}" (${a.source}${a.date ? ' '+a.date : ''}) vs "${tB}" (${b.source}${b.date ? ' '+b.date : ''})`,
+        });
+      }
+    }
+  }
+  return out;
+}
+
 // ─── Main resolver ──────────────────────────────────────────────────────────
 function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = false }) {
   if (!topic) return { topic: null, results: [], error: 'topic required' };
@@ -542,13 +609,18 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = f
   // applyProjectScope returns the FILTERED list — foreign dropped by default.
   const filtered = applyProjectScope(all, project, includeForeign);
   filtered.sort((a, b) => b.score - a.score);
+  const topResults = filtered.slice(0, max);
+  // Run contradiction detection on the SAME slice the caller will see —
+  // detecting against entries the user won't get is misleading noise.
+  const contradictions = detectContradictions(topResults);
   const out = {
     topic,
     project: project || null,
     activeProjectCanon: canonProject(project),
     count: filtered.length,
     foreignDropped: all.length - filtered.length,
-    results: filtered.slice(0, max),
+    results: topResults,
+    contradictions,
   };
   if (log) {
     // Log SHAPE, not content. Top-3 score-source-scope tuples are enough to
@@ -652,6 +724,16 @@ function formatText(out) {
     ? `${out.count} result(s) for "${out.topic}" (active project: ${out.activeProjectCanon}):`
     : `${out.count} result(s) for "${out.topic}":`;
   const lines = [header, ''];
+  // Tier 6 #14: surface contradictions BEFORE results so the LLM/user sees
+  // the warning before reading either contradictory entry.
+  if (out.contradictions && out.contradictions.length > 0) {
+    lines.push('⚠️  CONTRADICTION DETECTED — resolve before relying on either entry:');
+    for (const c of out.contradictions) {
+      lines.push(`  • ${c.hint} [confidence ${c.confidence}]`);
+    }
+    lines.push('  → newer source typically wins; if old decision is wrong, deprecate via /council.');
+    lines.push('');
+  }
   const icon = { invariant: '⚠️ ', decision: '📌', gotcha: '🔒', code: '▤', episode: '🧠', memory: '💭' };
   const scopeIcon = { scoped: '◉', global: '○', foreign: '⊗' };
   for (const r of out.results) {
@@ -747,4 +829,4 @@ async function main() {
 }
 
 if (require.main === module) main();
-module.exports = { resolve, scoreResult, analyzeLog };
+module.exports = { resolve, scoreResult, analyzeLog, detectContradictions };

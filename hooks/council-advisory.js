@@ -16,11 +16,17 @@ const { execSync } = require('child_process');
 
 // Load the canonical resolver. Try the deployed path first, fall back to repo.
 let resolveKnowledge = null;
+let detectContradictions = null;
 for (const p of [
   path.join(os.homedir(), '.claude', 'bin', 'vanta-resolve.js'),
   path.join(os.homedir(), 'Projects', 'vanta', 'bin', 'vanta-resolve.js'),
 ]) {
-  try { ({ resolve: resolveKnowledge } = require(p)); break; } catch { /* keep looking */ }
+  try {
+    const m = require(p);
+    resolveKnowledge = m.resolve;
+    detectContradictions = m.detectContradictions || null;
+    break;
+  } catch { /* keep looking */ }
 }
 
 // Cleanup #11: lazy logger.
@@ -129,10 +135,27 @@ process.stdin.on('end', () => {
     }
 
     // Cap at 4 total — beyond that the pack stops being focused.
+    const topAggregated = aggregated.slice(0, 4);
     const buckets = { decision: [], invariant: [], gotcha: [], episode: [], memory: [] };
-    for (const r of aggregated.slice(0, 4)) (buckets[r.source] || []).push(r);
+    for (const r of topAggregated) (buckets[r.source] || []).push(r);
+
+    // Tier 6 #14: detect contradictions in the SAME slice the LLM will see.
+    // Surfaced first so the warning lands before either contradictory entry.
+    let contradictionSection = null;
+    if (detectContradictions) {
+      try {
+        const sigs = detectContradictions(topAggregated);
+        if (sigs.length > 0) {
+          contradictionSection =
+            '⚠️  CONTRADICTION DETECTED — sources disagree, resolve before implementing:\n' +
+            sigs.map(c => `- ${c.hint} [confidence ${c.confidence}]`).join('\n') +
+            '\n  → Newer source typically wins. If the older entry is wrong, deprecate via /council.';
+        }
+      } catch (e) { /* never block on detector failure */ }
+    }
 
     const sections = [];
+    if (contradictionSection) sections.push(contradictionSection);
     if (buckets.decision.length) {
       sections.push('📌 PRIOR DECISIONS:\n' + buckets.decision.map(d => {
         const conf = d.confidence && d.confidence !== 'unknown' ? ` [${d.confidence}]` : '';
