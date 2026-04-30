@@ -1,0 +1,98 @@
+{
+  "_comment": "Single source of truth for Vanta hook registrations. Codex council P2 fix — drift between hooks/hooks.json + setup.sh + README was the failure mode. setup.sh now reads this file instead of hardcoding the registration table.",
+  "_schema": "Each entry: { event, matcher (optional), file, runtime: 'node'|'bash', timeout (seconds), purpose }",
+  "_event_types": "SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop",
+
+  "registrations": [
+    {
+      "event": "SessionStart",
+      "matcher": "",
+      "file": "session-start",
+      "runtime": "bash",
+      "timeout": 5,
+      "purpose": "Inject project brief into first response (4 lines)"
+    },
+    {
+      "event": "UserPromptSubmit",
+      "matcher": "",
+      "file": "prompt-context.js",
+      "runtime": "node",
+      "timeout": 5,
+      "purpose": "Always-on: classify prompt + inject 3-line brief when relevant + on-cooldown",
+      "added": "2026-05-01"
+    },
+    {
+      "event": "Stop",
+      "matcher": "",
+      "file": "auto-sync.js",
+      "runtime": "node",
+      "timeout": 10,
+      "purpose": "Queue session for vanta-sync; episodic memory dedup by session_id"
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Write|Edit",
+      "file": "council-advisory.js",
+      "runtime": "node",
+      "timeout": 5,
+      "purpose": "Constraint pack on auth/payment/migration writes + contradiction surface"
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "file": "git-guardrails.js",
+      "runtime": "node",
+      "timeout": 5,
+      "purpose": "Hard-block + advisory on destructive git/sql/rm commands"
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Agent|Task",
+      "file": "tool-observer.js",
+      "runtime": "node",
+      "timeout": 3,
+      "purpose": "Always-on: shape-only telemetry to interactions.jsonl, no inject no block",
+      "added": "2026-05-01"
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Bash",
+      "file": "test-failure-advisor.js",
+      "runtime": "node",
+      "timeout": 5,
+      "purpose": "Hard-stop on failing tests/build"
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Write|Edit",
+      "file": "stack-file-nudge.js",
+      "runtime": "node",
+      "timeout": 5,
+      "purpose": "Follow-up actions on config-file changes"
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Write|Edit",
+      "file": "plan-watcher.js",
+      "runtime": "node",
+      "timeout": 5,
+      "purpose": "Shadow Council flag on sensitive plan content"
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Write|Edit|NotebookEdit",
+      "file": "code-index-watch.js",
+      "runtime": "node",
+      "timeout": 3,
+      "purpose": "Incremental refresh of per-project knowledge shards"
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Agent|Task",
+      "file": "tool-observer.js",
+      "runtime": "node",
+      "timeout": 3,
+      "purpose": "Always-on: post-side telemetry — captures success/fail bit"
+    }
+  ]
+}

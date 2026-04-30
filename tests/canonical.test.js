@@ -847,6 +847,224 @@ describe('vanta-extract-score — invariant candidate gating', () => {
   });
 });
 
+// ─── runtime-state (always-on dedupe brain) ─────────────────────────────────
+
+describe('vanta-runtime-state — per-session cooldown brain', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  let tmp;
+
+  function fresh() {
+    delete require.cache[require.resolve('../bin/vanta-runtime-state')];
+    return require('../bin/vanta-runtime-state');
+  }
+
+  test('shouldInject returns true for first key, false during cooldown', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rs-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = fresh();
+
+    assert.equal(m.shouldInject('s1', 'prompt-context:abc'), true);
+    m.markInjected('s1', 'prompt-context:abc');
+    assert.equal(m.shouldInject('s1', 'prompt-context:abc'), false);
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('shouldInject treats different keys independently', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rs-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = fresh();
+
+    m.markInjected('s1', 'prompt-context:abc');
+    assert.equal(m.shouldInject('s1', 'prompt-context:xyz'), true,
+      'different key should not be on cooldown');
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('cooldown windows differ by source prefix', () => {
+    const m = fresh();
+    // 'council-advisory:' has 30min, 'prompt-context:' has 10min, default 5min
+    assert.ok(m.COOLDOWNS['council-advisory:'] > m.COOLDOWNS['prompt-context:']);
+    assert.ok(m.COOLDOWNS['prompt-context:'] > m.COOLDOWNS['default']);
+  });
+
+  test('bump increments + persists', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rs-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = fresh();
+
+    m.bump('s1', 'prompt_count');
+    m.bump('s1', 'prompt_count');
+    m.bump('s1', 'tool_calls');
+
+    const s = m.getState('s1');
+    assert.equal(s.prompt_count, 2);
+    assert.equal(s.tool_calls, 1);
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('setPhase rejects invalid phase', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rs-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = fresh();
+
+    m.setPhase('s1', 'build');
+    assert.equal(m.getState('s1').phase, 'build');
+    m.setPhase('s1', 'invalid-phase');  // silent reject
+    assert.equal(m.getState('s1').phase, 'build', 'invalid phase should not overwrite');
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('reapStale removes old session files', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rs-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = fresh();
+
+    m.bump('alive-1', 'prompt_count');
+    m.bump('alive-2', 'prompt_count');
+
+    // Backdate one file by 14 days to test reaping.
+    const dir = path.join(tmp, 'runtime');
+    const files = fs.readdirSync(dir);
+    const stale = path.join(dir, files[0]);
+    const oldTime = Date.now() - 14 * 86400_000;
+    fs.utimesSync(stale, oldTime / 1000, oldTime / 1000);
+
+    const removed = m.reapStale({ days: 7 });
+    assert.equal(removed, 1, 'only the stale file should be reaped');
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
+// ─── prompt-brief (UserPromptSubmit classifier) ─────────────────────────────
+
+describe('vanta-prompt-brief — classifier + brief generator', () => {
+  const m = require('../bin/vanta-prompt-brief');
+
+  test('classify routes prompts to correct phase', () => {
+    assert.equal(m.classify('investigate why JWT verification is failing'), 'debug');
+    assert.equal(m.classify('ship the auth refactor branch'), 'ship');
+    assert.equal(m.classify('design the always-on layer for vanta'), 'plan');
+    assert.equal(m.classify('build the new prompt-context hook'), 'build');
+    assert.equal(m.classify('do we have any prior art for this?'), 'recall');
+    assert.equal(m.classify('review this diff'), 'review');
+    assert.equal(m.classify('hello'), 'unknown');
+  });
+
+  test('classify is conservative — generic verbs do not collide', () => {
+    // "should" alone shouldn't trigger 'plan' — needs "how should" / "what approach".
+    assert.equal(m.classify('the test should pass when I run it'), 'unknown');
+    // "fix" alone is generic — but "broken" / "fail" / "bug" trigger 'debug'.
+    assert.equal(m.classify('make this nicer'), 'unknown');
+  });
+
+  test('extractTopics drops English stopwords + dedupes', () => {
+    const t = m.extractTopics('how should I architect the always-on layer for vanta');
+    assert.ok(t.length <= 3, 'caps at 3 topics');
+    // Stopwords like "the", "for", "should", "how" should not appear.
+    for (const stop of ['the', 'for', 'should', 'how']) {
+      assert.equal(t.includes(stop), false, `"${stop}" should be filtered`);
+    }
+  });
+
+  test('shapeKey is deterministic for same prompt', () => {
+    const k1 = m.shapeKey('build the new prompt-context hook');
+    const k2 = m.shapeKey('build the new prompt-context hook');
+    assert.equal(k1, k2);
+    assert.match(k1, /^build:[0-9a-f]{8}$/);
+  });
+
+  test('shapeKey changes when phase or topics differ', () => {
+    const k1 = m.shapeKey('build the new prompt-context hook');
+    const k2 = m.shapeKey('debug the new prompt-context hook');  // different phase
+    const k3 = m.shapeKey('build the new tool-observer hook');   // different topics
+    assert.notEqual(k1, k2);
+    assert.notEqual(k1, k3);
+  });
+
+  test('buildBrief returns null for review / unknown phase', () => {
+    assert.equal(m.buildBrief({ prompt: 'review this diff' }), null);
+    assert.equal(m.buildBrief({ prompt: 'hello there' }), null);
+  });
+});
+
+// ─── interaction-log (universal observer) ────────────────────────────────────
+
+describe('vanta-interaction-log — telemetry shape extraction', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  function fresh() {
+    delete require.cache[require.resolve('../bin/vanta-interaction-log')];
+    return require('../bin/vanta-interaction-log');
+  }
+
+  test('shapeOfArgs strips file content but keeps extension', () => {
+    const m = fresh();
+    const s = m.shapeOfArgs('Write', { file_path: '/foo/bar.tsx', content: 'const x = 42;'.repeat(1000) });
+    assert.equal(s.ext, 'tsx');
+    assert.ok(s.keys.includes('file_path'));
+    assert.ok(s.keys.includes('content'));
+  });
+
+  test('shapeOfArgs reduces Bash command to first verb only', () => {
+    const m = fresh();
+    const s = m.shapeOfArgs('Bash', { command: 'git push origin main --force' });
+    assert.equal(s.bashVerb, 'git');
+    // No trailing args leaked.
+    assert.equal(s.bashVerb.includes('push'), false);
+  });
+
+  test('logEvent + audit roundtrip', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-il-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = fresh();
+
+    m.logEvent({ session_id: 'a', tool: 'Bash', event: 'pre',  bash_verb: 'git' });
+    m.logEvent({ session_id: 'a', tool: 'Bash', event: 'post', bash_verb: 'git', ok: true });
+    m.logEvent({ session_id: 'a', tool: 'Write', event: 'pre', ext: 'ts' });
+
+    const r = m.audit({ days: 1 });
+    assert.equal(r.total, 3);
+    assert.equal(r.sessions, 1);
+    assert.equal(r.pre, 2);
+    assert.equal(r.post, 1);
+    assert.equal(r.by_tool.Bash, 2);
+    assert.equal(r.by_tool.Write, 1);
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('audit captures failure rate from post events', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-il-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = fresh();
+
+    m.logEvent({ session_id: 'a', tool: 'Bash', event: 'post', ok: true });
+    m.logEvent({ session_id: 'a', tool: 'Bash', event: 'post', ok: false });
+    m.logEvent({ session_id: 'a', tool: 'Bash', event: 'post', ok: false });
+
+    const r = m.audit({ days: 1 });
+    assert.equal(r.failures, 2);
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
 // ─── module surface check ──────────────────────────────────────────────────
 
 describe('module exports — sanity', () => {
