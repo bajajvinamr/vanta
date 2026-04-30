@@ -16,7 +16,7 @@ const PROJECT_KEYWORDS = {
   'sales-agent-publisher': [/\bsales[- ]agent[- ]publisher\b/i, /\bsalestracker\b/i],
   'founderos':         [/\bfounder ?os\b/i, /\bpaperclip\b/i],
   'priyaa-audit':      [/\bpriyaa\b/i],
-  'vanta':             [/\bvanta[- ]run\b/i, /\bvanta[- ]council\b/i, /\bvanta[- ]sync\b/i, /\bvanta-resolve\b/, /\bvanta-brief\b/, /\bvanta-index\b/, /\bcouncil[- ]advisory\b/, /\bplan[- ]watcher\b/],
+  'vanta':             [/\bvanta[- ]run\b/i, /\bvanta[- ]council\b/i, /\bvanta[- ]sync\b/i, /\bvanta-resolve\b/, /\bvanta-brief\b/, /\bvanta-index\b/, /\bcouncil[- ]advisory\b/, /\bplan[- ]watcher\b/, /\bbajajvinamr-vanta\b/],
 };
 
 // Sentinel for content that is project-agnostic (e.g. global invariants).
