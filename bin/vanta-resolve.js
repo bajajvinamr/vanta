@@ -434,8 +434,40 @@ function applyProjectScope(results, activeProject, includeForeign) {
   return out;
 }
 
+// ─── Query log (cleanup #6) ────────────────────────────────────────────────
+// Lightweight passive logging: every resolve() with `log: true` appends one
+// line to ~/.vanta/query-log.jsonl. We log SHAPE — topic, project, count,
+// foreignDropped, score distribution — never excerpts or paths inside results
+// (could be sensitive PII, secrets, etc.).
+//
+// Volume: council-advisory fires on every Write|Edit to auth/payment/migration
+// files. ~50/day × 365 days × 200B/entry = 3.6MB/year. Best-effort rotation
+// at 5MB to bound disk impact.
+//
+// Why opt-in: programmatic callers (tests, future automation) shouldn't
+// silently write to the log. CLI mode and council-advisory both pass log:true.
+const QUERY_LOG = path.join(os.homedir(), '.vanta', 'query-log.jsonl');
+const QUERY_LOG_MAX_BYTES = 5_000_000;
+
+function _logQuery(entry) {
+  try {
+    const dir = path.dirname(QUERY_LOG);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // Best-effort rotation: if exceeds cap, keep the last 50% by line count.
+    try {
+      const st = fs.statSync(QUERY_LOG);
+      if (st.size > QUERY_LOG_MAX_BYTES) {
+        const lines = fs.readFileSync(QUERY_LOG, 'utf8').split('\n').filter(Boolean);
+        const kept = lines.slice(Math.floor(lines.length / 2));
+        fs.writeFileSync(QUERY_LOG, kept.join('\n') + '\n');
+      }
+    } catch { /* file doesn't exist yet — fine */ }
+    fs.appendFileSync(QUERY_LOG, JSON.stringify(entry) + '\n');
+  } catch { /* never block resolve() on log failure */ }
+}
+
 // ─── Main resolver ──────────────────────────────────────────────────────────
-function resolve({ topic, project, cwd, max = 5, includeForeign = false }) {
+function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = false }) {
   if (!topic) return { topic: null, results: [], error: 'topic required' };
   const all = [
     ...readInvariants(topic, cwd),
@@ -449,13 +481,93 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false }) {
   // applyProjectScope returns the FILTERED list — foreign dropped by default.
   const filtered = applyProjectScope(all, project, includeForeign);
   filtered.sort((a, b) => b.score - a.score);
-  return {
+  const out = {
     topic,
     project: project || null,
     activeProjectCanon: canonProject(project),
     count: filtered.length,
     foreignDropped: all.length - filtered.length,
     results: filtered.slice(0, max),
+  };
+  if (log) {
+    // Log SHAPE, not content. Top-3 score-source-scope tuples are enough to
+    // diagnose: empty results, foreign bleed, score collapse, source bias.
+    _logQuery({
+      ts: new Date().toISOString(),
+      topic,
+      project: project || null,
+      activeCanon: out.activeProjectCanon,
+      cwd: cwd || null,
+      count: out.count,
+      foreignDropped: out.foreignDropped,
+      top: out.results.slice(0, 3).map(r => ({
+        source: r.source,
+        score: r.score,
+        scope: r.scope_match,
+      })),
+    });
+  }
+  return out;
+}
+
+// Read query-log and produce diagnostics. Surfaces:
+//   - Top-N most queried topics
+//   - Topics where count=0 (gaps in the index)
+//   - Total foreign-bleed events (filter working / not)
+//   - Score-distribution sketch (are top-1 results actually scoring high,
+//     or are we emitting noise that barely passes the threshold?)
+function analyzeLog({ last = 500 } = {}) {
+  if (!fs.existsSync(QUERY_LOG)) {
+    return { present: false, message: 'no query log yet (~/.vanta/query-log.jsonl absent)' };
+  }
+  const lines = fs.readFileSync(QUERY_LOG, 'utf8').split('\n').filter(Boolean).slice(-last);
+  const entries = [];
+  for (const l of lines) { try { entries.push(JSON.parse(l)); } catch { /* skip */ } }
+  if (!entries.length) return { present: true, count: 0, message: 'log present but empty' };
+  // Most queried topics
+  const topicCount = new Map();
+  let zeroResultQueries = 0;
+  let foreignBleedTotal = 0;
+  const topScores = [];
+  const sourceCount = new Map();
+  for (const e of entries) {
+    topicCount.set(e.topic, (topicCount.get(e.topic) || 0) + 1);
+    if (e.count === 0) zeroResultQueries++;
+    foreignBleedTotal += (e.foreignDropped || 0);
+    if (e.top && e.top[0]) {
+      topScores.push(e.top[0].score);
+      const src = e.top[0].source;
+      sourceCount.set(src, (sourceCount.get(src) || 0) + 1);
+    }
+  }
+  const topicsRanked = [...topicCount.entries()]
+    .sort((a, b) => b[1] - a[1]).slice(0, 10);
+  // Topics that returned nothing on >50% of their attempts → index gap
+  const gapTopics = [...topicCount.entries()]
+    .filter(([t, n]) => n >= 2)
+    .map(([t, n]) => {
+      const zero = entries.filter(e => e.topic === t && e.count === 0).length;
+      return { topic: t, attempts: n, zero, ratio: zero / n };
+    })
+    .filter(g => g.ratio >= 0.5)
+    .sort((a, b) => b.attempts - a.attempts)
+    .slice(0, 10);
+  // Top score percentiles
+  topScores.sort((a, b) => a - b);
+  const p = (q) => topScores.length ? topScores[Math.floor(topScores.length * q)] : 0;
+  return {
+    present: true,
+    sampleSize: entries.length,
+    spanFrom: entries[0].ts,
+    spanTo:   entries[entries.length - 1].ts,
+    topTopics: topicsRanked,
+    zeroResultQueries,
+    zeroResultRatio: Math.round(zeroResultQueries / entries.length * 100) / 100,
+    foreignBleedTotal,
+    topScoreP50: p(0.5),
+    topScoreP90: p(0.9),
+    topSourceMix: [...sourceCount.entries()].sort((a, b) => b[1] - a[1]),
+    gapTopics,
   };
 }
 
@@ -513,18 +625,58 @@ async function readStdin() {
   });
 }
 
+function formatAnalysis(a) {
+  if (!a.present) return a.message;
+  if (a.count === 0) return a.message;
+  const lines = [];
+  lines.push(`=== query-log analysis (last ${a.sampleSize} entries) ===`);
+  lines.push(`span: ${a.spanFrom} → ${a.spanTo}`);
+  lines.push('');
+  lines.push('TOP TOPICS');
+  for (const [t, n] of a.topTopics) lines.push(`  ${String(n).padStart(4)}  ${t}`);
+  lines.push('');
+  lines.push(`ZERO-RESULT QUERIES: ${a.zeroResultQueries} (${(a.zeroResultRatio * 100).toFixed(0)}%)`);
+  lines.push(`FOREIGN-BLEED EVENTS DROPPED: ${a.foreignBleedTotal}`);
+  lines.push(`TOP-1 SCORE p50=${a.topScoreP50}  p90=${a.topScoreP90}`);
+  lines.push('');
+  lines.push('SOURCE MIX (top-1 by source)');
+  for (const [s, n] of a.topSourceMix) lines.push(`  ${String(n).padStart(4)}  ${s}`);
+  if (a.gapTopics.length) {
+    lines.push('');
+    lines.push('INDEX GAPS (topics that returned nothing ≥50% of attempts)');
+    for (const g of a.gapTopics) {
+      lines.push(`  ${g.topic.padEnd(20)}  ${g.zero}/${g.attempts} empty (${(g.ratio * 100).toFixed(0)}%)`);
+    }
+  }
+  return lines.join('\n');
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   let input = args;
   if (args.stdin) {
     try { input = { ...args, ...JSON.parse(await readStdin()) }; } catch { /* ignore */ }
   }
+
+  // Cleanup #6: --analyze surfaces query-log diagnostics. Bypasses normal
+  // resolve flow.
+  if (input.analyze) {
+    const a = analyzeLog({ last: parseInt(input.last, 10) || 500 });
+    if (input.format === 'json') {
+      process.stdout.write(JSON.stringify(a, null, 2));
+    } else {
+      process.stdout.write(formatAnalysis(a));
+    }
+    return;
+  }
+
   const out = resolve({
     topic: input.topic,
     project: input.project,
     cwd: input.cwd || process.cwd(),
     max: parseInt(input.max, 10) || 5,
     includeForeign: !!input['include-foreign'],
+    log: !input['no-log'],  // CLI logs by default; --no-log opts out
   });
   if (input.format === 'text') {
     process.stdout.write(formatText(out));
@@ -534,4 +686,4 @@ async function main() {
 }
 
 if (require.main === module) main();
-module.exports = { resolve, scoreResult };
+module.exports = { resolve, scoreResult, analyzeLog };

@@ -115,7 +115,7 @@ process.stdin.on('end', () => {
       for (let ti = 0; ti < trigger.topics.length; ti++) {
         const topic = trigger.topics[ti];
         const specificity = 1 + (trigger.topics.length - ti) * 0.3;  // 1st topic ~3x the boost vs last
-        const out = resolveKnowledge({ topic, project: slug, cwd, max: 3 });
+        const out = resolveKnowledge({ topic, project: slug, cwd, max: 3, log: true });
         for (const r of (out.results || [])) {
           const key = r.path + '|' + (r.excerpt || '').slice(0, 80);
           if (seen.has(key)) continue;
