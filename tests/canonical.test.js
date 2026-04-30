@@ -395,6 +395,16 @@ describe('detectContradictions — cross-source disagreement signal', () => {
     assert.deepEqual(detectContradictions([]), []);
   });
 
+  test('resolve() always emits contradictions array (regression guard)', () => {
+    const { resolve } = require('../bin/vanta-resolve');
+    // Use an obscure topic to keep the result set minimal — we just need
+    // the shape, not actual results. Tests that the wiring from
+    // detectContradictions into resolve() doesn't silently drop.
+    const out = resolve({ topic: 'nonexistent-topic-xyz-zz9' });
+    assert.ok(Array.isArray(out.contradictions),
+      'resolve() must always emit contradictions: [] (Tier 6 #14 wiring)');
+  });
+
   test('dedupes when same pair surfaces twice', () => {
     // If the same two entries match multiple binary pairs (rare but possible),
     // the dedup key prevents duplicate signals.

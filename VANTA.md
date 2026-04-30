@@ -125,18 +125,32 @@ The `## Vanta Protocol` section in `~/.claude/CLAUDE.md` encodes the proactive t
 
 ---
 
-## v3.4 — Operator Tools
+## v3.5 — Operator Tools + Trust/Resilience Layer
 
-In addition to the three commands, v3.4 ships read-only operator bins under
+In addition to the three commands, Vanta ships read-only operator bins under
 `~/.claude/bin/`:
 
 | Tool | Purpose |
 |---|---|
-| `vanta-status` | Single-screen health: shards / queues / hook errors / stuck locks / suggestions. `--json` for scripts, `--quiet` for prompts. |
+| `vanta-status` | Single-screen health: shards / queues / hook errors / stuck locks / council readiness / per-model accuracy / suggestions. `--json` for scripts, `--quiet` for prompts. |
 | `vanta-prune` | Archive dormant project shards (reversible via `--restore <slug>`). Two-signal classifier — won't archive a quiet shard if the project tree was touched recently. |
 | `vanta-resolve --analyze` | Query-log diagnostics: top topics, zero-result ratio, foreign-bleed events, top-1 score p50/p90, source mix, index gaps (topics returning nothing ≥50% of attempts). |
+| `vanta-council-health` (Tier 6 #17) | Pre-flight readiness for `/council`: Multi-CLI MCP registration, Gemini trust config, Codex config presence, last-council recency. Static config inspection only — no network. |
+| `vanta-council-feedback` (Tier 6 #15) | Two-stage council quality tracking. `record` appends each P1/P2 finding at council time; `attribute` marks outcomes (true-positive / false-positive / unverified) at sync time; `stats --days 90` rolls up per-model × priority accuracy. The `consensus_strategy` field tracks `two-different-models` (default) vs `n-of-same-model` (stochastic — never used, present for future analysis). |
+| `vanta-extract-score` (Tier 6 #16) | Confidence scoring + routing for invariant candidates. `auto` ≥ 0.65 → `vinamr-invariants.md`, `staging` 0.40–0.65 → `vinamr-invariants.staging.md` for review, `update-in-place` for near-dups (Jaccard ≥ 0.8), `discard` otherwise. Every auto/staging write gets an audit comment with session id, timestamp, and confidence so `git blame` traces mistakes back to source. |
 
-All three are read-only on a local filesystem. None network. Safe anywhere.
+All five are read-only on a local filesystem (council-feedback and
+extract-score have explicit append CLIs). None network. Safe anywhere.
+
+### Tier 6 — Trust + Resilience Layer
+
+The four Tier 6 items address the failure mode where Vanta's outputs drift
+silently over time:
+
+- **#14 — Cross-source contradiction detection.** `vanta-resolve` flags binary-opposition pairs (e.g., ES256 vs HS256) when each half lands in a separate retrieved entry. Council-advisory surfaces the warning ABOVE the constraint pack so the LLM sees the disagreement before reading either half. Conservative — comparisons (both halves in one entry) don't trip; pairs need ≥ 0.7 confidence.
+- **#15 — Council quality feedback.** Two-stage data flow records P1/P2 findings at council time and attributes outcomes when matching invariants land in `vanta-sync`. Per-model × priority accuracy rolls up in `vanta-status` and via `vanta-council-feedback stats`.
+- **#16 — Auto-extraction safeguards.** Three-stage pipeline gates writes to `vinamr-invariants.md`. Skill-doc phrases hard-reject; PII / project state routes to discard via low-density scoring; near-duplicates route to `update-in-place` instead of accumulating rephrasings. Audit comments make every entry traceable.
+- **#17 — Robust Multi-CLI degradation.** Pre-flight ping protocol + cascading model fallback chain prevent silent degradation when Gemini hits capacity-exhausted or trust-workspace failures. Mandatory `model_health` block in council reports surfaces what was actually consulted.
 
 ## Storage Assumptions
 
