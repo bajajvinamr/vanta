@@ -112,6 +112,63 @@ function attribute({ hash, outcome, evidence }) {
   return entry;
 }
 
+// Find open findings (raised but not yet attributed) that an incoming
+// invariant likely resolves. Used by vanta-sync Step 8 to turn prose
+// matching into a deterministic CLI call:
+//
+//   vanta-council-feedback match-open \
+//     --slug pi-perception \
+//     --invariant 'ES256 asymmetric JWTs required'
+//
+// Match criteria (ALL must hold):
+//   - finding.slug === slug
+//   - finding ts within last 14 days (default; --days N to override)
+//   - topic OR excerpt overlap with invariant text (Jaccard ≥ 0.25
+//     on word-set, or topic substring match in invariant)
+//
+// Returns array of { hash, finding_excerpt, topic, model, similarity }
+// sorted by similarity desc. Caller picks the top match for attribute().
+function matchOpen({ slug, invariant, days = 14 } = {}) {
+  if (!slug || !invariant) {
+    throw new Error('matchOpen() requires: slug, invariant');
+  }
+  const cutoff = Date.now() - days * 86400_000;
+  const findings = _readJsonl(_feedbackFile())
+    .filter(e => e.slug === slug && Date.parse(e.ts) >= cutoff);
+  const resolved = new Set(_readJsonl(_resolvedFile()).map(r => r.finding_hash));
+  const open = findings.filter(f => !resolved.has(f.finding_hash));
+
+  const tokenize = s => new Set(
+    String(s).toLowerCase().split(/[^a-z0-9_.-]+/).filter(w => w.length > 2)
+  );
+  const invTokens = tokenize(invariant);
+
+  const matches = [];
+  for (const f of open) {
+    const topicHit = (invariant.toLowerCase().includes(String(f.topic || '').toLowerCase())
+      && (f.topic || '').length >= 3) ? 1 : 0;
+    const excerptTokens = tokenize(f.finding_excerpt || '');
+    let inter = 0;
+    for (const t of invTokens) if (excerptTokens.has(t)) inter++;
+    const union = invTokens.size + excerptTokens.size - inter;
+    const jaccard = union === 0 ? 0 : inter / union;
+    if (jaccard >= 0.25 || topicHit) {
+      matches.push({
+        hash: f.finding_hash,
+        finding_excerpt: f.finding_excerpt,
+        topic: f.topic,
+        model: f.model,
+        priority: f.priority,
+        similarity: Math.round(jaccard * 100) / 100,
+        topicHit: !!topicHit,
+        ts: f.ts,
+      });
+    }
+  }
+  matches.sort((a, b) => b.similarity - a.similarity);
+  return matches;
+}
+
 // Compute per-model accuracy stats over a window.
 function stats({ days = 90 } = {}) {
   const cutoff = Date.now() - days * 86400_000;
@@ -208,6 +265,34 @@ function cliAttribute() {
   console.log(JSON.stringify(result, null, 2));
 }
 
+function cliMatchOpen() {
+  const a = parseArgs(process.argv);
+  const days = parseInt(a.days, 10) || 14;
+  const matches = matchOpen({
+    slug: a.slug,
+    invariant: a.invariant,
+    days,
+  });
+  if (a.json || a.json === true) {
+    console.log(JSON.stringify(matches, null, 2));
+    return;
+  }
+  if (matches.length === 0) {
+    console.log(`No open findings match (slug=${a.slug}, ${days}d window).`);
+    return;
+  }
+  console.log(`${matches.length} open finding(s) match within ${days}d:`);
+  for (const m of matches) {
+    console.log(`  [${m.priority}] ${m.hash} · ${m.model} · sim=${m.similarity}${m.topicHit ? ' (topic-hit)' : ''}`);
+    console.log(`     topic=${m.topic} ts=${m.ts.slice(0,10)}`);
+    console.log(`     "${m.finding_excerpt.slice(0, 120)}"`);
+  }
+  console.log('');
+  console.log('Attribute the top match:');
+  const top = matches[0];
+  console.log(`  vanta-council-feedback attribute --hash ${top.hash} --outcome true-positive --evidence "..."`);
+}
+
 function cliStats() {
   const a = parseArgs(process.argv);
   const days = parseInt(a.days, 10) || 90;
@@ -242,17 +327,19 @@ function cliStats() {
 
 function main() {
   const cmd = process.argv[2];
-  if (cmd === 'record')         cliRecord();
-  else if (cmd === 'attribute') cliAttribute();
-  else if (cmd === 'stats')     cliStats();
+  if (cmd === 'record')          cliRecord();
+  else if (cmd === 'attribute')  cliAttribute();
+  else if (cmd === 'stats')      cliStats();
+  else if (cmd === 'match-open') cliMatchOpen();
   else {
-    console.error('Usage: vanta-council-feedback {record|attribute|stats} [args]');
-    console.error('  record  --topic X --slug Y --council-run TS --finding-text "..." --priority P1 --model codex [--round N] [--mode FULL]');
-    console.error('  attribute --hash sha256:... --outcome true-positive|false-positive|unverified [--evidence "..."]');
-    console.error('  stats [--days 90] [--json]');
+    console.error('Usage: vanta-council-feedback {record|attribute|stats|match-open} [args]');
+    console.error('  record     --topic X --slug Y --council-run TS --finding-text "..." --priority P1 --model codex [--round N] [--mode FULL]');
+    console.error('  attribute  --hash sha256:... --outcome true-positive|false-positive|unverified [--evidence "..."]');
+    console.error('  stats      [--days 90] [--json]');
+    console.error('  match-open --slug Y --invariant "..." [--days 14] [--json]');
     process.exit(2);
   }
 }
 
 if (require.main === module) main();
-module.exports = { record, attribute, stats, findingHash, FEEDBACK_FILE, RESOLVED_FILE };
+module.exports = { record, attribute, stats, matchOpen, findingHash, FEEDBACK_FILE, RESOLVED_FILE };

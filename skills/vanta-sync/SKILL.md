@@ -197,27 +197,41 @@ If yes, apply the **write-a-skill discipline** when generating the SKILL.md:
 
 **Step 8 — Attribute Open Council Findings (Tier 6 #15)**
 
-For every invariant added in Step 3, check whether it resolves an open council finding so model accuracy data accumulates automatically.
+For every invariant added in Step 3, run the deterministic match-open helper to find open findings (raised, not yet attributed) that the new invariant likely resolves:
 
-Open findings = entries in `~/.vanta/council-feedback.jsonl` whose `finding_hash` does NOT yet appear in `~/.vanta/council-feedback-resolved.jsonl`.
+```bash
+node ~/.claude/bin/vanta-council-feedback.js match-open \
+  --slug "$_SLUG" \
+  --invariant '<invariant text>' \
+  --json
+```
 
-Match an invariant to a finding when ALL of:
-- Same `slug` (current gstack slug)
-- Finding `ts` within last **14 days**
-- Topic match: invariant's section header (e.g. `Supabase / Deno Edge Functions`) overlaps the finding's `topic` field, OR the invariant text overlaps the `finding_excerpt` substring (case-insensitive, ≥3 word match)
+The helper applies these criteria internally (no need to re-implement):
+- Same `slug`
+- Finding `ts` within last **14 days** (override via `--days N`)
+- Word-set Jaccard ≥ 0.25 between invariant and `finding_excerpt`, OR topic substring match in invariant text
+- Already-resolved findings excluded automatically
 
-For each match, attribute as `true-positive`:
+Output (when matches found):
+```json
+[
+  { "hash": "sha256:...", "topic": "auth", "model": "codex",
+    "priority": "P1", "similarity": 0.42, "topicHit": true, ... }
+]
+```
+
+For the **top match only** (highest similarity), attribute as `true-positive`:
 
 ```bash
 node ~/.claude/bin/vanta-council-feedback.js attribute \
-  --hash 'sha256:<hash>' \
-  --outcome 'true-positive' \
+  --hash '<top.hash>' \
+  --outcome true-positive \
   --evidence "invariant added $(date -u +%Y-%m-%d): <one-line invariant text>" >/dev/null 2>&1 || true
 ```
 
 **Do not auto-attribute false-positives.** False-positive evidence requires negative confirmation (e.g., "we tried this and it didn't break") that auto-extraction can't reliably detect. Leave non-matched findings as `pending` — they age into `unverified` after 90d via the stats window, which is the correct signal.
 
-If multiple invariants match the same finding, attribute once with the most specific match.
+Skip silently if `match-open` returns `[]` — no overlap found is a clean "nothing to attribute".
 
 Report attribution count in Step 9: `Attributed: 2 council findings as true-positive`.
 

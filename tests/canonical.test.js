@@ -529,6 +529,81 @@ describe('vanta-council-feedback — record/attribute/stats', () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
+  test('matchOpen() finds open findings with topic + jaccard match', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cf-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    cf = freshModule();
+
+    // Two findings: one matches an incoming invariant, one doesn't.
+    cf.record({
+      topic: 'auth', slug: 'pi-perception', councilRun: '2026-04-30T00:00:00Z',
+      findingText: 'JWT secrets must be ES256 not HS256', priority: 'P1', model: 'codex',
+    });
+    cf.record({
+      topic: 'cors', slug: 'pi-perception', councilRun: '2026-04-30T00:00:00Z',
+      findingText: 'CORS preflight headers missing on /login', priority: 'P2', model: 'gemini',
+    });
+
+    const matches = cf.matchOpen({
+      slug: 'pi-perception',
+      invariant: 'Use ES256 asymmetric JWTs for pi-perception auth',
+    });
+    assert.ok(matches.length >= 1, 'should find the JWT match');
+    // Top match should be the auth finding, not CORS.
+    assert.equal(matches[0].topic, 'auth');
+    assert.ok(matches[0].similarity > 0 || matches[0].topicHit);
+
+    process.env.VANTA_DIR_OVERRIDE = '';
+    delete process.env.VANTA_DIR_OVERRIDE;
+  });
+
+  test('matchOpen() respects 14d window cutoff', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cf-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    cf = freshModule();
+
+    // Manually write an "old" finding outside the 14d window.
+    const oldTs = new Date(Date.now() - 30 * 86400_000).toISOString();
+    fs.writeFileSync(
+      path.join(tmp, 'council-feedback.jsonl'),
+      JSON.stringify({
+        ts: oldTs, council_run: oldTs, model: 'codex', round: 1,
+        priority: 'P1', topic: 'auth', slug: 'pi-perception',
+        finding_hash: 'sha256:0000000000000000',
+        finding_excerpt: 'Use ES256 not HS256',
+        verdict: 'raised', outcome: null,
+      }) + '\n'
+    );
+
+    const matches = cf.matchOpen({
+      slug: 'pi-perception',
+      invariant: 'Use ES256 asymmetric JWTs',
+      days: 14,
+    });
+    assert.equal(matches.length, 0, 'old findings outside window should be excluded');
+
+    process.env.VANTA_DIR_OVERRIDE = '';
+    delete process.env.VANTA_DIR_OVERRIDE;
+  });
+
+  test('matchOpen() excludes already-resolved findings', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cf-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    cf = freshModule();
+
+    const e = cf.record({
+      topic: 'auth', slug: 'x', councilRun: '2026-04-30T00:00:00Z',
+      findingText: 'already-resolved finding', priority: 'P1', model: 'codex',
+    });
+    cf.attribute({ hash: e.finding_hash, outcome: 'true-positive' });
+
+    const matches = cf.matchOpen({ slug: 'x', invariant: 'already-resolved finding' });
+    assert.equal(matches.length, 0, 'resolved findings should not appear');
+
+    process.env.VANTA_DIR_OVERRIDE = '';
+    delete process.env.VANTA_DIR_OVERRIDE;
+  });
+
   test('stats() latest resolution wins on duplicate hash', () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-cf-'));
     process.env.VANTA_DIR_OVERRIDE = tmp;
