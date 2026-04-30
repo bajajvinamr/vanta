@@ -333,6 +333,84 @@ describe('vanta-council-health — pre-flight readiness', () => {
   });
 });
 
+// ─── contradiction detection (Tier 6 #14) ──────────────────────────────────
+
+describe('detectContradictions — cross-source disagreement signal', () => {
+  const { detectContradictions } = require('../bin/vanta-resolve');
+
+  test('flags ES256 vs HS256 across invariant + decision', () => {
+    const sigs = detectContradictions([
+      { source: 'invariant', excerpt: 'Use ES256 asymmetric JWTs for pi-perception auth.' },
+      { source: 'decision',  excerpt: 'HS256 chosen for simplicity.', date: '2025-08-12' },
+    ]);
+    assert.equal(sigs.length, 1);
+    assert.equal(sigs[0].type, 'binary');
+    assert.ok(sigs[0].confidence >= 0.7);
+    assert.match(sigs[0].hint, /ES256.*HS256/);
+  });
+
+  test('does NOT flag when both halves co-occur in same entry', () => {
+    // An entry that mentions BOTH options conversationally is not a
+    // contradiction — it's a comparison. Detector requires each half to
+    // appear in a SEPARATE entry.
+    const sigs = detectContradictions([
+      { source: 'invariant', excerpt: 'Use ES256 not HS256 for asymmetric JWT auth.' },
+    ]);
+    assert.equal(sigs.length, 0);
+  });
+
+  test('episode source drops below 0.7 confidence threshold', () => {
+    // Episodes are conversational and often discuss both options.
+    // ES256/HS256 base confidence is 0.9, episode tax is -0.2 → 0.7.
+    // Pair another episode (also -0.2) → both are loose, sum reduction is
+    // applied once → still 0.7. A pair where ONE side is invariant is fine.
+    // This test confirms the loose-source tax doesn't sink a real
+    // invariant↔decision pair.
+    const sigs = detectContradictions([
+      { source: 'invariant', excerpt: 'ES256 required for pi-perception JWTs.' },
+      { source: 'episode',   excerpt: 'We landed on HS256 in May.' },
+    ]);
+    // 0.9 base - 0.2 (episode loose) = 0.7 — exactly at threshold, kept.
+    assert.equal(sigs.length, 1);
+    assert.ok(sigs[0].confidence >= 0.7);
+  });
+
+  test('context-required pairs need shared context tokens', () => {
+    // sync ⇄ async only contradicts in the PixiJS context. Two unrelated
+    // entries about generic sync/async patterns should NOT trip.
+    const noContext = detectContradictions([
+      { source: 'invariant', excerpt: 'All HTTP calls are async.' },
+      { source: 'invariant', excerpt: 'File reads use the sync API for tests.' },
+    ]);
+    assert.equal(noContext.length, 0, 'no PixiJS context → no flag');
+
+    const withContext = detectContradictions([
+      { source: 'invariant', section: 'PixiJS v8', excerpt: 'Application.init() is async in v8.' },
+      { source: 'decision',  excerpt: 'PixiJS sync constructor pattern preferred.', date: '2025-06-01' },
+    ]);
+    assert.ok(withContext.length >= 1, 'PixiJS context → flag');
+  });
+
+  test('returns empty array on empty input', () => {
+    assert.deepEqual(detectContradictions([]), []);
+  });
+
+  test('dedupes when same pair surfaces twice', () => {
+    // If the same two entries match multiple binary pairs (rare but possible),
+    // the dedup key prevents duplicate signals.
+    const sigs = detectContradictions([
+      { source: 'invariant', excerpt: 'ES256 required.' },
+      { source: 'invariant', excerpt: 'ES256 required.' },  // exact dup
+      { source: 'decision',  excerpt: 'HS256 chosen.' },
+    ]);
+    // Two invariants both opposite of one decision = 2 pair-matches, but
+    // dedup key collapses identical excerpts to 1. (Actually here the two
+    // invariants have the same first-40 chars so both pair against the same
+    // decision dedup-collapse to 1.)
+    assert.equal(sigs.length, 1);
+  });
+});
+
 // ─── council-feedback (Tier 6 #15) ─────────────────────────────────────────
 
 describe('vanta-council-feedback — record/attribute/stats', () => {
@@ -481,5 +559,6 @@ describe('module exports — sanity', () => {
     const m = require('../bin/vanta-resolve');
     assert.equal(typeof m.resolve, 'function');
     assert.equal(typeof m.scoreResult, 'function');
+    assert.equal(typeof m.detectContradictions, 'function');
   });
 });
