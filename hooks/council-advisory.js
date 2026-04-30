@@ -23,6 +23,18 @@ for (const p of [
   try { ({ resolve: resolveKnowledge } = require(p)); break; } catch { /* keep looking */ }
 }
 
+// Cleanup #11: lazy logger.
+let _vlog;
+function vlog() {
+  if (_vlog) return _vlog;
+  for (const p of [
+    path.join(process.env.HOME || '', '.claude', 'bin', 'vanta-log.js'),
+    path.join(process.env.HOME || '', 'Projects', 'vanta', 'bin', 'vanta-log.js'),
+  ]) { try { _vlog = require(p); return _vlog; } catch {} }
+  _vlog = { info: () => {}, warn: () => {}, error: () => {} };
+  return _vlog;
+}
+
 // Topics ordered MOST SPECIFIC → LEAST SPECIFIC. The resolver matches each one
 // independently; specific topics surface tighter results, generic ones widen reach
 // when nothing specific hits. 'session' is intentionally NOT in the broad auth
@@ -162,7 +174,8 @@ process.stdin.on('end', () => {
     };
 
     process.stdout.write(JSON.stringify(result));
-  } catch (_) {
+  } catch (err) {
+    vlog().error('council-advisory', err && err.message || String(err));
     process.exit(0);
   }
 });

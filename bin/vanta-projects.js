@@ -64,11 +64,41 @@ function slugForFilesystem(slug) {
   return String(slug || 'unknown').replace(/[^a-z0-9_.-]/gi, '_');
 }
 
+// Curated per-project SENSITIVE_PATTERNS. Lives here (not in the indexer)
+// so adding a new project edits ONE file: PROJECT_KEYWORDS + this table
+// together. Codex Tier 5 R1 finding — was previously in vanta-index-code.js
+// which re-introduced sync drift between the two.
+//
+// Each entry: { cat: <category>, re: <regex with /g or /gi>, why: <rationale> }.
+// These merge with BASELINE_PATTERNS (in indexer) and any user-defined
+// `## Sensitive Patterns` section in the project's CLAUDE.md.
+const PROJECT_SPECIFIC_PATTERNS = {
+  'little-wins': [
+    { cat: 'child-safety',  re: /\b(POCSO|COPPA|safeguard(?:ing)?|child[- ]safe|mandatory[- ]report|incident[- ]rout)/gi, why: 'Child-safety boundary — POCSO §19/§21 reporting, mandatory incident routing.' },
+    { cat: 'output-filter', re: /\b(filterOutput|outputFilter|output[- ]filter|filter[- ]veto|llm[- ]safe(?:ty)?|output[- ]gate)\b/gi, why: 'LLM output filter — final veto gate. Regression here = unfiltered LLM reaches child.' },
+    { cat: 'consent',       re: /\b(DPDP|parental[- ]consent|guardian[- ]consent|child[- ]pii|EU[- ]region|india[- ]region)\b/gi, why: 'DPDP Rules 2025 — child PII region restriction, parental consent flow.' },
+    { cat: 'pii-lw',        re: /\b(child_name|parent_phone|school_name|dob)\b/gi, why: 'LW-specific PII — region-locked, never logged, encrypted at rest.' },
+    { cat: 'two-signal',    re: /\btwo[- ]signal\b|\bpaired[- ]sensors?\b|\bcorrobor(?:ate|ation)\b/gi, why: 'Two-signal rule — clinical claim requires ≥2 independent paradigms agreeing.' },
+    { cat: 'norms-gate',    re: /\b(indian[- ]norms?|cbse[- ]norms?|norms[- ]gate|age[- ]band|band[- ]baseline|isParadigmEnabled)\b/gi, why: 'Norms gate — age-band enablement, single source of truth for paradigm dispatch.' },
+  ],
+  'pi-perception': [
+    { cat: '12-dim',        re: /\b(12[- ]dim|twelve[- ]dim|perception[- ]intelligence|pi[- ]score)\b/gi, why: '12-dim perception scoring — calibration is load-bearing.' },
+  ],
+  // Add new projects here. Keep regex /gi unless case-sensitivity is meaningful.
+};
+
+// Returns the curated patterns for a slug, or [] if none.
+function projectPatternsFor(slug) {
+  return PROJECT_SPECIFIC_PATTERNS[canonProject(slug)] || [];
+}
+
 module.exports = {
   PROJECT_KEYWORDS,
+  PROJECT_SPECIFIC_PATTERNS,
   GLOBAL_PROJECT,
   canonProject,
   isKnownProject,
   detectProject,
   slugForFilesystem,
+  projectPatternsFor,
 };

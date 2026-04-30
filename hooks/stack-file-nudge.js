@@ -46,6 +46,19 @@ function extractFilePath(data) {
   return String(data.tool_input?.file_path || data.tool_input?.path || '');
 }
 
+// Cleanup #11: lazy logger.
+const path = require('path');
+let _vlog;
+function vlog() {
+  if (_vlog) return _vlog;
+  for (const p of [
+    path.join(process.env.HOME || '', '.claude', 'bin', 'vanta-log.js'),
+    path.join(process.env.HOME || '', 'Projects', 'vanta', 'bin', 'vanta-log.js'),
+  ]) { try { _vlog = require(p); return _vlog; } catch {} }
+  _vlog = { info: () => {}, warn: () => {}, error: () => {} };
+  return _vlog;
+}
+
 let input = '';
 const stdinTimeout = setTimeout(() => process.exit(0), 10000);
 process.stdin.setEncoding('utf8');
@@ -90,7 +103,8 @@ process.stdin.on('end', () => {
     };
 
     process.stdout.write(JSON.stringify(result));
-  } catch (_) {
+  } catch (err) {
+    vlog().error('stack-file-nudge', err && err.message || String(err));
     process.exit(0);
   }
 });
