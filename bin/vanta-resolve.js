@@ -25,6 +25,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+// Tier 4: PROJECT_KEYWORDS + canonProject extracted to shared module.
+// Both councils flagged the duplication as silent sync-drift surface.
+const { PROJECT_KEYWORDS, GLOBAL_PROJECT, canonProject, isKnownProject, detectProject, slugForFilesystem } = require('./vanta-projects');
+
 // ─── Config ─────────────────────────────────────────────────────────────────
 // Source weights: invariants are user-curated truths (highest); decisions are
 // dated/scoped (high); gotchas + code are auto-extracted from project (medium-
@@ -34,59 +38,8 @@ const SOURCE_WEIGHTS = { invariant: 2.0, decision: 1.5, gotcha: 1.5, code: 1.3, 
 const CONFIDENCE_MULT = { high: 1.5, medium: 1.0, low: 0.7, unknown: 1.0 };
 const TODAY = new Date().toISOString().slice(0, 10);
 
-// Cross-project bleed penalty — multiplies the final score of any result whose
-// project tag does NOT match the active project (and isn't 'global'). Values <1
-// down-rank foreign results so they only appear if no active-project results
-// score higher. Both councils flagged this as the v3.4 safety prerequisite.
+// Cross-project bleed penalty.
 const FOREIGN_PENALTY = 0.15;
-const GLOBAL_PROJECT = '__global__';
-// Tier 3 — Gemini P1 fix. Index entries with no recognized project keyword
-// are tagged with this token, NOT GLOBAL_PROJECT. Resolver treats them as
-// foreign (penalized/dropped), preventing silent bleed when PROJECT_KEYWORDS
-// drifts between resolver + indexer.
-const UNKNOWN_PROJECT = '__unknown_project__';
-
-// Project-keyword index. Used to tag invariants and memory entries with the
-// project they belong to. Slugs match gstack convention: <user>-<repo>.
-// Add new projects here as they grow LW-specific or pi-perception-specific
-// invariants. Untagged content defaults to GLOBAL (applies everywhere).
-const PROJECT_KEYWORDS = {
-  'little-wins':       [/\blittle[\s-]?wins?\b/i, /\bMitthu\b/i, /\bPOCSO\b/i, /\bSDQ\b/i, /\bIndian norms\b/i, /\btwo[- ]signal\b/i, /\bDPDP\b/i, /\bbajajvinamr-little-wins\b/],
-  'pi-perception':     [/\bpi[- ]?perception\b/i, /\b12[- ]dim\b/i, /\bperception intelligence\b/i, /\bbajajvinamr-pi-perception\b/],
-  'sales-agent-publisher': [/\bsales[- ]agent[- ]publisher\b/i, /\bsalestracker\b/i],
-  'founderos':         [/\bfounder ?os\b/i, /\bpaperclip\b/i],
-  'priyaa-audit':      [/\bpriyaa\b/i],
-  'vanta':             [/\bvanta[- ]run\b/i, /\bvanta[- ]council\b/i, /\bvanta[- ]sync\b/i, /\bvanta[- ]patterns\b/i, /\bvanta-resolve\b/, /\bvanta-brief\b/, /\bcouncil[- ]advisory\b/, /\bplan[- ]watcher\b/],
-};
-
-// Detect project tag for arbitrary text. Returns first matching slug, or
-// GLOBAL_PROJECT if no project keywords matched.
-function detectProject(text) {
-  if (!text) return GLOBAL_PROJECT;
-  for (const [slug, regexes] of Object.entries(PROJECT_KEYWORDS)) {
-    if (regexes.some(re => re.test(text))) return slug;
-  }
-  return GLOBAL_PROJECT;
-}
-
-// Normalize project slug — handles bare repo names ("little-wins"), gstack
-// slugs ("bajajvinamr-little-wins"), and suffixed memory slugs ("little-wins-stack")
-// to the same canonical form for matching.
-// Order: PROJECT_KEYWORDS lookup first (covers "little-wins-stack" → "little-wins"
-// and "bajajvinamr-little-wins" → "little-wins"), then fall back to user-prefix
-// stripping for unknown projects.
-function canonProject(slug) {
-  if (!slug) return null;
-  const lower = slug.toLowerCase();
-  // Check known projects first — handles all suffix and prefix variants.
-  for (const [proj, regexes] of Object.entries(PROJECT_KEYWORDS)) {
-    if (regexes.some(re => re.test(lower))) return proj;
-  }
-  // Fallback: strip GitHub-user-prefix if remainder still has a dash.
-  const m = lower.match(/^([a-z0-9]+)-(.+)$/);
-  if (m && m[2].includes('-')) return m[2];
-  return lower;
-}
 
 // Map invariant section names → stack tags that must be present in the project
 // for the invariant to apply. If the project doesn't use the stack, the
@@ -300,43 +253,37 @@ function readGotchas(cwd, topic) {
   return out;
 }
 
-// Read code-knowledge from ~/.vanta/knowledge/<slug>.jsonl shards (Tier 3).
-// Tier 2 used a single global jsonl which scaled O(N) with all projects;
-// per-project shards keep the hot path O(N entries in this project only).
+// Read code-knowledge from per-project shards at ~/.vanta/knowledge/<slug>.jsonl
+// (Tier 4). Both councils flagged that the Tier 3 fallback path (reading ALL
+// shards when no active project) was the new O(N) bug — every council-advisory
+// hook fires before the user has typed anything, often without project context.
 //
-// When activeProject is provided, read ONLY that shard (fast path, used by
-// council-advisory and /recall in a project context). When unset, read all
-// shards (rare — only for cross-project debugging).
+// Tier 4 rule: if no active project, return [] for code-knowledge. Callers
+// MUST pass --project for code results to surface. Invariants/decisions/
+// memory still work without project; only code-knowledge requires it.
+//
+// This is the CORRECT semantics: code-knowledge is structurally project-tagged
+// at index time. A query with no project context can't meaningfully match
+// project-scoped truth — better to return nothing than scan everything.
 function readCodeKnowledge(topic, activeProject, max = 20) {
+  if (!activeProject) return [];  // Tier 4: refuse multi-shard scan
   const dir = path.join(os.homedir(), '.vanta', 'knowledge');
-  if (!fs.existsSync(dir)) {
-    // Fallback: read legacy global file if Tier 2 was used and not yet migrated
-    const legacy = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
-    if (!fs.existsSync(legacy)) return [];
-    return _readCodeKnowledgeFromFile(legacy, topic, max, null);
-  }
-  const out = [];
   const active = canonProject(activeProject);
-  const filesToRead = [];
-  if (active) {
-    // Active project shard only — hot path, fast.
-    const shardName = active.replace(/[^a-z0-9_.-]/gi, '_');
-    const shard = path.join(dir, `${shardName}.jsonl`);
-    if (fs.existsSync(shard)) filesToRead.push({ file: shard, slug: active });
-  } else {
-    // No active project — read everything for cross-project debug
-    try {
-      for (const f of fs.readdirSync(dir)) {
-        if (!f.endsWith('.jsonl')) continue;
-        filesToRead.push({ file: path.join(dir, f), slug: f.replace(/\.jsonl$/, '') });
-      }
-    } catch { /* ignore */ }
+  if (!active) return [];
+
+  const shardFile = path.join(dir, `${slugForFilesystem(active)}.jsonl`);
+  if (!fs.existsSync(shardFile)) {
+    // Final-tier compatibility: Tier 2 legacy file still exists if migration
+    // hasn't run. Read it once, scoped to the active project.
+    const legacy = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
+    if (fs.existsSync(legacy)) {
+      return _readCodeKnowledgeFromFile(legacy, topic, max, active)
+        .filter(r => canonProject(r.project) === active);
+    }
+    return [];
   }
-  for (const { file, slug } of filesToRead) {
-    out.push(..._readCodeKnowledgeFromFile(file, topic, max, slug));
-    if (out.length >= max * 3) break;
-  }
-  return out;
+
+  return _readCodeKnowledgeFromFile(shardFile, topic, max, active);
 }
 
 function _readCodeKnowledgeFromFile(file, topic, max, fallbackSlug) {
@@ -348,11 +295,8 @@ function _readCodeKnowledgeFromFile(file, topic, max, fallbackSlug) {
     let e; try { e = JSON.parse(line); } catch { continue; }
     const haystack = [e.snippet, e.context, e.category, e.why].filter(Boolean).join(' ');
     if (topicMatch(haystack, topic) === 0) continue;
-    // Project tag: trust the entry's own project field; fall back to shard
-    // filename slug. Indexer tags unknown projects as UNKNOWN_PROJECT, NOT
-    // GLOBAL_PROJECT (Gemini P1 fix).
     let project = e.project;
-    if (!project || project === GLOBAL_PROJECT) project = fallbackSlug || UNKNOWN_PROJECT;
+    if (!project || project === GLOBAL_PROJECT) project = fallbackSlug;
     out.push({
       source: 'code',
       section: e.category,
@@ -361,7 +305,6 @@ function _readCodeKnowledgeFromFile(file, topic, max, fallbackSlug) {
       path: file,
       sourceLocation: e.source,
       // Path-based rank multiplier from indexer — Codex P3 fix.
-      // page.tsx + tests get <1.0; real implementation code = 1.0.
       pathRank: typeof e.pathRank === 'number' ? e.pathRank : 1.0,
       project: canonProject(project) || project,
     });
@@ -449,28 +392,24 @@ function applyProjectScope(results, activeProject, includeForeign) {
   const active = canonProject(activeProject);
   const out = [];
   for (const r of results) {
-    const rp = canonProject(r.project) || UNKNOWN_PROJECT;
-    // UNKNOWN_PROJECT entries (Gemini P1 fix) are treated as foreign — they
-    // came from an unindexed slug and should not silently land in queries.
-    // Only includeForeign opt-in surfaces them, with FOREIGN_PENALTY applied.
+    const rp = canonProject(r.project) || GLOBAL_PROJECT;
+    // Tier 4: indexer no longer tags entries with __unknown_project__; raw
+    // slugs land in their own shard. Resolver decides scope by canonical
+    // match: scoped (matches active), global (no project tag), or foreign
+    // (different known project). No UNKNOWN bucket.
     if (!active || rp === GLOBAL_PROJECT) {
       r.scope_match = 'global';
       out.push(r);
     } else if (rp === active) {
       r.scope_match = 'scoped';
       out.push(r);
-    } else if (rp === UNKNOWN_PROJECT) {
-      r.scope_match = 'unknown';
-      if (includeForeign) {
-        r.score *= FOREIGN_PENALTY;
-        out.push(r);
-      }
     } else {
       r.scope_match = 'foreign';
       if (includeForeign) {
         r.score *= FOREIGN_PENALTY;
         out.push(r);
       }
+      // Default: drop foreign entirely.
     }
   }
   return out;
@@ -522,7 +461,7 @@ function formatText(out) {
     : `${out.count} result(s) for "${out.topic}":`;
   const lines = [header, ''];
   const icon = { invariant: '⚠️ ', decision: '📌', gotcha: '🔒', code: '▤', episode: '🧠', memory: '💭' };
-  const scopeIcon = { scoped: '◉', global: '○', foreign: '⊗', unknown: '?' };
+  const scopeIcon = { scoped: '◉', global: '○', foreign: '⊗' };
   for (const r of out.results) {
     // Provenance: show canonical project tag and scope match status.
     // ⊗ = foreign (other project), ◉ = scoped to active, ○ = global.
