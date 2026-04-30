@@ -9,5 +9,8 @@
     "type": "git",
     "url": "https://github.com/vinamr/vanta"
   },
-  "keywords": ["vanta", "claude-code", "gstack", "gsd", "superpowers", "ai-workflow", "council"]
+  "keywords": ["vanta", "claude-code", "gstack", "gsd", "superpowers", "ai-workflow", "council"],
+  "scripts": {
+    "test": "node --test tests/canonical.test.js"
+  }
 }
