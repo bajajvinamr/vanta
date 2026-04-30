@@ -43,7 +43,7 @@ echo ""
 echo "Installing hooks..."
 mkdir -p "$HOOKS_DIR"
 
-for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js code-index-watch.js session-start; do
+for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js code-index-watch.js git-guardrails.js session-start; do
   src="$REPO_DIR/hooks/$hook"
   if [ -f "$src" ]; then
     cp "$src" "$HOOKS_DIR/$hook"
@@ -92,6 +92,7 @@ const REGISTRATIONS = [
   { event: 'PostToolUse',  matcher: 'Write|Edit', file: 'stack-file-nudge.js',     timeout: 5 },
   { event: 'PostToolUse',  matcher: 'Write|Edit', file: 'plan-watcher.js',         timeout: 5 },
   { event: 'PostToolUse',  matcher: 'Write|Edit|NotebookEdit', file: 'code-index-watch.js', timeout: 3 },
+  { event: 'PreToolUse',   matcher: 'Bash',       file: 'git-guardrails.js',       timeout: 5 },
 ];
 
 let added = 0, skipped = 0, missing = 0;
