@@ -288,6 +288,42 @@ Field semantics:
 
 vanta-sync attributes outcomes later (Step 7 of vanta-sync) by matching newly added invariants/episodes to open findings within a 14d window. The accuracy table surfaces in `vanta-status` and `vanta-council-feedback stats --days 90`.
 
+## Step 8 — Write Machine-Checked Run Artifact (Codex Tier-6 P2 fix)
+
+The `model_health` block in Step 5 is for the user to read. This step writes the same data in machine-checkable form so `vanta-status` and degradation audits don't have to grep prose.
+
+At the **start** of council, capture an ISO timestamp for the run:
+
+```bash
+_RUN_TS=$(node ~/.claude/bin/vanta-council-run.js start --slug "$_SLUG" --topic '<topic>')
+```
+
+Use `$_RUN_TS` as the `--council-run` value in every `vanta-council-feedback record` call (Step 7). Same id ties findings to run.
+
+After Step 5 (report) and Step 7 (record findings), close the run:
+
+```bash
+node ~/.claude/bin/vanta-council-run.js finish \
+  --ts "$_RUN_TS" \
+  --slug "$_SLUG" \
+  --topic '<topic>' \
+  --mode 'FULL|PARTIAL|SOLO' \
+  --models-attempted 'codex@gpt-5.4,gemini@gemini-3.1-pro-preview' \
+  --models-used 'codex@gpt-5.4,gemini@gemini-3.1-pro-preview' \
+  --fallbacks '[{"model":"gemini-3.1-pro-preview","to":"gemini-3-pro-preview","reason":"429"}]' \
+  --finding-hashes 'sha256:abc,sha256:def,...' \
+  --verdict 'PASS|PASS_WITH_CONDITIONS|BLOCK' \
+  --rounds 1 >/dev/null 2>&1 || true
+```
+
+`models_attempted` includes everything you tried (including failed pings); `models_used` is the subset that returned non-empty results. The diff is the silent-degradation signal.
+
+`fallbacks` is a JSON array of `{ model, to, reason }` triples — empty `[]` if no fallback fired. Reasons: `429`, `exit-55`, `timeout`, `arg-parse`, etc.
+
+Pull `--finding-hashes` from the JSON outputs of the `vanta-council-feedback record` calls in Step 7.
+
+This artifact is what makes Tier 6 #17's "no silent degradation" promise machine-checkable. `vanta-council-run audit --days 90` surfaces partial/solo rate, fallback frequency, and zero-finding rate — drift over time is visible without reading prose reports.
+
 ## What Council Is Not
 
 Not a rubber stamp. If both models find nothing, say: "Council clean — no P1/P2 findings. R2 skipped." Don't invent issues.

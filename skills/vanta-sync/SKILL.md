@@ -153,16 +153,27 @@ Critical: do NOT mark entries from other cwds — they belong to other projects 
 
 **Step 7 — Invariant→Skill Promotion (write-a-skill pattern)**
 
+⚠️ **Internal-only — never expose to the user.** Promoted skills are
+`user-invocable: false`. Claude pulls them via `Skill()` when working in the
+relevant tool's domain. The user never types the skill name; Vanta's
+three-command promise (`/vanta`, `/vanta-sync`, `/council`) is preserved. If
+you find yourself telling the user to "run `Skill("pixijs-v8-patterns")"`,
+stop — that's a Surface Impact Discipline violation.
+
 After writing new invariants in Step 3, check whether any section has accumulated enough density to deserve a dedicated skill. Threshold:
 - **≥4 distinct invariants in one `## Section`**
 - All describing the **same tool / framework / library**
 - Most written within the last **90 days** (recent + active surface)
 
-If a section qualifies, propose promotion:
+If a section qualifies, propose promotion (frame it as internal infrastructure, not a new feature):
 
-> `## PixiJS v8` has 5 invariants accumulated. Dense enough to promote to a dedicated skill (`pixijs-v8-patterns`). Promote? [y/n]
+> `## PixiJS v8` has 5 invariants accumulated — dense enough that scanning
+> the section costs more context than loading a focused internal-routing skill.
+> Promote to internal `pixijs-v8-patterns` skill? [y/n]
 > 
-> Trade-off: the section stays in invariants.md (other models read it via @import). The skill adds usage examples + decision tree + pitfalls. Claude pulls it via `Skill("<name>-patterns")` instead of scanning the 3000-line invariants file.
+> Trade-off: the section stays in invariants.md (other models read it via @import).
+> The skill is `user-invocable: false` — Claude routes to it automatically when
+> working on PixiJS, the user never sees it. No new surface for the user.
 
 If yes, apply the **write-a-skill discipline** when generating the SKILL.md:
 
@@ -209,18 +220,22 @@ node ~/.claude/bin/vanta-council-feedback.js match-open \
 The helper applies these criteria internally (no need to re-implement):
 - Same `slug`
 - Finding `ts` within last **14 days** (override via `--days N`)
-- Word-set Jaccard ≥ 0.25 between invariant and `finding_excerpt`, OR topic substring match in invariant text
+- Lexical overlap classified into two strengths:
+  - `strong`: word-set Jaccard ≥ 0.25 — auto-attribute candidate
+  - `weak`: Jaccard 0.10–0.25 + topic substring match — **surface for human review only, do NOT auto-attribute**
 - Already-resolved findings excluded automatically
+
+**Why two strengths**: topic-substring alone (e.g., a generic invariant containing "auth") matches every auth-topic finding. Auto-TP'ing on that signal silently corrupts the accuracy dataset that Tier 6 #15 depends on — defeating the entire feedback loop.
 
 Output (when matches found):
 ```json
 [
   { "hash": "sha256:...", "topic": "auth", "model": "codex",
-    "priority": "P1", "similarity": 0.42, "topicHit": true, ... }
+    "priority": "P1", "similarity": 0.42, "strength": "strong", "topicHit": true, ... }
 ]
 ```
 
-For the **top match only** (highest similarity), attribute as `true-positive`:
+**Only auto-attribute when `strength === 'strong'`.** For the top STRONG match (if any), attribute as `true-positive`:
 
 ```bash
 node ~/.claude/bin/vanta-council-feedback.js attribute \
