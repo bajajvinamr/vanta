@@ -256,6 +256,38 @@ If the user amends the council verdict during discussion, note it: `**Vinamr:** 
 
 The constraint-pack hook (council-advisory.js) ranks injected decisions by recency × confidence — high-confidence recent decisions dominate; expired ones drop off automatically.
 
+## Step 7 — Record Findings for Accuracy Tracking (Tier 6 #15)
+
+After Step 5 (report), every **P1 and P2 finding** is logged via `vanta-council-feedback record` so future runs can measure model accuracy. This produces no user-visible output — it's append-only telemetry.
+
+For each P1/P2 finding (including "Confirmed by both" — log under model `synthesis` for the joint case, then once per individual model):
+
+```bash
+node ~/.claude/bin/vanta-council-feedback.js record \
+  --topic '<topic>' \
+  --slug "$_SLUG" \
+  --council-run '<ISO timestamp of council start>' \
+  --finding-text '<the finding text — first 500 chars used as excerpt>' \
+  --priority 'P1' \
+  --model 'codex' \
+  --round 1 \
+  --mode 'FULL' >/dev/null 2>&1 || true
+```
+
+Field semantics:
+- `--topic` — coarse area (`auth`, `payments`, `migrations`, `routing`, etc.) — same axis as decisions.md topics
+- `--slug` — gstack project slug (`$_SLUG` from Step 6)
+- `--council-run` — ISO 8601 timestamp of when **this council run** started (NOT per-finding ts) — groups findings from the same run
+- `--finding-text` — the full finding text. Hashed to dedup. Excerpt stored verbatim
+- `--priority` — `P1`/`P2`/`P3`/`P4` exactly as in the report
+- `--model` — `codex` / `gemini` / `synthesis` (both raised it) / `solo` (Step 0b)
+- `--round` — `1` for Round 1 findings, `2` for net-new findings surfaced by R2 convergence
+- `--mode` — `FULL` / `PARTIAL` / `SOLO`
+
+**Skip this step entirely if** there are no P1/P2 findings — nothing to track. Do not log P3/P4 findings; the dataset stays focused on findings that actually warranted action.
+
+vanta-sync attributes outcomes later (Step 7 of vanta-sync) by matching newly added invariants/episodes to open findings within a 14d window. The accuracy table surfaces in `vanta-status` and `vanta-council-feedback stats --days 90`.
+
 ## What Council Is Not
 
 Not a rubber stamp. If both models find nothing, say: "Council clean — no P1/P2 findings. R2 skipped." Don't invent issues.

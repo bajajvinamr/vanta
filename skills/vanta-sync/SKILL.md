@@ -168,7 +168,33 @@ If yes, apply the **write-a-skill discipline** when generating the SKILL.md:
 
 **Upstream provenance**: structural discipline (frontmatter, progressive disclosure, bundled resources) adapted from mattpocock/skills/write-a-skill (MIT) and anthropics/skills/skill-creator (Apache-2.0). Promotion-by-density threshold and the cross-link pattern are Vanta-original.
 
-**Step 8 — Confirm**
+**Step 8 — Attribute Open Council Findings (Tier 6 #15)**
+
+For every invariant added in Step 3, check whether it resolves an open council finding so model accuracy data accumulates automatically.
+
+Open findings = entries in `~/.vanta/council-feedback.jsonl` whose `finding_hash` does NOT yet appear in `~/.vanta/council-feedback-resolved.jsonl`.
+
+Match an invariant to a finding when ALL of:
+- Same `slug` (current gstack slug)
+- Finding `ts` within last **14 days**
+- Topic match: invariant's section header (e.g. `Supabase / Deno Edge Functions`) overlaps the finding's `topic` field, OR the invariant text overlaps the `finding_excerpt` substring (case-insensitive, ≥3 word match)
+
+For each match, attribute as `true-positive`:
+
+```bash
+node ~/.claude/bin/vanta-council-feedback.js attribute \
+  --hash 'sha256:<hash>' \
+  --outcome 'true-positive' \
+  --evidence "invariant added $(date -u +%Y-%m-%d): <one-line invariant text>" >/dev/null 2>&1 || true
+```
+
+**Do not auto-attribute false-positives.** False-positive evidence requires negative confirmation (e.g., "we tried this and it didn't break") that auto-extraction can't reliably detect. Leave non-matched findings as `pending` — they age into `unverified` after 90d via the stats window, which is the correct signal.
+
+If multiple invariants match the same finding, attribute once with the most specific match.
+
+Report attribution count in Step 9: `Attributed: 2 council findings as true-positive`.
+
+**Step 9 — Confirm**
 
 Report back:
 ```
@@ -178,7 +204,8 @@ Added [N] invariants to ~/.claude/rules/vinamr-invariants.md:
 - [list them with the section they went under]
 
 Project CLAUDE.md updated: [yes/no — if yes, what was added]
-Skill promoted: [yes/no — if yes, name + path]   # new
+Skill promoted: [yes/no — if yes, name + path]
+Council findings attributed: [N true-positive / N skipped no-match]   # Tier 6 #15
 Gemini picks this up automatically next session.
 ```
 
