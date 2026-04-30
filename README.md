@@ -182,10 +182,12 @@ If the report flags ≥2 issues, it offers to run `/council` *on the report itse
 
 | Hook | Trigger | What |
 |---|---|---|
-| `council-advisory.js` | PreToolUse: Write/Edit to auth/payment/migration paths | **Constraint-pack injector** — queries `vanta-resolve.js` for ranked decisions, invariants, gotchas, episodes, and pending shadow reviews |
+| `council-advisory.js` | PreToolUse: Write/Edit to auth/payment/migration paths | **Constraint-pack injector** — queries `vanta-resolve.js` for ranked decisions, invariants, gotchas, episodes, and pending shadow reviews. Surfaces ⚠️ contradiction warnings (Tier 6 #14) when binary-opposition pairs land in separate retrieved entries. |
+| `git-guardrails.js` | PreToolUse: Bash | Two-tier policy on destructive git/sql/rm: HARD BLOCK on force-push to main, `--no-verify`, `rm -rf /`, `DROP/TRUNCATE`; ADVISORY on force-push feature, `reset --hard`, `clean -f`, relative `rm -rf` |
 | `plan-watcher.js` | PostToolUse: Write/Edit to `.planning/*.md` | **Shadow Council flag** — detects sensitive topics in plans, writes pending-review flag for council-advisory to surface at code time |
 | `test-failure-advisor.js` | PostToolUse: Bash with test failures | Hard-stop — don't ship over broken tests |
 | `stack-file-nudge.js` | PostToolUse: Write/Edit to config files | Follow-up actions for config changes |
+| `code-index-watch.js` | PostToolUse: Write/Edit/NotebookEdit | Incremental refresh of per-project knowledge shards |
 | `auto-sync.js` | Stop: session end | Queue session + write episodic memory; dedupes by session_id |
 
 ---
@@ -219,17 +221,22 @@ See `docs/install.md` for manual setup and dependency notes.
   vanta-patterns/   ← /vanta-patterns: weekly self-governance retrospective
 
 ~/.claude/bin/
-  vanta-projects.js   ← single source of truth for project keywords + slug canon
-  vanta-resolve.js    ← canonical knowledge query layer (one ranked index over 5 sources)
-  vanta-index-code.js ← code-knowledge indexer (per-project shards, lockfile, atomic write)
-  vanta-status.js     ← single-screen health summary across shards/queues/hooks
-  vanta-prune.js      ← archive dormant project shards (reversible)
-  vanta-log.js        ← shared hook logger (~/.vanta/hook.log)
-  vanta-brief.js      ← session-start brief generator
+  vanta-projects.js          ← single source of truth for project keywords + slug canon
+  vanta-resolve.js           ← canonical knowledge query layer (one ranked index over 6 sources)
+                               + cross-source contradiction detector (Tier 6 #14)
+  vanta-index-code.js        ← code-knowledge indexer (per-project shards, lockfile, atomic write)
+  vanta-status.js            ← single-screen health: shards/queues/hooks/council/accuracy
+  vanta-prune.js             ← archive dormant project shards (reversible)
+  vanta-log.js               ← shared hook logger (~/.vanta/hook.log)
+  vanta-brief.js             ← session-start brief generator
+  vanta-council-health.js    ← (Tier 6 #17) pre-flight readiness for /council
+  vanta-council-feedback.js  ← (Tier 6 #15) per-model finding accuracy tracker
+  vanta-extract-score.js     ← (Tier 6 #16) confidence scoring + auto/staging/discard router
 
 ~/.claude/hooks/
   auto-sync.js              ← Stop hook: sync-queue + episodic memory (deduped by session_id)
-  council-advisory.js       ← PreToolUse: constraint-pack via vanta-resolve (logs query feedback)
+  council-advisory.js       ← PreToolUse: constraint-pack via vanta-resolve + contradiction warnings
+  git-guardrails.js         ← PreToolUse:Bash hard-block + advisory tier (destructive git/sql/rm)
   plan-watcher.js           ← PostToolUse: Shadow Council flag on sensitive plans
   test-failure-advisor.js   ← PostToolUse: hard-stop on broken tests
   stack-file-nudge.js       ← PostToolUse: config-file follow-ups
@@ -298,3 +305,4 @@ sharing is silent corruption; the cost of snapshotting is a few seconds.
 | v3.2 | 9.8/10 | Constraint-pack hook (anticipatory memory at write-time), episodic memory (`episodes.jsonl`), `/vanta-patterns` self-governance loop, decision metadata (confidence/scope/expires/supersedes), Gemini trust fix |
 | v3.3 | 9.9/10 | `bin/vanta-resolve.js` canonical knowledge index (replaces 5 separate greps with one ranked query, expiry+supersession-aware), Shadow Council via `plan-watcher.js` (pre-emptive governance at plan-write time), Stop hook dedup by session_id, decision-extractor strips markdown, install bug fixed (all 4 hooks now register, not just Stop) |
 | v3.4 | 9.95/10 | **Per-project shards** (`~/.vanta/knowledge/<slug>.jsonl`) eliminate the O(N) write race on the global jsonl — each project gets its own shard, cursor, and O_EXCL lockfile with PID-aware steal. **3-layer pattern architecture**: BASELINE (universal) + PROJECT_SPECIFIC (curated table) + CLAUDE.md `## Sensitive Patterns` (user-defined). **Alias-shard fold-on-read** so `bajajvinamr-vanta.jsonl` and `vanta.jsonl` merge under the canonical slug at query time. **`vanta-status`** for single-screen health (shards, queues, hook errors, stuck locks, suggestions). **`vanta-prune`** for reversible archival of dormant projects. **Synonym pre-expansion** widens recall (`--topic JWT` matches `bearer token`, `access token`, etc.). **Query-log + `--analyze`** for shape-only observability of resolver calls (top topics, zero-result ratio, foreign-bleed counts, score percentiles). **Hook logging** via `~/.vanta/hook.log` — broken hooks no longer rot invisibly. **17+ tests** lock canonProject + pathRank + lock semantics. |
+| v3.5 | 9.97/10 | **Tier 6 — trust + resilience layer.** **#17** `vanta-council-health` pre-flight + cascading model fallback chain (gpt-5.4→5.3-codex→5.2; gemini-3.1-pro→3-pro→2.5-pro) + mandatory `model_health` block in council reports — silent degradation no longer goes unnoticed. **#15** `vanta-council-feedback` two-stage logging: record P1/P2 findings at council time, attribute outcomes at sync time, surface per-model accuracy in `vanta-status`. **#14** Cross-source contradiction detector in `vanta-resolve` flags binary-opposition pairs (ES256/HS256, v7/v8 in PixiJS, etc.) when they land in separate retrieved entries — surfaces ⚠️ above the constraint pack so the LLM sees the disagreement before reading either half. **#16** `vanta-extract-score` three-stage gating pipeline: skill-doc hard-reject, length/marker/framing/backtick scoring, near-dup → update-in-place, audit comments traceable via `git blame`. **Plus** integrations from external skill audit: `git-guardrails.js` PreToolUse:Bash two-tier policy (HARD BLOCK + ADVISORY), Low-Confidence Intent Mode in `vanta-run`, write-a-skill discipline in `vanta-sync`'s invariant→skill promotion. **52+ tests** across canonProject, pathRank, lock, synonym, git-guardrails, council-health, council-feedback, contradiction-detector, extract-score modules. |

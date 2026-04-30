@@ -204,6 +204,24 @@ function readCouncilHealth() {
   return null;
 }
 
+// Tier 6 #15: per-model council finding accuracy. Cheap to compute from
+// the JSONL logs at session-start time.
+let _councilFeedback = null;
+function readCouncilFeedback() {
+  if (_councilFeedback !== null) return _councilFeedback;
+  for (const p of [
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-council-feedback.js'),
+    path.join(os.homedir(), 'Projects', 'vanta', 'bin', 'vanta-council-feedback.js'),
+  ]) {
+    try {
+      const m = require(p);
+      if (m && m.stats) { _councilFeedback = m.stats({ days: 90 }); return _councilFeedback; }
+    } catch {}
+  }
+  _councilFeedback = null;
+  return null;
+}
+
 function renderText() {
   const shards   = readShards();
   const queues   = readQueues();
@@ -315,6 +333,25 @@ function renderText() {
       console.log(`  Last run:   ${council.lastCouncil.date} · ${council.lastCouncil.topic.slice(0, 50)}`);
     } else {
       console.log('  Last run:   — none for this project');
+    }
+    // Tier 6 #15: per-model accuracy if any feedback has accumulated.
+    const feedback = readCouncilFeedback();
+    if (feedback && feedback.total_findings > 0) {
+      const judged = feedback.tp + feedback.fp;
+      const overall = judged > 0 ? Math.round((feedback.tp / judged) * 100) + '%' : '—';
+      console.log(`  Accuracy:   ${feedback.total_findings} P1/P2 findings (${feedback.window_days}d) · ${feedback.tp} TP / ${feedback.fp} FP / ${feedback.pending} pending · overall ${overall}`);
+      // Per-model summary, max 3 models
+      const byModel = new Map();
+      for (const b of feedback.by_model_priority) {
+        const m = byModel.get(b.model) || { tp: 0, fp: 0, total: 0 };
+        m.tp += b.tp; m.fp += b.fp; m.total += b.total;
+        byModel.set(b.model, m);
+      }
+      for (const [model, m] of [...byModel].slice(0, 3)) {
+        const judged = m.tp + m.fp;
+        const acc = judged > 0 ? Math.round((m.tp / judged) * 100) + '%' : '—';
+        console.log(`              ${model.padEnd(10)} ${m.tp} TP / ${m.fp} FP / ${m.total} total · ${acc}`);
+      }
     }
     console.log('');
   }
