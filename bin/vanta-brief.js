@@ -134,7 +134,11 @@ function staleDecisions(slug, withinDays = 30) {
 function unsyncedSessions(cwd) {
   const file = path.join(os.homedir(), '.vanta', 'sync-queue.jsonl');
   const entries = readJsonl(file);
-  return entries.filter(e => e.synced === false && e.cwd === cwd).length;
+  // Codex R4 P2: sync-queue is now append-only; dedup by session_id, taking
+  // the LATEST (rightmost) entry as the source of truth.
+  const latest = new Map();
+  for (const e of entries) if (e.session_id) latest.set(e.session_id, e);
+  return [...latest.values()].filter(e => e.synced === false && e.cwd === cwd).length;
 }
 
 function recentMisses(days = 7) {

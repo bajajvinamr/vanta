@@ -119,7 +119,33 @@ function sectionAllowedForStack(section, stacks) {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-function readSafe(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } }
+//
+// readSafe per-process memo (Gemini R4 P1 fix). council-advisory.js fires
+// up to 6 topic-specific resolve() calls in a loop — each used to do
+// O(sources) disk reads. With this memo, each source file is read at
+// most once per (path, mtime) within a process. The regex match still
+// runs per topic, but against in-memory strings.
+//
+// Bounded at 32 entries to avoid retaining MB of source content if the
+// resolver is reused across many cwds (e.g. an audit run).
+const _readCache = new Map();
+const _READ_CACHE_MAX = 32;
+
+function readSafe(p) {
+  let mtime = 0;
+  try { mtime = fs.statSync(p).mtimeMs; } catch { return null; }
+  const cached = _readCache.get(p);
+  if (cached && cached.mtime === mtime) return cached.content;
+  let content = null;
+  try { content = fs.readFileSync(p, 'utf8'); } catch { return null; }
+  if (_readCache.size >= _READ_CACHE_MAX) {
+    _readCache.delete(_readCache.keys().next().value);
+  }
+  _readCache.set(p, { mtime, content });
+  return content;
+}
+
+function _clearReadCache() { _readCache.clear(); }
 
 function recencyMult(dateStr) {
   if (!dateStr) return 0.8;
@@ -623,7 +649,8 @@ const _resolveCache = new Map();
 const _RESOLVE_CACHE_TTL = 60_000;
 const _RESOLVE_CACHE_MAX = 64;
 const INVARIANTS_FILE = path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.md');
-const CODE_KNOWLEDGE_FILE = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
+const CODE_KNOWLEDGE_DIR = path.join(os.homedir(), '.vanta', 'knowledge');
+const CODE_KNOWLEDGE_LEGACY = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
 const EPISODES_FILE = path.join(os.homedir(), '.vanta', 'episodes.jsonl');
 const MEMORY_DIR = path.join(os.homedir(), '.claude', 'projects', '-Users-vinamr', 'memory');
 
@@ -639,12 +666,16 @@ function _sourceVector({ project, cwd }) {
   const slug = project ? slugForFilesystem(project) : '';
   const decisionsFile = slug ? path.join(os.homedir(), '.gstack', 'projects', slug, 'decisions.md') : '';
   const gotchasFile   = cwd  ? path.join(cwd, 'CLAUDE.md') : '';
-  // Concatenate stable mtime stamps. Any file change → different vector.
+  // Code knowledge moved from a single global file to per-project shards
+  // in v3.x (Tier 4). Watch the active project's shard if we have a slug,
+  // and fall back to the legacy file. Gemini R4 P1 fix.
+  const shardFile = slug ? path.join(CODE_KNOWLEDGE_DIR, slug + '.jsonl') : '';
   return [
     _mtime(INVARIANTS_FILE),
     decisionsFile ? _mtime(decisionsFile) : 0,
     gotchasFile   ? _mtime(gotchasFile)   : 0,
-    _mtime(CODE_KNOWLEDGE_FILE),
+    shardFile     ? _mtime(shardFile)     : 0,
+    _mtime(CODE_KNOWLEDGE_LEGACY),
     _mtime(EPISODES_FILE),
     _dirMtime(MEMORY_DIR),
     _mtime(path.join(MEMORY_DIR, 'MEMORY.md')),
@@ -669,7 +700,7 @@ function _cacheSet(key, value, ctx) {
   _resolveCache.set(key, { ts: Date.now(), vector: _sourceVector(ctx), value });
 }
 
-function clearCache() { _resolveCache.clear(); }
+function clearCache() { _resolveCache.clear(); _readCache.clear(); }
 
 function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = false }) {
   if (!topic) return { topic: null, results: [], error: 'topic required' };

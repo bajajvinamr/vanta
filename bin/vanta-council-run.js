@@ -45,6 +45,11 @@ function _vantaDir() {
 }
 function _runsFile() { return path.join(_vantaDir(), 'council-runs.jsonl'); }
 
+// R4 P2 — file was unbounded. Cap at 5MB; on overflow keep the most recent
+// half. Council runs are infrequent (~1-5/day) so even at the cap we hold
+// many years of history.
+const MAX_BYTES = 5_000_000;
+
 function _ensureDir() {
   const d = _vantaDir();
   if (!fs.existsSync(d)) {
@@ -52,9 +57,21 @@ function _ensureDir() {
   }
 }
 
+function _rotateIfLarge(file) {
+  try {
+    const st = fs.statSync(file);
+    if (st.size <= MAX_BYTES) return;
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const kept = lines.slice(Math.floor(lines.length / 2));
+    fs.writeFileSync(file, kept.join('\n') + '\n');
+  } catch {}
+}
+
 function _appendLine(obj) {
   _ensureDir();
-  try { fs.appendFileSync(_runsFile(), JSON.stringify(obj) + '\n'); }
+  const file = _runsFile();
+  _rotateIfLarge(file);
+  try { fs.appendFileSync(file, JSON.stringify(obj) + '\n'); }
   catch (e) { process.stderr.write(`vanta-council-run: ${e.message}\n`); }
 }
 

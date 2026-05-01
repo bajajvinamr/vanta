@@ -91,8 +91,18 @@ process.stdin.on('end', () => {
                   `Sensitive topics detected: ${topics.join(', ')}\n` +
                   `Status: PENDING — run /council on this plan before implementing\n`;
 
-    // Append; never delete prior entries (let user clear when reviewed).
-    fs.appendFileSync(flagFile, block);
+    // Gemini R4 P3 fix — idempotency. If Claude Code retries the Write/Edit
+    // tool call, plan-watcher fires again on the same plan. Skip the append
+    // if the same planName already has a PENDING flag in the file. User
+    // edits the flag (or deletes it) when they're done; that's the "ok to
+    // re-flag" signal.
+    let existing = '';
+    try { existing = fs.readFileSync(flagFile, 'utf8'); } catch {}
+    const alreadyFlagged = new RegExp(
+      `^## ${planName.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')} .*\\nPlan path: ${filePath.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\n[\\s\\S]*?Status: PENDING`,
+      'm'
+    ).test(existing);
+    if (!alreadyFlagged) fs.appendFileSync(flagFile, block);
 
     // Also emit a soft advisory back to the user.
     const result = {

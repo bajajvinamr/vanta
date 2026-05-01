@@ -28,9 +28,13 @@ function vlog() {
   return _vlog;
 }
 
-const VANTA_DIR = path.join(os.homedir(), '.vanta');
-const QUEUE_PATH = path.join(VANTA_DIR, 'sync-queue.jsonl');
-const EPISODES_PATH = path.join(VANTA_DIR, 'episodes.jsonl');
+// Codex R4 P3 fix — honor VANTA_DIR_OVERRIDE so tests don't pollute ~/.vanta.
+function _vantaDir() {
+  return process.env.VANTA_DIR_OVERRIDE || path.join(os.homedir(), '.vanta');
+}
+function _queuePath()    { return path.join(_vantaDir(), 'sync-queue.jsonl'); }
+function _episodesPath() { return path.join(_vantaDir(), 'episodes.jsonl'); }
+const MAX_BYTES = 5_000_000;
 const TOOL_CALL_THRESHOLD = 5;
 const DECISION_MARKERS = /\b(root cause|fixed it|decided to|shipped|merged|landed|figured out|the bug was)\b/i;
 
@@ -111,7 +115,7 @@ process.stdin.on('end', () => {
 
     if (toolCallCount <= TOOL_CALL_THRESHOLD && !hasDecisionMarker) process.exit(0);
 
-    fs.mkdirSync(VANTA_DIR, { recursive: true });
+    fs.mkdirSync(_vantaDir(), { recursive: true });
 
     let branch = 'unknown';
     try {
@@ -126,33 +130,43 @@ process.stdin.on('end', () => {
 
     const sid = session_id || 'unknown';
 
-    // upsertJsonl: replace existing entry with same session_id, else append.
-    // Stop hook can fire multiple times per session (compact, /clear, end) —
-    // dedup keeps the latest tool_call count + ts per session.
-    const upsertJsonl = (file, newEntry) => {
-      let lines = [];
-      if (fs.existsSync(file)) {
-        lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-      }
-      let replaced = false;
-      const updated = lines.map(l => {
-        try {
-          const e = JSON.parse(l);
-          if (e.session_id === newEntry.session_id) {
-            replaced = true;
-            return JSON.stringify(newEntry);
+    // Codex R4 P2 fix — was read-modify-write under .tmp+rename. Two
+    // sessions stopping concurrently could both load the same baseline and
+    // the second rename would clobber the first session's entry. Now we
+    // append-only; readers dedup by session_id taking the LAST occurrence.
+    // POSIX appendFileSync < PIPE_BUF (4096B) is atomic; each entry is
+    // a few hundred bytes, well under the limit.
+    //
+    // Rotation: if file > 5MB, fold to last-occurrence-per-session before
+    // appending. This is a per-Stop-hook event (not per tool call), so
+    // the fold cost is negligible vs hook lifetime.
+    const appendJsonl = (file, newEntry) => {
+      try {
+        if (fs.existsSync(file)) {
+          const st = fs.statSync(file);
+          if (st.size > MAX_BYTES) {
+            // Fold: keep latest entry per session_id, drop older duplicates.
+            const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+            const latest = new Map();
+            for (const l of lines) {
+              try {
+                const e = JSON.parse(l);
+                if (e.session_id) latest.set(e.session_id, l);
+              } catch { /* drop unparsable */ }
+            }
+            const tmp = file + '.compact';
+            fs.writeFileSync(tmp, [...latest.values()].join('\n') + '\n');
+            fs.renameSync(tmp, file);
           }
-          return l;
-        } catch { return l; }
-      });
-      if (!replaced) updated.push(JSON.stringify(newEntry));
-      const tmp = file + '.tmp';
-      fs.writeFileSync(tmp, updated.join('\n') + '\n');
-      fs.renameSync(tmp, file);  // atomic on POSIX
+        }
+      } catch { /* never block on rotation */ }
+      try {
+        fs.appendFileSync(file, JSON.stringify(newEntry) + '\n');
+      } catch (e) { vlog().error('auto-sync.append', e.message || String(e)); }
     };
 
     // 1. Sync queue (pending learning extraction)
-    upsertJsonl(QUEUE_PATH, {
+    appendJsonl(_queuePath(), {
       ts, cwd: cwd || process.cwd(), slug, branch,
       session_id: sid,
       transcript_path,
@@ -167,7 +181,7 @@ process.stdin.on('end', () => {
       const decision = extractDecision(transcript);
       const outcome = detectOutcome(transcript);
 
-      upsertJsonl(EPISODES_PATH, {
+      appendJsonl(_episodesPath(), {
         ts, slug, branch,
         topics,           // ["jwt", "auth"] etc.
         decision,         // 1-line decision summary (null if extractor rejected noise)

@@ -91,8 +91,17 @@ for p in prs:
   if age>=3: print(f'STALE_PR: #{p[\"number\"]} {p[\"title\"][:40]} ({age}d old)')
 " 2>/dev/null
 
-# Unsynced sessions
-[ -f ~/.vanta/sync-queue.jsonl ] && _U=$(grep -c '"synced":false' ~/.vanta/sync-queue.jsonl 2>/dev/null || echo 0) && [ "$_U" -gt 0 ] && echo "UNSYNCED: $_U sessions"
+# Unsynced sessions — sync-queue is append-only, dedup by session_id (latest wins).
+[ -f ~/.vanta/sync-queue.jsonl ] && _U=$(python3 -c "
+import json,os
+latest={}
+for l in open(os.path.expanduser('~/.vanta/sync-queue.jsonl')):
+  try:
+    e=json.loads(l); sid=e.get('session_id')
+    if sid: latest[sid]=(e.get('synced') is not True)
+  except: pass
+print(sum(1 for v in latest.values() if v))
+" 2>/dev/null || echo 0) && [ "$_U" -gt 0 ] && echo "UNSYNCED: $_U sessions"
 
 # Routing misses this week
 [ -f ~/.vanta/missed-intents.jsonl ] && _WEEK=$(date -u -d '7 days ago' +%Y-%m-%dT 2>/dev/null || date -u -v-7d +%Y-%m-%dT 2>/dev/null) && [ -n "$_WEEK" ] && _M=$(awk -v w="$_WEEK" '$0>=w' ~/.vanta/missed-intents.jsonl 2>/dev/null | wc -l | tr -d ' ') && [ "$_M" -ge 3 ] && echo "ROUTING_MISSES: $_M this week"
