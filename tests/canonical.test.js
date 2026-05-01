@@ -2720,9 +2720,12 @@ describe('vanta-rewriter — rule-based intent matching (v3.6.14)', () => {
     assert.equal(r.mode, 'rule');
     assert.equal(r.intent, 'fix-bug');
     assert.equal(r.rule_id, 'fix-broken');
-    assert.match(r.rewritten, /Suggested chain:/);
+    // v3.7.1: chains are now ≤3 numbered steps, no verbose header.
+    assert.match(r.rewritten, /^1\./m);
     assert.match(r.rewritten, /failing test/i);
     assert.match(r.rewritten, /git log/i);
+    // v3.7.1: skill_route surfaced for routing.
+    assert.equal(r.skill_route, '/investigate');
   });
 
   test('"it didn\'t work" routes to diagnose-recent rule', () => {
@@ -2736,9 +2739,12 @@ describe('vanta-rewriter — rule-based intent matching (v3.6.14)', () => {
     const r = rw.rewrite('ship this');
     assert.equal(r.mode, 'rule');
     assert.equal(r.intent, 'ship');
-    assert.match(r.rewritten, /test suite/i);
+    // v3.7.1: chain trimmed to 3 steps; ship still surfaces test+typecheck
+    // and the no-main guard.
+    assert.match(r.rewritten, /test/i);
     assert.match(r.rewritten, /typecheck/i);
-    assert.match(r.rewritten, /Do NOT push to main/i);
+    assert.match(r.rewritten, /(not|no).*main/i);
+    assert.equal(r.skill_route, '/ship');
   });
 
   test('"review the diff" routes to review rule', () => {
@@ -2842,10 +2848,12 @@ describe('hooks/prompt-rewriter.js — UserPromptSubmit injection (v3.6.14)', ()
       const out = spawnHook({ prompt: 'fix the bug in auth.ts', vantaDir: tmp });
       const parsed = JSON.parse(out);
       assert.equal(parsed.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
+      // v3.7.1: terse 4-line injection — `[Vanta] /<route> · <intent>` header
+      // followed by ≤3 numbered steps. No verbose "shadow mode" preamble.
       assert.match(parsed.hookSpecificOutput.additionalContext,
-        /Vanta rewriter \(shadow mode\)/);
+        /^\[Vanta\]\s+\/\S+\s+·\s+\S+/);
       assert.match(parsed.hookSpecificOutput.additionalContext,
-        /Suggested chain:/);
+        /^1\./m);
       // Hook ran with VANTA_DIR_OVERRIDE=tmp so action-log lives in tmp.
       // Read it directly from disk (the in-process module instance is
       // pointed at HOME=...).
@@ -3479,7 +3487,9 @@ describe('integration: rewriter ↔ safety-floor (v3.6.19)', () => {
     const r = rewriter.rewrite('fix the bug in auth.ts', {});
     assert.equal(r.mode, 'rule');
     assert.equal(r.rule_id, 'fix-broken');
-    assert.match(r.rewritten, /Suggested chain:/);
+    // v3.7.1: terse 3-step chain.
+    assert.match(r.rewritten, /^1\./m);
+    assert.equal(r.skill_route, '/investigate');
   });
 
   test('kill-switch (session scope) → rewriter passes through with kill-switch reason', () => {

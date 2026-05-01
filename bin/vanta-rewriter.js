@@ -91,101 +91,165 @@ function _isPassthrough(prompt) {
 // Templates ({file}, {test_path}, etc.) are filled by `_fillTemplate`
 // from the caller's context (cwd, recent files, etc.).
 
+// v3.7.1 contract:
+// - Each rule has skill_route — the slash command Vanta would invoke.
+// - chain is ≤3 high-signal steps so the shadow injection stays terse.
+// - Some rules emit `mode: 'ask'` instead of `mode: 'rule'` — these are
+//   product/irreversible decisions where Vanta should NOT auto-rewrite a
+//   chain. The hook surfaces "[Vanta] /<route> recommended · T3 ASK".
+// - Intent matching is permissive on purpose: weak one-liners like "fix
+//   this" / "write tests" / "make this better" are the make-or-break
+//   prompts. The rule regex matches the bare verb form too.
 const RULES = [
-  {
-    id: 'fix-broken',
-    rx: /\b(fix|debug|investigate|figure\s+out)\b.*\b(bug|error|broken|fail|crash|doesn'?t\s+work|not\s+working|didn'?t\s+work|stopped\s+working)\b/i,
-    intent: 'fix-bug',
-    chain: [
-      'Read the most recent error context (last_run.log, console output, or recently modified file).',
-      'Run `git log --oneline -5` to see what changed recently.',
-      'Write a failing test that reproduces the error before changing source.',
-      'Apply the minimal fix. Do not refactor unrelated code.',
-      'Run the test suite to verify the fix and check no regressions.',
-      'Commit with a clear `fix:` message naming the symptom and root cause.',
-    ],
-  },
+  // ── DIAGNOSTIC PATH (it-didnt-work BEFORE fix-broken so the bare
+  //    "it didn't work" lands on diagnose-recent, not the looser fix rule)
   {
     id: 'it-didnt-work',
     rx: /^\s*(it\s+didn'?t\s+work|that\s+didn'?t\s+work|broken|still\s+failing|didn'?t\s+fix\s+it)\s*\.?\s*$/i,
     intent: 'diagnose-recent',
+    skill_route: '/investigate',
     chain: [
       'Re-read the most recent test output / error context.',
-      'Compare current state to last known good (`git diff HEAD~1` if no uncommitted, otherwise `git status`).',
-      'List the top 3 hypotheses for why it failed, ranked by likelihood.',
-      'Pick the most likely; verify with a single targeted test or read.',
-      'Apply fix or escalate to /council if the failure mode is genuinely unclear.',
+      'Compare current state to last known good (`git diff HEAD~1` or `git status`).',
+      'Form 3 hypotheses, verify the most likely with one targeted test.',
     ],
   },
+  // ── FIX (broadened to catch bare "fix this" / "fix it" / "debug this")
+  {
+    id: 'fix-broken',
+    rx: /^\s*(fix|debug|investigate)\s+(this|it|that|the\s+\w+)?\s*\.?\s*$|\b(fix|debug|investigate|figure\s+out)\b.*\b(bug|error|broken|fail|crash|doesn'?t\s+work|not\s+working|didn'?t\s+work|stopped\s+working)\b/i,
+    intent: 'fix-bug',
+    skill_route: '/investigate',
+    chain: [
+      'Read the most recent error context and `git log --oneline -5` for recent changes.',
+      'Write a failing test that reproduces the bug before touching source.',
+      'Apply the minimal fix; run tests to confirm no regressions.',
+    ],
+  },
+  // ── SHIP (broadened to "push this" / "deploy this" / "merge this")
   {
     id: 'ship-this',
     rx: /^\s*(ship|deploy|push|merge|release)\s+(this|it|that|now)?\s*\.?\s*$/i,
     intent: 'ship',
+    skill_route: '/ship',
     chain: [
-      'Run the full test suite. Block on any failure.',
-      'Run `npx tsc --noEmit` (or language-equivalent typecheck).',
-      'Check `git status` is clean and on the right branch.',
-      'Open PR via `gh pr create` with a body summarizing the change and a test plan.',
-      'Do NOT push to main directly. Do NOT use --no-verify.',
+      'Run full tests + typecheck + lint. Block on any failure.',
+      'Confirm `git status` clean, on the right branch (not main).',
+      'Open PR via `gh pr create` with summary and test plan. Never --no-verify.',
     ],
   },
+  // ── REVIEW
   {
     id: 'review-this',
     rx: /^\s*(review|check|look\s+at)\s+(this|the\s+(code|diff|change|pr))?\s*\.?\s*$/i,
     intent: 'review',
+    skill_route: '/review',
     chain: [
-      'Run `git diff` (or `git diff main` if reviewing a branch) to scope the change.',
-      'Identify any safety-floor matches in the diff (DDL, pricing, auth, secrets).',
-      'Look for: edge cases not covered, error paths missing, test gaps, security issues.',
-      'Summarize findings as P1/P2/P3 priorities. Suggest fixes for P1 only.',
+      'Run `git diff` (or `git diff main`) to scope the change.',
+      'Flag safety-floor matches: DDL, pricing, auth, secrets, user-visible strings.',
+      'Summarize as P1/P2/P3; suggest fixes for P1 only.',
     ],
   },
+  // ── WRITE TESTS (broadened — bare "write tests" / "add tests" matches)
   {
     id: 'write-tests',
-    rx: /\b(write|add|create)\s+tests?\s+(for|on|covering)?\s*(this|the|that)?\b/i,
+    rx: /^\s*(write|add|create)\s+tests?\s*(for|on|covering)?\s*(this|the|that|\w+)?\s*\.?\s*$|\b(write|add|create)\s+tests?\s+(for|on|covering)\s+\S/i,
     intent: 'tdd',
+    skill_route: '/qa',
     chain: [
-      'Read the function/module you are testing. Understand the public surface.',
-      'List the cases: happy path, edge cases, error paths, boundary inputs.',
-      'Write failing tests for each case (red).',
-      'Verify each test fails for the right reason.',
-      'Implement minimal code to pass (green) — only if implementation is missing.',
+      'Read the function/module to test; list happy path + edges + error paths.',
+      'Write failing tests for each case (red). Verify each fails for the right reason.',
+      'Implement minimal code to pass (green) only if implementation is missing.',
     ],
   },
+  // ── MAKE FASTER / BETTER / IMPROVE (broadened)
   {
     id: 'make-faster',
-    rx: /\b(make|get|run)\s+(it|this|that)?\s*(faster|quicker|better\s+perf|optimize|speed\s+up)\b/i,
+    rx: /^\s*(make|get|run)\s+(it|this|that)\s*(faster|quicker|better|sharper)\s*\.?\s*$|\b(make|get|run)\s+(it|this|that)?\s*(faster|quicker|better\s+perf|optimize|speed\s+up)\b|^\s*improve\s+(this|it|that)\s*\.?\s*$/i,
     intent: 'optimize',
+    skill_route: '/review',
     chain: [
-      'Measure first. Run a benchmark or capture current timing — never optimize without numbers.',
-      'Identify the hot path. `console.time` / profiler / explain plan as appropriate.',
-      'Form a hypothesis about WHY it is slow before changing code.',
+      'Measure first — capture current timing or quality metric. Never optimize without numbers.',
+      'Identify the hot path or weak point; form a hypothesis about WHY before changing code.',
       'Apply ONE change. Re-measure. Keep if it helps; revert if not.',
-      'Document the speedup and the trade-off (memory, complexity, readability).',
     ],
   },
+  // ── REFACTOR (broadened — "clean this up" / "tidy this" matches)
   {
     id: 'refactor',
-    rx: /\b(refactor|clean\s+up|tidy|simplify|reorganize)\b/i,
+    rx: /^\s*(clean|tidy|simplify|reorganize)\s+(this|it|that|up)?\s*\.?\s*$|\b(refactor|clean\s+up|tidy|simplify|reorganize)\b/i,
     intent: 'refactor',
+    skill_route: '/review',
     chain: [
-      'Confirm tests cover the area you are about to refactor. If not, write tests first.',
-      'Make ONE structural change at a time. Run tests after each.',
-      'Do not change behavior. If you find a bug while refactoring, note it; fix in a separate commit.',
-      'Commit the refactor as `refactor:` — separate from any feature/fix.',
+      'Confirm tests cover the area; write tests first if not.',
+      'Make ONE structural change at a time; run tests after each.',
+      'Commit as `refactor:` — separate from any feature or fix.',
     ],
   },
+  // ── ADD FEATURE
   {
     id: 'add-feature',
     rx: /\b(add|implement|build|create)\b[^.?!\n]{0,80}\b(feature|endpoint|component|page|api|hook)\b/i,
     intent: 'feature',
+    skill_route: '/ship',
     chain: [
-      'Read the closest existing analogue in the codebase. Match its patterns.',
-      'Plan the change: what files, what tests, what API contract.',
-      'Write the test(s) first.',
-      'Implement to pass tests.',
-      'Verify integration: run the dev server, exercise the feature in a browser if UI-facing.',
+      'Read the closest existing analogue; match its patterns.',
+      'Plan files, tests, API contract; write tests first.',
+      'Implement to pass tests; verify in browser if UI-facing.',
     ],
+  },
+  // ── NEW v3.7.1 RULES ──────────────────────────────────────────────────
+  // Resume — "continue from last time" / "where were we" / "what's next"
+  // Reads CONTINUE.md per global CLAUDE.md convention.
+  {
+    id: 'resume',
+    rx: /^\s*(continue|resume|pick\s+up|where\s+were\s+we|what'?s?\s+next|next\s+up)\s*(from\s+(last\s+time|here|yesterday))?\s*\.?\s*$/i,
+    intent: 'resume',
+    skill_route: 'continue-state',
+    chain: [
+      'Read CONTINUE.md, latest `.planning/*.md` by mtime, and `git log -5 --oneline`.',
+      'Pick the next unblocked item from the resume state.',
+      'Execute end-to-end; only interrupt for one-way doors.',
+    ],
+  },
+  // Audit gaps — "find gaps" / "what's missing" / "audit this"
+  // Routes to Codex/adversarial review path.
+  {
+    id: 'audit-gaps',
+    rx: /^\s*(find|show|list)\s+gaps?\s*\.?\s*$|\bwhat'?s?\s+missing\b|^\s*audit\s+(this|it|that|the\s+\w+)?\s*\.?\s*$/i,
+    intent: 'audit-gaps',
+    skill_route: '/codex',
+    chain: [
+      'Run `git diff main` (or current branch base) to scope the change set.',
+      'Send to adversarial reviewer (`/codex` or `/council`) for blind-spot detection.',
+      'Treat findings as hypotheses — verify each before fixing.',
+    ],
+  },
+  // Diff summary — "what changed?" / "show me the diff"
+  {
+    id: 'diff-summary',
+    rx: /^\s*(what\s+changed|what'?s?\s+different|show\s+(me\s+)?(the\s+)?diff)\s*\??\s*\.?\s*$/i,
+    intent: 'diff-summary',
+    skill_route: 'git-diff',
+    chain: [
+      'Run `git status --short` and `git diff --stat`.',
+      'For each modified file, summarize what changed in 1 sentence.',
+      'Flag any safety-floor matches (DDL, pricing, auth, secrets).',
+    ],
+  },
+  // Taxonomy / rename — "rename X to Y" / "rename Z" → ASK (not rewrite).
+  // This is the silent-product-decision miss the council flagged. Mode='ask'
+  // tells the hook to surface "/council recommended · T3 ASK", not inject
+  // a chain.
+  {
+    id: 'taxonomy-rename',
+    rx: /^\s*(rename|change\s+name\s+of)\s+\S+\s+(to|->|→|=>)\s+\S+|^\s*rename\s+\w+\s*\.?\s*$/i,
+    intent: 'taxonomy-rename',
+    skill_route: '/council',
+    mode: 'ask',
+    tier: 'T3',
+    why: 'rename touches taxonomy/API/schema/UX strings — product authority required',
+    chain: [],
   },
 ];
 
@@ -227,7 +291,19 @@ function rewrite(prompt, context = {}) {
     if (!f && context.command) f = sf.matchCommand(context.command);
     if (!f && context.file_path) f = sf.matchFile(context.file_path);
     if (f) {
-      return { mode: 'passthrough', original: prompt, why: `safety-floor:${f.id}`, floor_match: f };
+      // v3.7.1: floor matches that read as product-decision prompts get
+      // a /council skill_route so the hook can surface the right next
+      // step. Other floor matches (force-push, .env writes) leave
+      // skill_route null — the user confirms or aborts; no skill flow.
+      const isProductDecision = /^prompt-(pivot|launch|data-policy|taxonomy)/.test(f.id || '');
+      return {
+        mode: 'passthrough',
+        original: prompt,
+        why: `safety-floor:${f.id}`,
+        floor_match: f,
+        skill_route: isProductDecision ? '/council' : null,
+        tier: 'T3',
+      };
     }
   }
 
@@ -240,6 +316,22 @@ function rewrite(prompt, context = {}) {
   // 4. Rule-based templates.
   for (const r of RULES) {
     if (r.rx.test(prompt)) {
+      // Some rules emit `ask` mode for product/irreversible decisions.
+      // The hook surfaces "/<route> recommended · T3 ASK" instead of
+      // injecting a shadow chain. v3.7.1 — taxonomy-rename is the only
+      // such rule today; the pattern is reusable.
+      if (r.mode === 'ask') {
+        return {
+          mode: 'ask',
+          original: prompt,
+          intent: r.intent,
+          rule_id: r.id,
+          skill_route: r.skill_route || null,
+          tier: r.tier || 'T3',
+          confidence: 'high',
+          why: r.why || `matched ask-rule:${r.id}`,
+        };
+      }
       const rewritten = _formatChain(prompt, r);
       return {
         mode: 'rule',
@@ -247,6 +339,7 @@ function rewrite(prompt, context = {}) {
         rewritten,
         intent: r.intent,
         rule_id: r.id,
+        skill_route: r.skill_route || null,
         confidence: 'high',
         why: `matched rule:${r.id}`,
       };
@@ -263,16 +356,13 @@ function rewrite(prompt, context = {}) {
   return { mode: 'passthrough', original: prompt, intent: 'unmatched' };
 }
 
-function _formatChain(original, rule) {
-  const lines = [];
-  lines.push(`[Vanta rewrite — intent=${rule.intent}, confidence=high]`);
-  lines.push(`Original: ${original.trim()}`);
-  lines.push('');
-  lines.push('Suggested chain:');
-  for (let i = 0; i < rule.chain.length; i++) {
-    lines.push(`  ${i + 1}. ${rule.chain[i]}`);
-  }
-  return lines.join('\n');
+// v3.7.1: terse output. Header line + ≤3 chain steps = 4 lines max.
+// The hook adds a single "[Vanta]" prefix line (skill route + tier);
+// _formatChain returns ONLY the numbered steps so the hook doesn't
+// duplicate metadata.
+function _formatChain(_original, rule) {
+  const steps = rule.chain.slice(0, 3);
+  return steps.map((s, i) => `${i + 1}. ${s}`).join('\n');
 }
 
 module.exports = { rewrite, RULES, _isPassthrough };
