@@ -886,11 +886,18 @@ describe('vanta-runtime-state — per-session cooldown brain', () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  test('cooldown windows differ by source prefix', () => {
+  test('cooldown windows differ by source prefix (R6 P3 — pruned dead entries)', () => {
     const m = fresh();
-    // 'council-advisory:' has 30min, 'prompt-context:' has 10min, default 5min
-    assert.ok(m.COOLDOWNS['council-advisory:'] > m.COOLDOWNS['prompt-context:']);
+    // After R6: only the prefixes whose hooks actually call shouldInject
+    // are present. council-advisory and tool-observer were dead config —
+    // listed in the table, never called. Pruned. Now: prompt-context,
+    // stack-file-nudge, contradiction-shown, default.
+    assert.ok(m.COOLDOWNS['stack-file-nudge:'] > m.COOLDOWNS['prompt-context:']);
     assert.ok(m.COOLDOWNS['prompt-context:'] > m.COOLDOWNS['default']);
+    assert.ok(m.COOLDOWNS['contradiction-shown:'] >= m.COOLDOWNS['default']);
+    // Pruned entries are gone — explicit check so re-adding them flags here.
+    assert.equal(m.COOLDOWNS['council-advisory:'], undefined);
+    assert.equal(m.COOLDOWNS['tool-observer:'], undefined);
   });
 
   test('bump increments + persists', () => {
@@ -1037,6 +1044,42 @@ describe('vanta-prompt-brief — classifier + brief generator', () => {
     for (const stop of ['the', 'for', 'should', 'how']) {
       assert.equal(t.includes(stop), false, `"${stop}" should be filtered`);
     }
+  });
+
+  test('extractTopics drops phase verbs (R6 P1 — signal quality)', () => {
+    // Earlier topic extractor passed 'build', 'fix', 'ship', 'design',
+    // 'investigate', 'decide' through to the resolver — generic verbs that
+    // pulled unrelated junk. They classify the PHASE; they aren't topical.
+    for (const phaseVerb of ['build', 'fix', 'ship', 'design', 'investigate', 'decide', 'review', 'recall', 'implement']) {
+      const t = m.extractTopics(`${phaseVerb} the new sync flow`);
+      assert.equal(
+        t.includes(phaseVerb), false,
+        `"${phaseVerb}" must be dropped — it classifies phase, not topic`,
+      );
+    }
+  });
+
+  test('extractTopics prefers identifier-shaped tokens over English (R6 P1)', () => {
+    // camelCase, dotted, hyphenated, path-like all score ahead of plain English.
+    const t1 = m.extractTopics('the JWTVerifier in pi-perception is throwing');
+    assert.ok(t1.includes('jwtverifier') || t1.some(x => x.includes('pi-perception')),
+      `should pick up identifier-shaped tokens, got ${JSON.stringify(t1)}`);
+    const t2 = m.extractTopics('look at @prisma/client.connect');
+    assert.ok(t2.some(x => x.includes('prisma') || x.includes('client')),
+      `should pick up package/dotted identifiers, got ${JSON.stringify(t2)}`);
+  });
+
+  test('shapeKey canonicalizes topics so rephrases hit same cooldown key (R6 P1)', () => {
+    // "build the sync flow", "build the new sync flow", and
+    // "implement the sync flow" all share the same intent; they should
+    // collapse to one cooldown key after R6's canonicalization (sort + dedup
+    // of length-3+ tokens, plus the phase classifier already maps "build"
+    // and "implement" to the same 'build' phase).
+    const a = m.shapeKey('build the sync flow');
+    const b = m.shapeKey('build the new sync flow');
+    const c = m.shapeKey('implement the sync flow');
+    assert.equal(a, b, 'trivial filler word should not change the cooldown key');
+    assert.equal(a, c, 'synonyms in the phase classifier should produce the same key');
   });
 
   test('shapeKey is deterministic for same prompt', () => {

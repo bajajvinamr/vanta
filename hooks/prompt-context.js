@@ -99,14 +99,32 @@ async function main() {
   try { canInject = state.shouldInject(sessionId, key); } catch { canInject = true; }
   if (!canInject) process.exit(0);
 
-  let line;
+  let detail;
   try {
-    line = brief.buildBrief({ prompt, slug: getProjectSlug(cwd), cwd });
+    detail = brief.buildBriefDetail({ prompt, slug: getProjectSlug(cwd), cwd });
   } catch (e) {
     vlog().error('prompt-context', e && e.message || String(e));
     process.exit(0);
   }
-  if (!line) process.exit(0);
+  if (!detail || !detail.line) process.exit(0);
+  let output = detail.line;
+
+  // R6 P3 — contradiction dedup. Both prompt-context and council-advisory
+  // can detect the same contradiction (ES256/HS256 etc). Without dedup
+  // the user sees the warning twice in the same response. Gate via
+  // runtime-state cooldown — first hook to see it claims the slot for
+  // 10 minutes; the second stays silent on that contradiction.
+  if (detail.contradictions && detail.contradictions.length > 0) {
+    const c = detail.contradictions[0];
+    const tokens = (c.tokens || []).slice().sort().join('-').toLowerCase();
+    const cKey = `contradiction-shown:${tokens || c.hint.slice(0, 30)}`;
+    let canShow;
+    try { canShow = state.shouldInject(sessionId, cKey); } catch { canShow = true; }
+    if (canShow) {
+      try { state.markInjected(sessionId, cKey); } catch {}
+      output += `\n  ⚠ contradiction: ${String(c.hint).slice(0, 120)}`;
+    }
+  }
 
   // Mark injected BEFORE writing output — write failure shouldn't cause
   // a duplicate inject on the next prompt with the same shape.
@@ -115,7 +133,7 @@ async function main() {
   const out = {
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
-      additionalContext: line,
+      additionalContext: output,
     },
   };
   process.stdout.write(JSON.stringify(out));
