@@ -56,7 +56,12 @@ function ageStr(ts) {
 // ─── Phase detection (.planning/) ───────────────────────────────────────────
 function detectPhase(cwd) {
   const planDir = path.join(cwd, '.planning');
-  if (!fs.existsSync(planDir)) return null;
+  // R9 P1 — Gemini council finding. existsSync passes for files too. If
+  // a user has a sentinel `.planning` *file* (not dir), readdirSync will
+  // throw ENOTDIR and crash session-start. Check isDirectory explicitly.
+  let st;
+  try { st = fs.statSync(planDir); } catch { return null; }
+  if (!st.isDirectory()) return null;
   // PHASE.md is authoritative; otherwise use newest .md mtime
   const phasePath = path.join(planDir, 'PHASE.md');
   if (fs.existsSync(phasePath)) {

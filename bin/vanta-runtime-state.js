@@ -50,7 +50,8 @@ function _ensureDir() {
 function _appendLine(sessionId, obj) {
   _ensureDir();
   try {
-    fs.appendFileSync(_fileFor(sessionId), JSON.stringify(obj) + '\n');
+    // R9 P1 — torn-line guard. See bin/vanta-jsonl.js comment.
+    fs.appendFileSync(_fileFor(sessionId), '\n' + JSON.stringify(obj) + '\n');
     return true;
   } catch { return false; }
 }
@@ -159,15 +160,18 @@ function _compact(sessionId, { force = false } = {}) {
       try { preMtimeMs = fs.statSync(file).mtimeMs; } catch {}
     }
     const state = _foldJournal(sessionId);
-    const snapshotLine = JSON.stringify({
+    // R9 P1 — Gemini council finding. Earlier impl explicitly enumerated
+    // fields, so any new field added to the folded state by future ops
+    // (e.g., `last_seen`, telemetry fields) was silently destroyed on
+    // compaction. Use spread so unknown fields survive the round-trip.
+    // Strip `session_id` because the snapshot is keyed by session_id at
+    // _fileFor() level — embedding it would be redundant noise.
+    const { session_id: _drop, ...rest } = state;
+    void _drop;
+    const snapshotLine = '\n' + JSON.stringify({
       ts: new Date().toISOString(),
       op: 'snapshot',
-      state: {
-        started_at: state.started_at,
-        phase: state.phase,
-        injected: state.injected,
-        counters: state.counters,
-      },
+      state: rest,
     }) + '\n';
     const tmp = file + '.compact';
     fs.writeFileSync(tmp, snapshotLine);

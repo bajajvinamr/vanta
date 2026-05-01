@@ -75,4 +75,25 @@ function listBaks(file) {
   } catch { return []; }
 }
 
-module.exports = { readMergedJsonl, readDedupedJsonl, listBaks };
+// R9 P1 — torn-line guard.
+//
+// Gemini council finding: if a write is truncated (SIGKILL or ENOSPC) leaving
+// the line WITHOUT its trailing newline, the next appendFileSync fuses into
+// the torn line. Reader's split('\n') yields one merged garbage chunk;
+// JSON.parse fails on it and BOTH records are lost (the torn one AND the
+// next healthy one).
+//
+// Fix: every appended record is bracketed by leading-and-trailing newlines
+// (`\n` + JSON + `\n`). On read, split('\n').filter(Boolean) drops the
+// extras. A torn write that loses its trailing `\n` still gets the LEADING
+// `\n` of the NEXT record, so split keeps them in separate chunks. Only
+// the torn record is lost; the healthy next record survives.
+//
+// Cost: 1 extra byte per line. Reader semantics unchanged for already-
+// healthy files because filter(Boolean) was already in use.
+function appendJsonlLine(file, obj) {
+  const fs = require('fs');
+  fs.appendFileSync(file, '\n' + JSON.stringify(obj) + '\n');
+}
+
+module.exports = { readMergedJsonl, readDedupedJsonl, listBaks, appendJsonlLine };

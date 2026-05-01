@@ -182,7 +182,13 @@ process.stdin.on('end', () => {
     }
     const ts = new Date().toISOString();
 
-    const sid = session_id || 'unknown';
+    // R9 P1 — Codex council finding. The synthetic 'unknown' fallback
+    // collapsed multiple session_id-less Stop hook invocations into one
+    // dedup bucket: consumers that fold by session_id (vanta-brief,
+    // vanta-resolve, vanta-status) silently overwrote each other's
+    // entries. Prefer a unique fallback so unknown-source events still
+    // get distinct dedup keys.
+    const sid = session_id || `unknown-${process.pid}-${Date.now()}`;
 
     // Codex R4 P2 fix — was read-modify-write under .tmp+rename. Two
     // sessions stopping concurrently could both load the same baseline and
@@ -239,7 +245,12 @@ process.stdin.on('end', () => {
         }
       } catch { /* never block on rotation */ }
       try {
-        fs.appendFileSync(file, JSON.stringify(newEntry) + '\n');
+        // R9 P1 — torn-line guard. Gemini council: if a previous append
+        // was truncated mid-write (SIGKILL/ENOSPC) and lost its trailing
+        // newline, this write fuses to it and corrupts BOTH records on
+        // read. Leading \n ensures the next record's start is anchored
+        // even when the previous one lost its terminator.
+        fs.appendFileSync(file, '\n' + JSON.stringify(newEntry) + '\n');
       } catch (e) { vlog().error('auto-sync.append', e.message || String(e)); }
     };
 

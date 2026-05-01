@@ -605,7 +605,8 @@ function _logQuery(entry) {
       foreignDropped: entry.foreignDropped,
       top: entry.top || [],
     };
-    fs.appendFileSync(file, JSON.stringify(safe) + '\n');
+    // R9 P1 — torn-line guard. See bin/vanta-jsonl.js comment.
+    fs.appendFileSync(file, '\n' + JSON.stringify(safe) + '\n');
   } catch { /* never block resolve() on log failure */ }
 }
 

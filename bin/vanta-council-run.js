@@ -72,7 +72,8 @@ function _appendLine(obj) {
   _ensureDir();
   const file = _runsFile();
   _rotateIfLarge(file);
-  try { fs.appendFileSync(file, JSON.stringify(obj) + '\n'); }
+  // R9 P1 — torn-line guard. See bin/vanta-jsonl.js comment.
+  try { fs.appendFileSync(file, '\n' + JSON.stringify(obj) + '\n'); }
   catch (e) { process.stderr.write(`vanta-council-run: ${e.message}\n`); }
 }
 
