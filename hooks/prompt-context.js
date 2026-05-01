@@ -98,7 +98,31 @@ async function main() {
 
   const state = rs();
   const brief = pb();
-  if (!state || !brief) process.exit(0);  // bins not deployed yet — degrade silently
+  if (!state || !brief) {
+    // R8 P2 — Codex council finding. Earlier code degraded silently when
+    // bins weren't deployed, so a botched setup or rename could disable
+    // the always-on layer for months without any visible signal. Now:
+    // touch a sentinel and log once per process lifetime. vanta-status
+    // surfaces the sentinel so the user actually sees it.
+    try {
+      const sentinel = path.join(os.homedir(), '.vanta', '.bin-missing');
+      const fs = require('fs');
+      const dir = path.dirname(sentinel);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // Throttle: only re-touch once per hour to avoid spam.
+      let shouldTouch = true;
+      try {
+        const st = fs.statSync(sentinel);
+        if (Date.now() - st.mtimeMs < 60 * 60_000) shouldTouch = false;
+      } catch {}
+      if (shouldTouch) {
+        fs.writeFileSync(sentinel,
+          `${new Date().toISOString()} prompt-context: bins missing (state=${!!state} brief=${!!brief})\n`);
+        vlog().error('prompt-context', `bins missing — state=${!!state} brief=${!!brief}; sentinel touched`);
+      }
+    } catch {}
+    process.exit(0);
+  }
 
   // Bump prompt counter — useful telemetry for "how busy is this session"
   try { state.bump(sessionId, 'prompt_count'); } catch {}

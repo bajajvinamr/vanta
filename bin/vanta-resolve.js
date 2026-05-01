@@ -434,11 +434,17 @@ function _readCodeKnowledgeFromFile(file, topic, max, fallbackSlug, activeRoot =
   return out;
 }
 
+// R8 P1 — episodes are now read across rotated .bak.<ts> + live file.
+// Producers (auto-sync.js Stop hook) no longer compact on rotate; merge
+// happens here. Also R8 P3 back-compat: old episodes had `topic` (singular)
+// + `project` instead of current `topics` + `slug`. We accept both shapes.
+const { readMergedJsonl } = require('./vanta-jsonl');
+
 function readEpisodes(topic, max = 5) {
   const file = path.join(os.homedir(), '.vanta', 'episodes.jsonl');
-  const content = readSafe(file);
-  if (!content) return [];
-  const lines = content.split('\n').filter(Boolean);
+  const merged = readMergedJsonl(file);
+  if (!merged) return [];
+  const lines = merged.split('\n').filter(Boolean);
   const seen = new Set();
   const out = [];
   // Iterate newest-first by reversing
@@ -447,17 +453,22 @@ function readEpisodes(topic, max = 5) {
     try { e = JSON.parse(lines[i]); } catch { continue; }
     if (seen.has(e.session_id)) continue;
     seen.add(e.session_id);
-    const haystack = [e.decision, ...(e.topics || [])].filter(Boolean).join(' ');
+    // R8 P3 — accept both v3.6.0 ({topic, project}) and v3.6.6 ({topics, slug}).
+    const topicsList = e.topics || (e.topic ? [e.topic] : []);
+    const slug = e.slug || e.project;
+    const haystack = [e.decision, ...topicsList].filter(Boolean).join(' ');
     if (topicMatch(haystack, topic) === 0) continue;
     out.push({
       source: 'episode',
-      excerpt: e.decision || `[${(e.topics || []).join(', ')}] ${e.outcome || ''}`,
+      excerpt: e.decision || `[${topicsList.join(', ')}] ${e.outcome || ''}`,
       date: (e.ts || '').slice(0, 10),
-      slug: e.slug,
+      slug,
       outcome: e.outcome,
       path: file,
       // Episodes always carry a slug from the originating session's cwd.
-      project: canonProject(e.slug) || e.slug || GLOBAL_PROJECT,
+      // R8 P3 — `slug` falls back to legacy `project` field via the local
+      // var resolved above. canonProject normalizes either shape.
+      project: canonProject(slug) || slug || GLOBAL_PROJECT,
     });
     if (out.length >= max * 3) break;  // overshoot for ranking
   }

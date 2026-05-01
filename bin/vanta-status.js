@@ -120,8 +120,10 @@ function readQueues() {
       // Codex R4 P2 fix — sync-queue is now append-only; multiple Stop hook
       // fires for the same session produce duplicate entries. Count
       // unsynced by latest-per-session, not raw line match.
+      // R8 P1 — read merged across rotated `.bak.<ts>` + live file.
       try {
-        const raw = fs.readFileSync(q.file, 'utf8');
+        const { readMergedJsonl } = require('./vanta-jsonl');
+        const raw = readMergedJsonl(q.file);
         const latest = new Map();
         for (const l of raw.split('\n')) {
           if (!l) continue;

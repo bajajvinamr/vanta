@@ -140,12 +140,24 @@ earlier `synced: false` entry naturally.
 ```bash
 _QUEUE=~/.vanta/sync-queue.jsonl
 _CWD="$(pwd)"
-if [ -f "$_QUEUE" ]; then
+if [ -f "$_QUEUE" ] || ls "$_QUEUE".bak.* >/dev/null 2>&1; then
   node -e "
 const fs=require('fs');
+const path=require('path');
 const targetCwd='$_CWD';
 const queue='$_QUEUE';
-const lines=fs.readFileSync(queue,'utf8').trim().split('\n').filter(Boolean);
+// R8 P1 — read across rotated bak files. Producer (auto-sync.js) no
+// longer compacts on rotate; merge happens here at read time.
+const dir=path.dirname(queue);
+const base=path.basename(queue);
+const parts=[];
+try{
+  const baks=fs.readdirSync(dir).filter(n=>n.startsWith(base+'.bak.')).sort();
+  for(const b of baks){ try{ parts.push(fs.readFileSync(path.join(dir,b),'utf8')); }catch{} }
+}catch{}
+try{ parts.push(fs.readFileSync(queue,'utf8')); }catch{}
+const merged=parts.map(p=>p.endsWith('\n')?p:p+'\n').join('');
+const lines=merged.trim().split('\n').filter(Boolean);
 // Fold by session_id (latest wins) so we only flip the truly-unsynced rows.
 const latest=new Map();
 for(const l of lines){ try{ const e=JSON.parse(l); if(e.session_id) latest.set(e.session_id,e); }catch{} }

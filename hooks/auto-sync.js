@@ -106,7 +106,16 @@ function detectOutcome(text) {
 // processed so even a 100MB transcript doesn't push us past budget.
 const TRANSCRIPT_BYTES_CAP = 8 * 1024 * 1024;  // 8MB — typical session is <2MB
 let input = '';
-const timeout = setTimeout(() => process.exit(0), 9500);  // 0.5s margin under 10s
+// R8 P2 — Gemini council finding. Earlier impl exited silently when the
+// 9.5s deadline tripped, never reaching the catch-block logger. If a
+// growing transcript consistently breached 9.5s (large project, ~MB
+// transcript), Vanta would stop recording memories with zero error
+// signal. Log before exit so silent breakage becomes visible in
+// hook.log, which vanta-status surfaces.
+const timeout = setTimeout(() => {
+  try { vlog().error('auto-sync', 'timeout (9.5s) exceeded — Stop hook force-exiting'); } catch {}
+  process.exit(0);
+}, 9500);
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { input += chunk; });
 process.stdin.on('end', () => {
@@ -191,26 +200,41 @@ process.stdin.on('end', () => {
     // folded snapshot as the fresh file. POSIX rename is atomic; any
     // concurrent appendFileSync either lands in the soon-to-be-.bak file
     // (preserved) or the freshly-recreated file. No clobber window.
+    // Codex+Gemini council R8 P1 — concurrent-stop data loss.
+    // Earlier impl folded inline: rename file→.bak, then writeFileSync(file)
+    // with the deduped snapshot. When 5 Claude Code windows ended within the
+    // same second, Session A's writeFileSync clobbered Session B's
+    // freshly-appended entry (B's appendFileSync between A's rename and A's
+    // writeFileSync created a fresh file with B's data; A's writeFileSync
+    // then OVERWROTE it). The R5 P2 comment claiming "no clobber window"
+    // was wrong.
+    //
+    // R8 fix: rotation no longer recreates the file. We rename to a
+    // timestamp-suffixed `.bak.<ts>` and let appendFileSync recreate the
+    // live file for the new entry. Folding moves to READ-TIME — readers
+    // (vanta-sync, vanta-status, using-vanta SKILL.md) glob `.bak.*` plus
+    // the live file and dedup by session_id. This is the correct semantics
+    // for an append-only log; the producer never needs to compact.
+    //
+    // Also R8 P2 — legacy entries without session_id used to silently
+    // disappear when fold-on-rotate dropped them. With rotation no longer
+    // folding, legacy entries are preserved verbatim in `.bak.<ts>` and
+    // remain visible to readers that don't require session_id.
     const appendJsonl = (file, newEntry) => {
       try {
         if (fs.existsSync(file)) {
           const st = fs.statSync(file);
           if (st.size > MAX_BYTES) {
-            // Capture the file under .bak first — atomic. Then fold from .bak
-            // and write the snapshot fresh. Concurrent writers see fresh file.
-            const bak = file + '.bak';
-            fs.renameSync(file, bak);
-            try {
-              const lines = fs.readFileSync(bak, 'utf8').split('\n').filter(Boolean);
-              const latest = new Map();
-              for (const l of lines) {
-                try {
-                  const e = JSON.parse(l);
-                  if (e.session_id) latest.set(e.session_id, l);
-                } catch {}
-              }
-              fs.writeFileSync(file, [...latest.values()].join('\n') + '\n');
-            } catch { /* fold failure: leave fresh empty, .bak preserved */ }
+            // Atomic-rename rotation. Timestamp suffix avoids overwriting
+            // an earlier rotation's .bak — a yearly system can rotate
+            // many times. The next rotator picks up where this one left off.
+            const ts = Date.now() + '.' + process.pid;
+            const bak = `${file}.bak.${ts}`;
+            try { fs.renameSync(file, bak); } catch { /* race: someone else rotated; fine */ }
+            // No writeFileSync — file is recreated by appendFileSync below
+            // with this session's entry. Concurrent appenders also create
+            // it; appendFileSync per-line atomicity (POSIX) means each
+            // entry lands intact.
           }
         }
       } catch { /* never block on rotation */ }
@@ -243,9 +267,39 @@ process.stdin.on('end', () => {
         session_id: sid,
       });
     }
+    // R8 P2 — wire resetSession + reapStale (Codex council finding).
+    // Earlier code exposed both functions via vanta-runtime-state.js but
+    // nothing called them. Per-session journals at ~/.vanta/runtime/*.jsonl
+    // accumulated forever. Now: clean THIS session's journal on its Stop,
+    // and run a once-a-day reapStale pass for orphans.
+    try {
+      const rs = require(path.join(os.homedir(), '.claude', 'bin', 'vanta-runtime-state.js'));
+      if (rs && rs.resetSession) rs.resetSession(sid);
+      // Once-per-day gate to keep the work cheap. Marker file mtime tracks last reap.
+      const reapMarker = path.join(_vantaDir(), '.last-reap');
+      let needsReap = true;
+      try {
+        const st = fs.statSync(reapMarker);
+        if (Date.now() - st.mtimeMs < 24 * 60 * 60_000) needsReap = false;
+      } catch { /* marker missing — first reap */ }
+      if (needsReap && rs && rs.reapStale) {
+        rs.reapStale({ days: 7 });
+        // Sweep stale .tmp / .compact leaks across the persistent dirs too.
+        if (rs.reapStaleTmp) {
+          rs.reapStaleTmp([
+            _vantaDir(),
+            path.join(os.homedir(), '.vanta', 'knowledge'),
+          ]);
+        }
+        try { fs.writeFileSync(reapMarker, ''); } catch {}
+      }
+    } catch (e) {
+      vlog().error('auto-sync.reap', e.message || String(e));
+    }
   } catch (err) {
     // Never block a session from ending — but log so silent breakage is visible.
     vlog().error('auto-sync', err && err.message || String(err));
   }
+  clearTimeout(timeout);
   process.exit(0);
 });

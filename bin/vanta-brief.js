@@ -132,8 +132,14 @@ function staleDecisions(slug, withinDays = 30) {
 }
 
 function unsyncedSessions(cwd) {
+  // R8 P1 — read merged across rotated `.bak.<ts>` + live file. Producer
+  // no longer compacts on rotate (concurrent-write data loss); merge here.
+  const { readMergedJsonl } = require('./vanta-jsonl');
   const file = path.join(os.homedir(), '.vanta', 'sync-queue.jsonl');
-  const entries = readJsonl(file);
+  const merged = readMergedJsonl(file);
+  const entries = merged.split('\n').filter(Boolean)
+    .map(l => { try { return JSON.parse(l); } catch { return null; } })
+    .filter(Boolean);
   // Codex R4 P2: sync-queue is now append-only; dedup by session_id, taking
   // the LATEST (rightmost) entry as the source of truth.
   const latest = new Map();
