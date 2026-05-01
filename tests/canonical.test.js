@@ -1836,3 +1836,70 @@ describe('auto-sync — session_id fallback uniqueness (R9 P1)', () => {
       'plain `unknown` fallback was replaced (R9 P1) — multi-session collapse');
   });
 });
+
+// ─── R10 lockdown — composability ordering (Codex+Gemini R10 P1) ─────────────
+
+describe('manifest — tool-observer is prepended for composability (R10 P1)', () => {
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(__dirname, '..', 'hooks', 'manifest.json'), 'utf8'));
+
+  test('every tool-observer registration carries `prepend: true`', () => {
+    const observers = manifest.registrations.filter(r => r.file === 'tool-observer.js');
+    assert.ok(observers.length >= 2, 'tool-observer registers on Pre + Post');
+    for (const r of observers) {
+      assert.equal(r.prepend, true,
+        `tool-observer registration on ${r.event}[${r.matcher}] must carry prepend:true`);
+    }
+  });
+
+  test('non-observer hooks do NOT prepend (preserves blocking-hook order)', () => {
+    // git-guardrails appends because it's a blocker — appending is correct
+    // so it fires AFTER telemetry. If we prepended it, blocked Bash commands
+    // would never reach the telemetry hook.
+    const guardrail = manifest.registrations.find(r => r.file === 'git-guardrails.js');
+    assert.ok(guardrail, 'git-guardrails registration present');
+    assert.notEqual(guardrail.prepend, true, 'guardrails must append, not prepend');
+  });
+});
+
+// ─── R10 lockdown — IMPORT_LINE no longer hardcoded (Codex+Gemini R10 P1) ────
+
+describe('setup.sh — IMPORT_LINE derived from REPO_DIR (R10 P1)', () => {
+  test('uses $REPO_DIR/skills/using-vanta, not the literal ~/Projects/vanta path', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'setup.sh'), 'utf8');
+    // Must reference REPO_DIR in the import-line construction.
+    assert.match(src, /\$REPO_DIR\/skills\/using-vanta\/SKILL\.md/,
+      'IMPORT_LINE must derive path from $REPO_DIR');
+    // The verbatim "@~/Projects/vanta/..." literal must be gone.
+    assert.equal(/IMPORT_LINE="@~\/Projects\/vanta\//.test(src), false,
+      'hardcoded ~/Projects/vanta path was replaced (R10 P1)');
+  });
+});
+
+// ─── R10 lockdown — vanta-extract-score docstring (R10 P3) ───────────────────
+
+describe('vanta-extract-score — docstring matches code (R10 P3)', () => {
+  test('top-of-file comment reflects current ≥0.65 / ≥0.40 thresholds', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'bin', 'vanta-extract-score.js'), 'utf8');
+    // Top docstring must mention the current ≥ 0.65 auto threshold.
+    const head = src.slice(0, 1500);
+    assert.match(head, /≥\s*0\.65/, 'top docstring should mention ≥ 0.65 (current)');
+    // And must mention staging redirect from R7 P1.
+    assert.match(head, /STAGING ONLY|staging only/i,
+      'docstring should note R7 P1 staging-only behavior');
+  });
+});
+
+// ─── R10 lockdown — uninstall strips CLAUDE.md @-import (R10 P2) ─────────────
+
+describe('uninstall.sh — strips using-vanta @-import (R10 P2)', () => {
+  test('script contains awk/sed pass that drops the @-import line', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'uninstall.sh'), 'utf8');
+    assert.match(src, /Stripping using-vanta @-import/,
+      'uninstall must announce the strip step');
+    assert.match(src, /skills\\\/using-vanta\\\/SKILL\\\.md|skills\/using-vanta\/SKILL\.md/,
+      'uninstall must reference the import target by tail');
+  });
+});
+

@@ -160,6 +160,19 @@ for (const event of Object.keys(s.hooks)) {
 }
 if (purged > 0) console.log(`  ✓ purged ${purged} stale Vanta hook entr(ies) from settings.json`);
 
+// Codex+Gemini council R10 P1 — composability ordering.
+// Earlier setup appended Vanta hooks to settings.json. If another plugin
+// had registered a PreToolUse:Bash hook FIRST and that hook exited
+// non-zero (blocking the tool call), Vanta's tool-observer never fired
+// — telemetry blind. The "always-on observability" promise was broken
+// for users who installed Vanta after another telemetry plugin.
+//
+// Fix: hooks tagged `prepend: true` in manifest.json land at the FRONT
+// of the matcher's hook list. tool-observer is the only one that needs
+// this — it's pure telemetry that must see every event before any
+// blocker can short-circuit the chain. git-guardrails stays appended
+// because it's a blocker itself; appending preserves a sensible order
+// where guardrails fire after telemetry but before downstream hooks.
 let added = 0, missing = 0;
 for (const r of REGISTRATIONS) {
   const hookPath = `${hooksDir}/${r.file}`;
@@ -168,9 +181,10 @@ for (const r of REGISTRATIONS) {
   s.hooks[r.event] = s.hooks[r.event] || [];
   const entry = { hooks: [{ type: 'command', command: cmd, timeout: r.timeout }] };
   if (r.matcher) entry.matcher = r.matcher;
-  s.hooks[r.event].push(entry);
+  if (r.prepend) s.hooks[r.event].unshift(entry);
+  else           s.hooks[r.event].push(entry);
   added++;
-  console.log(`  ✓ ${r.event}${r.matcher ? '['+r.matcher+']' : ''} → ${r.file}`);
+  console.log(`  ✓ ${r.event}${r.matcher ? '['+r.matcher+']' : ''} → ${r.file}${r.prepend ? ' (prepend)' : ''}`);
 }
 fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2) + '\n');
 console.log(`  Summary: ${added} added, ${purged} purged, ${missing} missing`);
@@ -182,7 +196,29 @@ echo ""
 # The @-import must point to the repo copy so edits take effect without re-running setup.
 echo "Wiring session context..."
 
-IMPORT_LINE="@~/Projects/vanta/skills/using-vanta/SKILL.md"
+# Codex+Gemini council R10 P1 — IMPORT_LINE was hardcoded to
+# `~/Projects/vanta/...`. If the user cloned anywhere else (Documents,
+# work/, code/, a forked org-named dir), the @-import resolved to a
+# non-existent file and CLAUDE.md context loading silently broke. Use
+# REPO_DIR to derive the actual path. Translate $HOME → ~ for cosmetic
+# tidiness in the rendered CLAUDE.md.
+_IMPORT_TARGET="$REPO_DIR/skills/using-vanta/SKILL.md"
+case "$_IMPORT_TARGET" in
+  "$HOME"/*) IMPORT_LINE="@~${_IMPORT_TARGET#$HOME}" ;;
+  *)         IMPORT_LINE="@$_IMPORT_TARGET" ;;
+esac
+
+# R10 P2 — also clean up any pre-v3.6.9 hardcoded import line so users
+# upgrading don't end up with both a stale + a fresh @-import after
+# moving the repo. Match by the using-vanta tail, not the full path.
+if [ -f "$CLAUDE_MD" ]; then
+  # Remove any existing line containing skills/using-vanta/SKILL.md that
+  # ISN'T the one we're about to write.
+  awk -v keep="$IMPORT_LINE" '
+    /skills\/using-vanta\/SKILL\.md/ && $0 != keep { next }
+    { print }
+  ' "$CLAUDE_MD" > "$CLAUDE_MD.tmp" && mv "$CLAUDE_MD.tmp" "$CLAUDE_MD"
+fi
 
 if [ -f "$CLAUDE_MD" ] && grep -qF "$IMPORT_LINE" "$CLAUDE_MD"; then
   echo "  ✓ using-vanta already in CLAUDE.md"
@@ -190,7 +226,7 @@ else
   echo "" >> "$CLAUDE_MD"
   echo "# Vanta session protocol" >> "$CLAUDE_MD"
   echo "$IMPORT_LINE" >> "$CLAUDE_MD"
-  echo "  ✓ using-vanta added to ~/.claude/CLAUDE.md"
+  echo "  ✓ using-vanta added to ~/.claude/CLAUDE.md ($IMPORT_LINE)"
 fi
 echo ""
 

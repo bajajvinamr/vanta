@@ -1,94 +1,39 @@
 # Install Guide
 
+The supported installer is the repo's `setup.sh`. Run it from the repo root:
+
+```bash
+./setup.sh
+```
+
+That single command:
+
+- Deploys the four flat skills (`vanta-run`, `vanta-council`, `vanta-sync`, `vanta-patterns`) to `~/.claude/skills/`
+- Deploys all hooks listed in `hooks/manifest.json` (the single source of truth) to `~/.claude/hooks/`
+- Deploys all shared bins (`vanta-resolve`, `vanta-jsonl`, runtime-state, etc.) to `~/.claude/bin/`
+- Regenerates `hooks/hooks.json` from `manifest.json`
+- Wires every hook into `~/.claude/settings.json` (purges any earlier Vanta entries first to avoid drift)
+- Wires `using-vanta` as always-active context via `@`-import in `~/.claude/CLAUDE.md`
+- Prepends `tool-observer.js` so other plugins' blocking hooks can't shadow telemetry (R10 P1)
+
 ## Prerequisites
 
 - Claude Code CLI installed
-- `~/.claude/` directory exists
-- Multi-CLI MCP: `@osanoai/multicli` (for `/council`)
+- Node.js 18+
+- `~/.claude/` directory exists (Claude Code creates it on first run)
+- Optional: `@osanoai/multicli` MCP server for `/council` (full Gemini + Codex review). Without it, `/council` falls back to PARTIAL or SOLO mode (see `skills/council/SKILL.md`).
 
-## Step 1 — Install Superpowers Plugin
-
-In Claude Code:
-```
-/plugin install superpowers@claude-plugins-official
-```
-
-## Step 2 — Copy Skills
+## Uninstall
 
 ```bash
-mkdir -p ~/.claude/skills/vanta
-cp -r skills/vanta ~/.claude/skills/vanta/vanta
-cp -r skills/vanta-sync ~/.claude/skills/vanta/vanta-sync
-cp -r skills/council ~/.claude/skills/vanta/council
-
-# Skills must be directories with SKILL.md inside
-# Verify:
-ls ~/.claude/skills/vanta/
+./uninstall.sh
 ```
 
-Note: Skills in Claude Code must be directories named after the command, with a `SKILL.md` inside. The `/vanta` command loads from `~/.claude/skills/vanta/vanta/SKILL.md`.
+Reverses what `setup.sh` did using `manifest.json` as the authoritative file list. Preserves user data (`~/.vanta/`, `~/.claude/rules/vinamr-invariants.md`). Strips the `using-vanta` `@`-import from `~/.claude/CLAUDE.md`.
 
-## Step 3 — Install Hooks
+## Manual install
 
-```bash
-cp hooks/council-advisory.js ~/.claude/hooks/
-cp hooks/test-failure-advisor.js ~/.claude/hooks/
-cp hooks/stack-file-nudge.js ~/.claude/hooks/
-chmod +x ~/.claude/hooks/*.js
-```
-
-## Step 4 — Wire Hooks in settings.json
-
-Add to `~/.claude/settings.json` under `hooks`:
-
-```json
-{
-  "PreToolUse": [
-    {
-      "matcher": "Write|Edit",
-      "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/council-advisory.js", "timeout": 5 }]
-    }
-  ],
-  "PostToolUse": [
-    {
-      "matcher": "Bash",
-      "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/test-failure-advisor.js", "timeout": 8 }]
-    },
-    {
-      "matcher": "Write|Edit",
-      "hooks": [{ "type": "command", "command": "node ~/.claude/hooks/stack-file-nudge.js", "timeout": 5 }]
-    }
-  ]
-}
-```
-
-## Step 5 — Add Vanta Protocol to CLAUDE.md
-
-Add the `## Vanta Protocol` section from `VANTA.md` to your `~/.claude/CLAUDE.md`.
-
-## Step 6 — Add gemini-plugin Marketplace (optional)
-
-In `~/.claude/settings.json` `extraKnownMarketplaces`:
-```json
-"gemini-plugin": {
-  "source": { "source": "github", "repo": "spyrae/gemini-plugin-cc" }
-}
-```
-
-Then install:
-```
-/plugin install gemini-plugin@gemini-plugin
-```
-
-## Step 7 — Enable Codex Memories
-
-In `~/.codex/config.toml`:
-```toml
-[memories]
-generate_memories = true
-use_memories = true
-disable_on_external_context = true
-```
+Not supported. Earlier versions of this guide documented a nested `skills/vanta/<name>/` layout and only three hooks — that layout is incorrect for current Claude Code (skills must be flat: `~/.claude/skills/<name>/SKILL.md`, one level only) and the hook list has grown. If you need to install on a system where `setup.sh` won't run, read `setup.sh` itself — it's a few hundred lines of bash that documents every step.
 
 ## Verify
 

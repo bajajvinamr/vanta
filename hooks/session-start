@@ -34,11 +34,25 @@ fi
 # `read` approach silently dropped everything past the first newline and
 # every cwd extraction failed → fell back to $PWD. `cat` with a 2s timeout
 # guarded by `timeout` consumes the entire payload.
+# Codex council R10 P1 — `timeout` is GNU coreutils, not on stock macOS.
+# Stock macOS users would see this hook silently fail every SessionStart
+# because `timeout` returns a "command not found" error, the `|| echo ""`
+# absorbs it, and input_json stays empty. Probe the command first:
+# - GNU `timeout` (Linux, macOS via brew/coreutils)
+# - `gtimeout` (macOS via brew prefix)
+# - direct cat (no timeout, but session-start has Claude's own 5s budget)
 input_json=""
 if [ -t 0 ]; then
   input_json=""
-else
+elif command -v timeout >/dev/null 2>&1; then
   input_json=$(timeout 2 cat 2>/dev/null || echo "")
+elif command -v gtimeout >/dev/null 2>&1; then
+  input_json=$(gtimeout 2 cat 2>/dev/null || echo "")
+else
+  # No timeout available — read stdin directly. Claude Code's own
+  # 5s SessionStart budget prevents runaway. Worst case the cat
+  # blocks until parent closes stdin, which is fast for SessionStart.
+  input_json=$(cat 2>/dev/null || echo "")
 fi
 cwd=""
 if [ -n "$input_json" ]; then

@@ -92,13 +92,20 @@ for p in prs:
 " 2>/dev/null
 
 # Unsynced sessions — sync-queue is append-only, dedup by session_id (latest wins).
-[ -f ~/.vanta/sync-queue.jsonl ] && _U=$(python3 -c "
-import json,os
+# R10 P2 / R8 P1 fix — also read across rotated `.bak.<ts>` siblings; producer
+# no longer compacts on rotate, so old unsynced sessions live in the bak files.
+{ [ -f ~/.vanta/sync-queue.jsonl ] || ls ~/.vanta/sync-queue.jsonl.bak.* >/dev/null 2>&1; } && _U=$(python3 -c "
+import json, os, glob
+base=os.path.expanduser('~/.vanta/sync-queue.jsonl')
+files=sorted(glob.glob(base+'.bak.*')) + ([base] if os.path.exists(base) else [])
 latest={}
-for l in open(os.path.expanduser('~/.vanta/sync-queue.jsonl')):
+for fp in files:
   try:
-    e=json.loads(l); sid=e.get('session_id')
-    if sid: latest[sid]=(e.get('synced') is not True)
+    for l in open(fp):
+      try:
+        e=json.loads(l); sid=e.get('session_id')
+        if sid: latest[sid]=(e.get('synced') is not True)
+      except: pass
   except: pass
 print(sum(1 for v in latest.values() if v))
 " 2>/dev/null || echo 0) && [ "$_U" -gt 0 ] && echo "UNSYNCED: $_U sessions"

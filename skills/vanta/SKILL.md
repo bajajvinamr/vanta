@@ -66,15 +66,22 @@ First, silently check the sync queue:
 
 ```bash
 _QUEUE=~/.vanta/sync-queue.jsonl
-if [ -f "$_QUEUE" ]; then
+if [ -f "$_QUEUE" ] || ls "$_QUEUE".bak.* >/dev/null 2>&1; then
   # sync-queue is append-only; dedup by session_id (latest entry wins).
+  # R10 P2 / R8 P1 — read across rotated `.bak.<ts>` siblings; producer
+  # no longer compacts on rotate so old unsynced sessions live in the baks.
   _UNSYNCED=$(python3 -c "
-import json,os
+import json, os, glob
+base=os.path.expanduser('~/.vanta/sync-queue.jsonl')
+files=sorted(glob.glob(base+'.bak.*')) + ([base] if os.path.exists(base) else [])
 latest={}
-for l in open(os.path.expanduser('~/.vanta/sync-queue.jsonl')):
+for fp in files:
   try:
-    e=json.loads(l); sid=e.get('session_id')
-    if sid: latest[sid]=(e.get('synced') is not True)
+    for l in open(fp):
+      try:
+        e=json.loads(l); sid=e.get('session_id')
+        if sid: latest[sid]=(e.get('synced') is not True)
+      except: pass
   except: pass
 print(sum(1 for v in latest.values() if v))
 " 2>/dev/null || echo 0)
