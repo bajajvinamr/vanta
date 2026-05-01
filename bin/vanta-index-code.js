@@ -244,8 +244,17 @@ function releaseLock(slug) {
 function atomicWriteJsonl(file, entries) {
   const tmp = `${file}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
   const body = entries.length ? entries.map(e => JSON.stringify(e)).join('\n') + '\n' : '';
-  fs.writeFileSync(tmp, body);
-  fs.renameSync(tmp, file);
+  // R9 P2 — Gemini council finding. ENOSPC mid-write left an orphaned
+  // .tmp file forever (auto-sync.reapStaleTmp doesn't sweep this dir).
+  // Catch the failure, unlink the partial tmp, then re-throw so the
+  // caller's higher-level error surface stays intact.
+  try {
+    fs.writeFileSync(tmp, body);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw err;
+  }
 }
 
 function loadShard(slug) {
@@ -275,8 +284,14 @@ function loadCursor(slug) {
 function saveCursor(slug, cursor) {
   const file = cursorPath(slug);
   const tmp = `${file}.tmp.${process.pid}.${Date.now()}`;
-  fs.writeFileSync(tmp, JSON.stringify(cursor, null, 2));
-  fs.renameSync(tmp, file);
+  // R9 P2 — same ENOSPC tmp-leak fix as atomicWriteJsonl above.
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(cursor, null, 2));
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw err;
+  }
 }
 
 // ─── Project resolution ─────────────────────────────────────────────────────

@@ -66,7 +66,8 @@ function _rotateIfLarge(file) {
 function _appendLine(file, obj) {
   _ensureDir();
   _rotateIfLarge(file);
-  try { fs.appendFileSync(file, JSON.stringify(obj) + '\n'); } catch (e) {
+  // R9 P1 — torn-line guard. See bin/vanta-jsonl.js comment.
+  try { fs.appendFileSync(file, '\n' + JSON.stringify(obj) + '\n'); } catch (e) {
     process.stderr.write(`failed to append to ${file}: ${e.message}\n`);
   }
 }

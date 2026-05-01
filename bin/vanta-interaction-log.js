@@ -40,13 +40,21 @@ function _ensureDir() {
 
 // Codex council R5 P2 fix — atomic rotation via rename. Concurrent
 // appendFileSync from PreToolUse + PostToolUse hooks could collide with
-// the earlier read-trim-write rotator and lose telemetry. Now: rename
-// to .bak, drop the older half, accept the loss as best-effort observability.
+// the earlier read-trim-write rotator.
+//
+// R9 P2 — Codex council finding. Earlier rotation overwrote .bak on
+// every cycle: the file got 5MB → renamed to .bak → next 5MB → renamed
+// to .bak (clobbering the earlier .bak). After two rotations, 5MB of
+// history was permanently lost. audit() and vanta-status only read the
+// live file, so analytics undercounted on every long-running install.
+// Now: timestamped `.bak.<ts>` siblings — same shape as sync-queue and
+// episodes (R8 P1). Readers can union them via readMergedJsonl.
 function _rotate(file) {
   try {
     const st = fs.statSync(file);
     if (st.size <= MAX_BYTES) return;
-    fs.renameSync(file, file + '.bak');
+    const ts = Date.now() + '.' + process.pid;
+    fs.renameSync(file, `${file}.bak.${ts}`);
   } catch {}
 }
 
@@ -148,16 +156,21 @@ function logEvent(entry) {
   const file = _logFile();
   try {
     _rotate(file);
-    fs.appendFileSync(file, JSON.stringify(e) + '\n');
+    // R9 P1 — torn-line guard. See bin/vanta-jsonl.js comment.
+    fs.appendFileSync(file, '\n' + JSON.stringify(e) + '\n');
   } catch { /* never block hook on log failure */ }
   return e;
 }
 
 function _readAll() {
+  // R9 P2 — read across rotated `.bak.<ts>` siblings AND the live file.
+  // Earlier impl only read the live file, so audit()/vanta-status lost
+  // visibility into the older 5MB after every rotation.
   const f = _logFile();
-  if (!fs.existsSync(f)) return [];
   try {
-    return fs.readFileSync(f, 'utf8').split('\n').filter(Boolean)
+    const { readMergedJsonl } = require('./vanta-jsonl');
+    const merged = readMergedJsonl(f);
+    return merged.split('\n').filter(Boolean)
       .map(l => { try { return JSON.parse(l); } catch { return null; } })
       .filter(Boolean);
   } catch { return []; }

@@ -1728,6 +1728,30 @@ describe('vanta-resolve — legacy episode shape (R8 P3)', () => {
 
 // ─── R8 lockdown — auto-sync rotation rename-only (Gemini R8 P1) ─────────────
 
+// ─── R9 lockdown — torn-line guard (Gemini R9 P1) ────────────────────────────
+
+describe('vanta-jsonl — torn-line resilience (R9 P1)', () => {
+  const { readDedupedJsonl } = require('../bin/vanta-jsonl');
+
+  test('torn final line does NOT corrupt the next healthy record', () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-torn-'));
+    const file = path.join(tmpdir, 'q.jsonl');
+    try {
+      // Producer A: torn write — no trailing \n. Simulates SIGKILL/ENOSPC.
+      fs.writeFileSync(file, '\n{"session_id":"A","payload":"torn"');
+      // Producer B: healthy append with leading \n guard (R9 P1 fix).
+      fs.appendFileSync(file, '\n{"session_id":"B","payload":"intact"}\n');
+      const m = readDedupedJsonl(file);
+      // A's torn record is unparseable → dropped silently. That's
+      // expected. The CRITICAL property: B's record survives.
+      const sawB = m.has('B') && m.get('B').payload === 'intact';
+      assert.equal(sawB, true, 'healthy next record must survive after torn line');
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('auto-sync — rotation does not destroy concurrent appends (R8 P1)', () => {
   test('rotation produces .bak.<ts> file and does NOT call fs.writeFileSync', () => {
     // Static-source sanity check. The fix removes the in-rotation
@@ -1748,5 +1772,67 @@ describe('auto-sync — rotation does not destroy concurrent appends (R8 P1)', (
     // Now check for an actual fs.writeFileSync call inside.
     assert.equal(/fs\.writeFileSync/.test(fnMatch[0]), false,
       'appendJsonl must not fs.writeFileSync (would clobber concurrent appenders)');
+  });
+});
+
+// ─── R9 lockdown — _compact field spread (Gemini R9 P1) ──────────────────────
+
+describe('vanta-runtime-state — _compact preserves all fields (R9 P1)', () => {
+  test('compact does not enumerate fields explicitly (regression guard)', () => {
+    // Static-source guard. The fix replaced an explicit field enumeration
+    // with object spread so future state additions survive compaction.
+    // If someone reverts to enumeration, this test catches it.
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'bin', 'vanta-runtime-state.js'), 'utf8');
+    // The new shape uses `state: rest` (rest = ...state minus session_id).
+    assert.match(src, /state: rest/,
+      '_compact must use object spread, not explicit field enumeration');
+    // Catch the old shape if it gets re-introduced.
+    assert.equal(/state:\s*\{\s*started_at: state\.started_at/.test(src), false,
+      'explicit field enumeration was replaced with spread (R9 P1)');
+  });
+});
+
+// ─── R9 lockdown — .planning is-directory check (Gemini R9 P1) ───────────────
+
+describe('vanta-brief — detectPhase tolerates .planning as a file (R9 P1)', () => {
+  const brief = require('../bin/vanta-brief.js');
+
+  test('returns null when .planning is a file (not a dir) — does NOT crash', () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r9-planning-'));
+    try {
+      // Create `.planning` as a FILE not a DIRECTORY.
+      fs.writeFileSync(path.join(tmpdir, '.planning'), 'not a dir');
+      // brief is a CLI but exposes detectPhase indirectly via main(). Easiest
+      // path is to spawn it as a subprocess and assert it exits 0.
+      const { execFileSync } = require('node:child_process');
+      const briefPath = path.join(__dirname, '..', 'bin', 'vanta-brief.js');
+      let result;
+      assert.doesNotThrow(() => {
+        result = execFileSync(process.execPath, [briefPath, '--cwd', tmpdir, '--format', 'json'],
+          { stdio: ['pipe', 'pipe', 'pipe'], timeout: 3000 });
+      }, 'vanta-brief must not crash when .planning is a file');
+      // Output must still be valid JSON (no phase, but no error).
+      assert.doesNotThrow(() => JSON.parse(result.toString()),
+        'output must be parseable JSON even when .planning is a file');
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+  void brief;  // satisfy "unused" lint if any
+});
+
+// ─── R9 lockdown — unique session_id fallback (Codex R9 P1) ──────────────────
+
+describe('auto-sync — session_id fallback uniqueness (R9 P1)', () => {
+  test('hook source uses pid+ts fallback, not collapsed `unknown`', () => {
+    // Static-source guard against re-introducing `session_id || 'unknown'`.
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'hooks', 'auto-sync.js'), 'utf8');
+    assert.match(src, /unknown-\$\{process\.pid\}-\$\{Date\.now\(\)\}/,
+      'fallback must include pid+ts so unknown-source events do not collide');
+    // Old shape must NOT be present.
+    assert.equal(/session_id\s*\|\|\s*['"]unknown['"]\s*;/.test(src), false,
+      'plain `unknown` fallback was replaced (R9 P1) — multi-session collapse');
   });
 });
