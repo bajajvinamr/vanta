@@ -24,6 +24,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 // Tier 4: PROJECT_KEYWORDS + canonProject extracted to shared module.
 // Both councils flagged the duplication as silent sync-drift surface.
@@ -533,23 +534,53 @@ function applyProjectScope(results, activeProject, includeForeign) {
 //
 // Why opt-in: programmatic callers (tests, future automation) shouldn't
 // silently write to the log. CLI mode and council-advisory both pass log:true.
-const QUERY_LOG = path.join(os.homedir(), '.vanta', 'query-log.jsonl');
+//
+// Codex council R5 P2 fix — earlier impl logged raw `topic` (user query
+// term) and `cwd` (absolute filesystem path). That violates the
+// shape-only contract claimed two lines up. Now: topic is hashed to
+// 8 hex chars; cwd is dropped. Project canon stays — it's a known slug
+// from PROJECT_KEYWORDS, not user-typed content.
+//
+// Codex council R5 P2 fix — rotation was read-trim-writeFileSync, racing
+// with concurrent appendFileSync from a parallel hook. New approach:
+// rename the live file to .bak and start fresh — the rename is atomic,
+// no in-flight writer's bytes are clobbered. The losing-half is dropped
+// (acceptable: query log is best-effort observability, not durability).
+function _qlogVantaDir() { return process.env.VANTA_DIR_OVERRIDE || path.join(os.homedir(), '.vanta'); }
+function _queryLogFile() { return path.join(_qlogVantaDir(), 'query-log.jsonl'); }
 const QUERY_LOG_MAX_BYTES = 5_000_000;
+// Back-compat const for any external readers; resolved at module load.
+const QUERY_LOG = _queryLogFile();
+
+function _shapeTopic(t) {
+  if (!t) return null;
+  return crypto.createHash('sha256').update(String(t)).digest('hex').slice(0, 8);
+}
 
 function _logQuery(entry) {
   try {
-    const dir = path.dirname(QUERY_LOG);
+    const file = _queryLogFile();
+    const dir = path.dirname(file);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    // Best-effort rotation: if exceeds cap, keep the last 50% by line count.
+    // Atomic rotation: rename (POSIX-atomic) so concurrent appendFileSync
+    // calls keep working — they either land in the old file (preserved as
+    // .bak) or the freshly-created new file. No lost-update race.
     try {
-      const st = fs.statSync(QUERY_LOG);
-      if (st.size > QUERY_LOG_MAX_BYTES) {
-        const lines = fs.readFileSync(QUERY_LOG, 'utf8').split('\n').filter(Boolean);
-        const kept = lines.slice(Math.floor(lines.length / 2));
-        fs.writeFileSync(QUERY_LOG, kept.join('\n') + '\n');
-      }
+      const st = fs.statSync(file);
+      if (st.size > QUERY_LOG_MAX_BYTES) fs.renameSync(file, file + '.bak');
     } catch { /* file doesn't exist yet — fine */ }
-    fs.appendFileSync(QUERY_LOG, JSON.stringify(entry) + '\n');
+    // Strip identifying fields before persisting. Keep coarse counts +
+    // canonical project slug + hashed topic for trend/audit utility.
+    const safe = {
+      ts: entry.ts,
+      topic_hash:  _shapeTopic(entry.topic),
+      project:     entry.project || null,
+      activeCanon: entry.activeCanon || null,
+      count:       entry.count,
+      foreignDropped: entry.foreignDropped,
+      top: entry.top || [],
+    };
+    fs.appendFileSync(file, JSON.stringify(safe) + '\n');
   } catch { /* never block resolve() on log failure */ }
 }
 
@@ -772,14 +803,19 @@ function analyzeLog({ last = 500 } = {}) {
   const entries = [];
   for (const l of lines) { try { entries.push(JSON.parse(l)); } catch { /* skip */ } }
   if (!entries.length) return { present: true, count: 0, message: 'log present but empty' };
-  // Most queried topics
+  // Most queried topics. Post-R5 the persisted field is `topic_hash`
+  // (not the raw query string) — analytics now key on the hash. Old
+  // entries with `topic` are folded in for backwards compatibility
+  // during the transition window.
   const topicCount = new Map();
   let zeroResultQueries = 0;
   let foreignBleedTotal = 0;
   const topScores = [];
   const sourceCount = new Map();
+  const topicKey = e => e.topic_hash || e.topic || null;
   for (const e of entries) {
-    topicCount.set(e.topic, (topicCount.get(e.topic) || 0) + 1);
+    const k = topicKey(e);
+    if (k) topicCount.set(k, (topicCount.get(k) || 0) + 1);
     if (e.count === 0) zeroResultQueries++;
     foreignBleedTotal += (e.foreignDropped || 0);
     if (e.top && e.top[0]) {
@@ -794,7 +830,7 @@ function analyzeLog({ last = 500 } = {}) {
   const gapTopics = [...topicCount.entries()]
     .filter(([t, n]) => n >= 2)
     .map(([t, n]) => {
-      const zero = entries.filter(e => e.topic === t && e.count === 0).length;
+      const zero = entries.filter(e => topicKey(e) === t && e.count === 0).length;
       return { topic: t, attempts: n, zero, ratio: zero / n };
     })
     .filter(g => g.ratio >= 0.5)

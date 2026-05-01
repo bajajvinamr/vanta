@@ -38,14 +38,15 @@ function _ensureDir() {
   try { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); } catch {}
 }
 
+// Codex council R5 P2 fix — atomic rotation via rename. Concurrent
+// appendFileSync from PreToolUse + PostToolUse hooks could collide with
+// the earlier read-trim-write rotator and lose telemetry. Now: rename
+// to .bak, drop the older half, accept the loss as best-effort observability.
 function _rotate(file) {
   try {
     const st = fs.statSync(file);
     if (st.size <= MAX_BYTES) return;
-    // Keep the most-recent half.
-    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-    const kept = lines.slice(Math.floor(lines.length / 2));
-    fs.writeFileSync(file, kept.join('\n') + '\n');
+    fs.renameSync(file, file + '.bak');
   } catch {}
 }
 

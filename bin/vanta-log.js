@@ -12,23 +12,30 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const LOG_FILE = path.join(os.homedir(), '.vanta', 'hook.log');
-const MAX_LINES = 1000;
+// Codex+Gemini council R5 P1+P2 fixes — VANTA_DIR_OVERRIDE honored;
+// rotation no longer races concurrent appends.
+function _vantaDir() { return process.env.VANTA_DIR_OVERRIDE || path.join(os.homedir(), '.vanta'); }
+function _logFile()  { return path.join(_vantaDir(), 'hook.log'); }
+const LOG_FILE = path.join(os.homedir(), '.vanta', 'hook.log');  // back-compat const
+const MAX_BYTES = 200_000;  // ~1k lines @ 200 char/line
 
 function _ensureDir() {
-  const dir = path.dirname(LOG_FILE);
+  const dir = path.dirname(_logFile());
   if (!fs.existsSync(dir)) { try { fs.mkdirSync(dir, { recursive: true }); } catch {} }
 }
 
+// Atomic rotation: rename live log to .bak. POSIX rename is atomic and
+// concurrent appendFileSync calls keep working — they either land in the
+// already-renamed .bak (we lose its trailing entries on next rotation,
+// fine for best-effort hook telemetry) or in the freshly-created file.
+// Earlier read-then-writeFileSync would silently destroy any append that
+// happened in the read-write window.
 function _rotateIfNeeded() {
   try {
-    const st = fs.statSync(LOG_FILE);
-    if (st.size < 200_000) return;  // ~1k lines @ 200 char/line
-    const content = fs.readFileSync(LOG_FILE, 'utf8');
-    const lines = content.split('\n').filter(Boolean);
-    if (lines.length <= MAX_LINES) return;
-    const trimmed = lines.slice(-MAX_LINES).join('\n') + '\n';
-    fs.writeFileSync(LOG_FILE, trimmed);
+    const file = _logFile();
+    const st = fs.statSync(file);
+    if (st.size < MAX_BYTES) return;
+    fs.renameSync(file, file + '.bak');
   } catch { /* never block */ }
 }
 
@@ -37,7 +44,7 @@ function log(level, source, message) {
   _rotateIfNeeded();
   const ts = new Date().toISOString();
   const line = `${ts} | ${level.padEnd(5)} | ${source.padEnd(24)} | ${String(message).replace(/\n/g, ' ').slice(0, 500)}\n`;
-  try { fs.appendFileSync(LOG_FILE, line); } catch { /* never block */ }
+  try { fs.appendFileSync(_logFile(), line); } catch { /* never block */ }
 }
 
 function info(source, message)  { log('INFO',  source, message); }

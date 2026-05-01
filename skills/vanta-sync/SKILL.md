@@ -121,7 +121,13 @@ If no learnings are project-specific: note "Project CLAUDE.md: no project-specif
 **Step 6 — Mark synced sessions (scoped to current project)**
 
 Only mark entries for the CURRENT project (cwd) — never touch other projects' unsynced entries.
-Uses atomic write (tmp + rename) so a concurrent Stop hook `appendFileSync` can't be silently overwritten:
+
+Codex council R5 P1 fix — sync-queue is **append-only**, written by `auto-sync.js`
+under POSIX-atomic `appendFileSync`. The earlier read-modify-rename approach
+clobbered concurrent Stop-hook entries when two sessions ended simultaneously.
+We now append `{session_id, synced: true, ts}` resolution entries; consumers
+already dedup by session_id (latest wins), so the resolution overlays the
+earlier `synced: false` entry naturally.
 
 ```bash
 _QUEUE=~/.vanta/sync-queue.jsonl
@@ -131,19 +137,18 @@ if [ -f "$_QUEUE" ]; then
 const fs=require('fs');
 const targetCwd='$_CWD';
 const queue='$_QUEUE';
-// Re-read at the moment of write to minimize the race window.
 const lines=fs.readFileSync(queue,'utf8').trim().split('\n').filter(Boolean);
+// Fold by session_id (latest wins) so we only flip the truly-unsynced rows.
+const latest=new Map();
+for(const l of lines){ try{ const e=JSON.parse(l); if(e.session_id) latest.set(e.session_id,e); }catch{} }
+const ts=new Date().toISOString();
 let marked=0;
-const updated=lines.map(l=>{
-  try{
-    const e=JSON.parse(l);
-    if(e.synced===false && e.cwd===targetCwd){ e.synced=true; marked++; }
-    return JSON.stringify(e);
-  }catch{return l;}
-});
-const tmp=queue+'.tmp';
-fs.writeFileSync(tmp,updated.join('\n')+'\n');
-fs.renameSync(tmp,queue);
+for(const [sid,e] of latest){
+  if(e.synced===false && e.cwd===targetCwd){
+    fs.appendFileSync(queue, JSON.stringify({...e,synced:true,marked_synced_at:ts})+'\n');
+    marked++;
+  }
+}
 console.log(\`  ✓ sync-queue: \${marked} entries marked synced for \${targetCwd}\`);
 "
 fi

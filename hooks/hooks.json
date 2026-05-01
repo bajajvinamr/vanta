@@ -45,22 +45,22 @@
         ]
       },
       {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/git-guardrails.js\"",
-            "timeout": 5
-          }
-        ]
-      },
-      {
         "matcher": "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Agent|Task",
         "hooks": [
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/tool-observer.js\"",
             "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/git-guardrails.js\"",
+            "timeout": 5
           }
         ]
       }

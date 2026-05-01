@@ -30,12 +30,20 @@ const { execSync } = require('child_process');
 const { canonProject, isKnownProject, slugForFilesystem, projectPatternsFor } = require('./vanta-projects');
 
 // ─── Config ─────────────────────────────────────────────────────────────────
+//
+// Codex council R5 P2 fix — VANTA_DIR_OVERRIDE was previously ignored here.
+// The code-index-watch hook shells into runIndex() and would always write
+// to the user's real ~/.vanta even under test sandbox. Replaced with
+// resolver functions so every read of these paths picks up the current
+// value of process.env.VANTA_DIR_OVERRIDE.
+function _vantaDir()     { return process.env.VANTA_DIR_OVERRIDE || path.join(os.homedir(), '.vanta'); }
+function _knowledgeDir() { return path.join(_vantaDir(), 'knowledge'); }
+function _legacyJsonl()  { return path.join(_vantaDir(), 'code-knowledge.jsonl'); }
+function _legacyCursor() { return path.join(_vantaDir(), 'code-knowledge-cursor.json'); }
+// Back-compat const exports for callers that imported VANTA_DIR directly.
+// Resolved lazily — re-read each access via the helpers above.
 const VANTA_DIR = path.join(os.homedir(), '.vanta');
 const KNOWLEDGE_DIR = path.join(VANTA_DIR, 'knowledge');
-
-// Legacy paths from earlier tiers. On first Tier 4 run we migrate forward.
-const LEGACY_GLOBAL_JSONL = path.join(VANTA_DIR, 'code-knowledge.jsonl');
-const LEGACY_GLOBAL_CURSOR = path.join(VANTA_DIR, 'code-knowledge-cursor.json');
 
 const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.py', '.rs', '.go']);
 const SKIP_DIRS = new Set([
@@ -172,13 +180,13 @@ function readSafe(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return
 function statSafe(p) { try { return fs.statSync(p); } catch { return null; } }
 
 function ensureKnowledgeDir() {
-  if (!fs.existsSync(VANTA_DIR)) fs.mkdirSync(VANTA_DIR, { recursive: true });
-  if (!fs.existsSync(KNOWLEDGE_DIR)) fs.mkdirSync(KNOWLEDGE_DIR, { recursive: true });
+  if (!fs.existsSync(_vantaDir()))     fs.mkdirSync(_vantaDir(),     { recursive: true });
+  if (!fs.existsSync(_knowledgeDir())) fs.mkdirSync(_knowledgeDir(), { recursive: true });
 }
 
-function shardPath(slug)  { return path.join(KNOWLEDGE_DIR, `${slugForFilesystem(slug)}.jsonl`); }
-function cursorPath(slug) { return path.join(KNOWLEDGE_DIR, `${slugForFilesystem(slug)}.cursor.json`); }
-function lockPath(slug)   { return path.join(KNOWLEDGE_DIR, `${slugForFilesystem(slug)}.lock`); }
+function shardPath(slug)  { return path.join(_knowledgeDir(), `${slugForFilesystem(slug)}.jsonl`); }
+function cursorPath(slug) { return path.join(_knowledgeDir(), `${slugForFilesystem(slug)}.cursor.json`); }
+function lockPath(slug)   { return path.join(_knowledgeDir(), `${slugForFilesystem(slug)}.lock`); }
 
 // ─── Shard locking ──────────────────────────────────────────────────────────
 // Advisory file lock via O_EXCL. Tier 3/4/5 evolution:
@@ -443,8 +451,8 @@ function extractFromClaudeMd(filePath, projectRoot, projectSlug) {
 // Forward-migrate Tier 2 (single global jsonl) and Tier 3 (per-shard with
 // __unknown_project__ + global cursor) into Tier 4 layout. Idempotent.
 //
-// Legacy detection: presence of LEGACY_GLOBAL_JSONL means Tier 2 wasn't
-// migrated; presence of LEGACY_GLOBAL_CURSOR means Tier 2/3 cursor exists.
+// Legacy detection: presence of _legacyJsonl() means Tier 2 wasn't
+// migrated; presence of _legacyCursor() means Tier 2/3 cursor exists.
 // Both get processed if found, then renamed to .bak.
 function migrateLegacyIfNeeded(quiet) {
   ensureKnowledgeDir();
@@ -452,14 +460,14 @@ function migrateLegacyIfNeeded(quiet) {
   // runs (e.g. two indexers triggered by simultaneous edits in different
   // tmux panes) could both migrate, doubling entries. Guard with a single
   // global migration lock — first run does the work, others skip.
-  const migrationLock = path.join(KNOWLEDGE_DIR, '.migration.lock');
+  const migrationLock = path.join(_knowledgeDir(), '.migration.lock');
   if (!acquireMigrationLock(migrationLock)) return;
 
   let migrated = 0;
 
   // Tier 2 global jsonl → split into per-slug shards
-  if (fs.existsSync(LEGACY_GLOBAL_JSONL)) {
-    const content = readSafe(LEGACY_GLOBAL_JSONL);
+  if (fs.existsSync(_legacyJsonl())) {
+    const content = readSafe(_legacyJsonl());
     let allShardsMigrated = true;  // Tier 5.2 (Codex): track partial failure
     if (content) {
       const byProject = {};
@@ -497,23 +505,23 @@ function migrateLegacyIfNeeded(quiet) {
     }
     // Only rename legacy file when EVERY shard migrated successfully.
     if (allShardsMigrated) {
-      fs.renameSync(LEGACY_GLOBAL_JSONL, LEGACY_GLOBAL_JSONL + '.bak');
+      fs.renameSync(_legacyJsonl(), _legacyJsonl() + '.bak');
     } else if (!quiet) {
-      process.stderr.write(`vanta-index: legacy migration partial (some shards locked); leaving ${LEGACY_GLOBAL_JSONL} for next run\n`);
+      process.stderr.write(`vanta-index: legacy migration partial (some shards locked); leaving ${_legacyJsonl()} for next run\n`);
     }
   }
 
   // Tier 3 __unknown_project__ shard → re-shard by raw slug if any entries
   // can be salvaged. Most can't (they didn't carry the original project),
   // so we drop the shard and let next --full re-extract.
-  const unknownShard = path.join(KNOWLEDGE_DIR, '__unknown_project__.jsonl');
+  const unknownShard = path.join(_knowledgeDir(), '__unknown_project__.jsonl');
   if (fs.existsSync(unknownShard)) {
     fs.renameSync(unknownShard, unknownShard + '.bak');
   }
 
   // Tier 3 global cursor → drop. Per-project cursors get rebuilt on next run.
-  if (fs.existsSync(LEGACY_GLOBAL_CURSOR)) {
-    const content = readSafe(LEGACY_GLOBAL_CURSOR);
+  if (fs.existsSync(_legacyCursor())) {
+    const content = readSafe(_legacyCursor());
     if (content) {
       try {
         const j = JSON.parse(content);
@@ -530,7 +538,7 @@ function migrateLegacyIfNeeded(quiet) {
         }
       } catch {}
     }
-    fs.renameSync(LEGACY_GLOBAL_CURSOR, LEGACY_GLOBAL_CURSOR + '.bak');
+    fs.renameSync(_legacyCursor(), _legacyCursor() + '.bak');
   }
 
   if (!quiet && migrated > 0) {

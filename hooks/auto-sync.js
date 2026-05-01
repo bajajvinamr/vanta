@@ -140,23 +140,32 @@ process.stdin.on('end', () => {
     // Rotation: if file > 5MB, fold to last-occurrence-per-session before
     // appending. This is a per-Stop-hook event (not per tool call), so
     // the fold cost is negligible vs hook lifetime.
+    // R5 P2 fix — earlier rotation read+folded then renamed tmp→file. A
+    // concurrent appendFileSync between the read and the rename would be
+    // lost. New: rename live file to .bak when oversized, then write the
+    // folded snapshot as the fresh file. POSIX rename is atomic; any
+    // concurrent appendFileSync either lands in the soon-to-be-.bak file
+    // (preserved) or the freshly-recreated file. No clobber window.
     const appendJsonl = (file, newEntry) => {
       try {
         if (fs.existsSync(file)) {
           const st = fs.statSync(file);
           if (st.size > MAX_BYTES) {
-            // Fold: keep latest entry per session_id, drop older duplicates.
-            const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-            const latest = new Map();
-            for (const l of lines) {
-              try {
-                const e = JSON.parse(l);
-                if (e.session_id) latest.set(e.session_id, l);
-              } catch { /* drop unparsable */ }
-            }
-            const tmp = file + '.compact';
-            fs.writeFileSync(tmp, [...latest.values()].join('\n') + '\n');
-            fs.renameSync(tmp, file);
+            // Capture the file under .bak first — atomic. Then fold from .bak
+            // and write the snapshot fresh. Concurrent writers see fresh file.
+            const bak = file + '.bak';
+            fs.renameSync(file, bak);
+            try {
+              const lines = fs.readFileSync(bak, 'utf8').split('\n').filter(Boolean);
+              const latest = new Map();
+              for (const l of lines) {
+                try {
+                  const e = JSON.parse(l);
+                  if (e.session_id) latest.set(e.session_id, l);
+                } catch {}
+              }
+              fs.writeFileSync(file, [...latest.values()].join('\n') + '\n');
+            } catch { /* fold failure: leave fresh empty, .bak preserved */ }
           }
         }
       } catch { /* never block on rotation */ }

@@ -39,20 +39,20 @@
     },
     {
       "event": "PreToolUse",
+      "matcher": "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Agent|Task",
+      "file": "tool-observer.js",
+      "runtime": "node",
+      "timeout": 3,
+      "purpose": "Always-on: shape-only telemetry to interactions.jsonl, no inject no block. R5 P2 — registered BEFORE git-guardrails so blocked Bash commands still get telemetry.",
+      "added": "2026-05-01"
+    },
+    {
+      "event": "PreToolUse",
       "matcher": "Bash",
       "file": "git-guardrails.js",
       "runtime": "node",
       "timeout": 5,
       "purpose": "Hard-block + advisory on destructive git/sql/rm commands"
-    },
-    {
-      "event": "PreToolUse",
-      "matcher": "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Agent|Task",
-      "file": "tool-observer.js",
-      "runtime": "node",
-      "timeout": 3,
-      "purpose": "Always-on: shape-only telemetry to interactions.jsonl, no inject no block",
-      "added": "2026-05-01"
     },
     {
       "event": "PostToolUse",
