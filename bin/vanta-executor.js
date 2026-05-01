@@ -231,6 +231,29 @@ function decide(input = {}) {
     }
   }
 
+  // 2.5 Semantic product-decision detector (v3.8.0 council P2 fix).
+  //     Originally ran AFTER the rewriter, which meant a prompt like
+  //     "should we pivot pricing? also fix lint" matched the fix-bug
+  //     rule first and BYPASSED the T3 ASK gate. Gemini caught this.
+  //     Now runs BEFORE the rewriter so semantic strategic phrasing
+  //     terminates regardless of trailing tactical verbs.
+  {
+    const sem = _semanticProductDecision(ctx.prompt);
+    if (sem) {
+      return _make(ctx, ts, decision_id, {
+        tier: 'T3',
+        decision: 'ask',
+        source: SOURCES.FLOOR,
+        why: `semantic-product:${sem.why}`,
+        floor: { id: sem.id, why: sem.why, kind: 'semantic' },
+        skill_route: '/council',
+        score: { reversibility: 2, blast_radius: 3, product_authority: true },
+        risk: 8,
+        confidence: 'medium',
+      });
+    }
+  }
+
   // 3. Rewriter — routing + chain. ASK mode is terminal at T3.
   const rw = rewriter();
   let routing = {
@@ -311,25 +334,7 @@ function decide(input = {}) {
     }
   }
 
-  // 3a. Semantic product-decision detector — runs after the rewriter
-  //     so well-known patterns (taxonomy-rename, ship rule) win. Catches
-  //     framing-style strategic prompts that the regex floor misses.
-  if (routing.mode !== 'rule' && routing.mode !== 'llm') {
-    const sem = _semanticProductDecision(ctx.prompt);
-    if (sem) {
-      return _make(ctx, ts, decision_id, {
-        tier: 'T3',
-        decision: 'ask',
-        source: SOURCES.FLOOR,
-        why: `semantic-product:${sem.why}`,
-        floor: { id: sem.id, why: sem.why, kind: 'semantic' },
-        skill_route: '/council',
-        score: { reversibility: 2, blast_radius: 3, product_authority: true },
-        risk: 8,
-        confidence: 'medium',
-      });
-    }
-  }
+  // (Semantic product-decision detector moved to step 2.5 — see above.)
 
   // 4. Risk classifier — independent score over prompt+file+command.
   const rc = riskClassifier();

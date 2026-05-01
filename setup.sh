@@ -75,7 +75,7 @@ else
     DEPLOY_RULES=$(grep -c '^  - id:' "$HOME/.vanta/policy/safety-floor.yaml")
     echo "  ⚠ safety-floor.yaml: repo v$REPO_VER ($REPO_RULES rules) > deployed v$DEPLOY_VER ($DEPLOY_RULES rules)"
     echo "    To upgrade (preserves your edits via .bak): VANTA_FORCE_FLOOR_UPGRADE=1 ./setup.sh"
-    if [ "$VANTA_FORCE_FLOOR_UPGRADE" = "1" ]; then
+    if [ "${VANTA_FORCE_FLOOR_UPGRADE:-0}" = "1" ]; then
       cp "$HOME/.vanta/policy/safety-floor.yaml" "$HOME/.vanta/policy/safety-floor.yaml.bak.$(date +%s)"
       cp "$REPO_DIR/policy/safety-floor.yaml" "$HOME/.vanta/policy/safety-floor.yaml"
       echo "  ✓ safety-floor.yaml upgraded v$DEPLOY_VER → v$REPO_VER (backup saved)"

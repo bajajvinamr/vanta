@@ -72,6 +72,23 @@ process.stdin.on('end', () => {
 
   if (!prompt.trim()) return _empty();
 
+  // v3.8.0 council P2 fix — derive project slug from cwd so action-log
+  // entries from this hook count toward project-scoped trust metrics.
+  // Without this, `vanta-trust-metrics.compute({project})` filters out
+  // every rewrite event and inline_ready never earns a project signal.
+  let project = null;
+  try {
+    const projectsPath = _resolveBin('vanta-projects.js');
+    if (projectsPath) {
+      const { canonProject } = require(projectsPath);
+      project = canonProject ? canonProject(cwd) : path.basename(cwd);
+    } else {
+      project = path.basename(cwd);
+    }
+  } catch (_) {
+    project = path.basename(cwd);
+  }
+
   // Resolve executor bin and call it directly (in-process).
   const executorPath = _resolveBin('vanta-executor.js');
   if (!executorPath) return _empty();
@@ -99,7 +116,7 @@ process.stdin.on('end', () => {
       ? decision.floor.why
       : (decision.why || decision.intent || 'product decision');
     const ask = `[Vanta] ${route} recommended · ${decision.tier} ASK · ${why}`;
-    _logAction({ session_id: sessionId, cwd, action: 'rewrite-ask',
+    _logAction({ session_id: sessionId, cwd, project, action: 'rewrite-ask',
       decision: 'ask', why: decision.why || ('ask:' + (decision.intent || decision.source)),
       subject: prompt.slice(0, 80), tier: decision.tier });
     process.stdout.write(JSON.stringify({
@@ -126,7 +143,7 @@ process.stdin.on('end', () => {
     const tag = decision.inline_ready ? '[Vanta INLINE]' : '[Vanta]';
     const header = `${tag} ${decision.skill_route || '/' + (decision.intent || 'review')} · ${decision.intent || 'unknown'}`;
     const additionalContext = [header, decision.rewritten].join('\n');
-    _logAction({ session_id: sessionId, cwd, action: 'rewrite',
+    _logAction({ session_id: sessionId, cwd, project, action: 'rewrite',
       decision: 'auto', why: decision.why || ('intent=' + decision.intent),
       subject: prompt.slice(0, 80), tier: decision.tier,
       undo_hint: { kind: 'rewriter-shadow', payload: {
@@ -144,7 +161,7 @@ process.stdin.on('end', () => {
   }
 
   // ── 3. Auto / passthrough — log silently, inject nothing.
-  _logAction({ session_id: sessionId, cwd, action: 'rewrite-skip',
+  _logAction({ session_id: sessionId, cwd, project, action: 'rewrite-skip',
     decision: decision.decision, why: decision.why || decision.intent || 'passthrough',
     subject: prompt.slice(0, 80), tier: decision.tier });
   return _empty();

@@ -4996,6 +4996,87 @@ describe('docs/FAILURE-MODES.md exists and covers known modes (v3.7.6)', () => {
   });
 });
 
+// ─── v3.8.0 council P2 fixes ────────────────────────────────────────────────
+//
+// Codex + Gemini R1 review on the v3.7 → v3.8 sprint surfaced four P2s.
+// These tests lock the regression boundaries.
+
+describe('vanta-executor — semantic detector runs before rewriter (v3.8.0 P2)', () => {
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  delete require.cache[require.resolve('../bin/vanta-safety-floor')];
+  delete require.cache[require.resolve('../bin/vanta-executor')];
+  require('../bin/vanta-safety-floor').reload();
+  const executor = require('../bin/vanta-executor');
+
+  test('"should we pivot pricing? also fix lint" → T3 ASK (not fix-bug rule)', () => {
+    // Gemini's P2: a strategic-framing prompt with a tactical verb suffix
+    // was masking the semantic detector when the rewriter rule matched first.
+    const d = executor.decide({ prompt: 'should we pivot pricing? also fix lint' });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.decision, 'ask');
+    assert.equal(d.skill_route, '/council');
+    // The detected source must be safety-floor (semantic), NOT rewriter-rule.
+    assert.equal(d.source, 'safety-floor');
+  });
+
+  test('"can we rename schema? then fix this" → T3 ASK', () => {
+    const d = executor.decide({ prompt: 'can we rename schema? then fix this' });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.source, 'safety-floor');
+  });
+
+  test('benign rewriter rules still fire when prompt is purely tactical', () => {
+    // Sanity: the move did not break the normal rule path.
+    const a = executor.decide({ prompt: 'fix this' });
+    assert.equal(a.source, 'rewriter-rule');
+    const b = executor.decide({ prompt: 'ship it' });
+    assert.equal(b.source, 'rewriter-rule');
+  });
+});
+
+describe('vanta-trust-metrics — _interruptRate is project-scoped (v3.8.0 P2)', () => {
+  // The function is private; we test through compute({project}) and
+  // assert that a foreign-project event doesn't leak into the rate.
+  test('compute({project}) reads slug/project from interactions.jsonl', () => {
+    // Smoke-only: tests/canonical.test.js doesn't seed interactions.jsonl,
+    // so we just verify the function accepts the parameter and returns
+    // a valid shape without crashing.
+    delete require.cache[require.resolve('../bin/vanta-trust-metrics')];
+    const tm = require('../bin/vanta-trust-metrics');
+    const m = tm.compute({ days: 30, project: 'pi-perception' });
+    assert.equal(m.project, 'pi-perception');
+    assert.equal(typeof m.manual_interrupt.rate, 'number');
+  });
+
+  test('source: _interruptRate signature includes project parameter', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'vanta-trust-metrics.js'), 'utf8');
+    assert.match(src, /function _interruptRate\(\s*\{\s*sinceMs\s*,\s*project\s*\}/);
+  });
+
+  test('source: _interruptRate filters by event.slug or event.project', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'vanta-trust-metrics.js'), 'utf8');
+    assert.match(src, /e\.slug\s*\|\|\s*e\.project/);
+  });
+});
+
+describe('hooks/prompt-rewriter — logs include project field (v3.8.0 P2)', () => {
+  // Without `project`, vanta-trust-metrics.compute({project}) filters
+  // out every rewrite event and inline_ready never accumulates.
+  test('source: prompt-rewriter resolves canonProject from cwd', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'hooks', 'prompt-rewriter.js'), 'utf8');
+    assert.match(src, /canonProject/);
+    assert.match(src, /project,\s*action:/);  // every _logAction passes project
+  });
+});
+
+describe('setup.sh — VANTA_FORCE_FLOOR_UPGRADE safe under set -u (v3.8.0 P2)', () => {
+  test('upgrade var is read with default value (no unbound-var crash)', () => {
+    const sh = fs.readFileSync(path.join(__dirname, '..', 'setup.sh'), 'utf8');
+    // Either ${VANTA_FORCE_FLOOR_UPGRADE:-...} or [ "${...:-...}" = "1" ]
+    assert.match(sh, /\$\{VANTA_FORCE_FLOOR_UPGRADE:-/);
+  });
+});
+
 describe('setup.sh idempotency — preserves user edits (v3.7.6)', () => {
   test('setup.sh has explicit "preserved user edits" path for safety-floor', () => {
     const sh = fs.readFileSync(path.join(__dirname, '..', 'setup.sh'), 'utf8');

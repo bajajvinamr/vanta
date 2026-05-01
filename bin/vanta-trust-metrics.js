@@ -85,7 +85,12 @@ function _undoWithin2m(entries) {
 // manual_interrupt_rate: pct of distinct sessions where the user issued
 // an interrupt-style prompt at any point. Reads interactions.jsonl
 // (UserPromptSubmit shape captured by tool-observer).
-function _interruptRate({ sinceMs }) {
+//
+// v3.8.0 council P2 fix — accepts a `project` filter so that interrupt
+// rate is project-scoped too. Without this, a noisy repo poisons the
+// `manual_interrupt` metric for every other repo, breaking the v3.7.5
+// "project-scoped trust" promise.
+function _interruptRate({ sinceMs, project }) {
   const file = _interactionsFile();
   if (!fs.existsSync(file)) return { rate: 0, n: 0, interrupted: 0 };
   const merged = readMergedJsonl(file);
@@ -96,6 +101,13 @@ function _interruptRate({ sinceMs }) {
     let e; try { e = JSON.parse(line); } catch { continue; }
     if (sinceMs && Date.parse(e.ts) < sinceMs) continue;
     if (!e.session_id) continue;
+    // Project filter: tool-observer writes `slug` (canonical project
+    // name) and/or `project` to interactions.jsonl. Skip events from
+    // other projects when the caller asked for a specific scope.
+    if (project) {
+      const eventProject = e.slug || e.project || null;
+      if (eventProject && eventProject !== project) continue;
+    }
     sessions.add(e.session_id);
     // Look for interrupt markers in the captured prompt text shape.
     // tool-observer stores `event` and `args.prompt` where applicable.
@@ -177,7 +189,7 @@ function compute({ sinceMs, days, project, min_sample } = {}) {
   if (!sinceMs && days) sinceMs = Date.now() - days * ONE_DAY_MS;
   const entries = read({ sinceMs, project });
   const undoWithin2m = _undoWithin2m(entries);
-  const manualInterrupt = _interruptRate({ sinceMs });
+  const manualInterrupt = _interruptRate({ sinceMs, project });
   const chainSuccess = _chainSuccess({ sinceMs, project });
   const spanDays = entries.length > 0
     ? Math.max(1, Math.round((Date.now() - Date.parse(entries[0].ts)) / ONE_DAY_MS))
