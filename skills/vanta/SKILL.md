@@ -67,7 +67,17 @@ First, silently check the sync queue:
 ```bash
 _QUEUE=~/.vanta/sync-queue.jsonl
 if [ -f "$_QUEUE" ]; then
-  _UNSYNCED=$(grep -c '"synced":false' "$_QUEUE" 2>/dev/null || echo 0)
+  # sync-queue is append-only; dedup by session_id (latest entry wins).
+  _UNSYNCED=$(python3 -c "
+import json,os
+latest={}
+for l in open(os.path.expanduser('~/.vanta/sync-queue.jsonl')):
+  try:
+    e=json.loads(l); sid=e.get('session_id')
+    if sid: latest[sid]=(e.get('synced') is not True)
+  except: pass
+print(sum(1 for v in latest.values() if v))
+" 2>/dev/null || echo 0)
   [ "$_UNSYNCED" -gt 0 ] && echo "UNSYNCED_SESSIONS: $_UNSYNCED"
 fi
 ```

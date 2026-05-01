@@ -946,6 +946,35 @@ describe('vanta-runtime-state — per-session cooldown brain', () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
+  test('_foldJournal memoizes by mtime (Codex/Gemini R4 P1)', () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rs-'));
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    const m = fresh();
+
+    m.bump('memo', 'tool_calls');
+    m._clearFoldCache();
+    const a = m._foldJournal('memo');
+    const b = m._foldJournal('memo');
+    // Same mtime → cache hit → identical reference.
+    assert.strictEqual(a, b, 'second fold with unchanged mtime must be a cache hit');
+
+    // Append a new entry — mtime changes, cache busts. Spin-loop on mtime
+    // to avoid timing flake on fast filesystems where the second
+    // appendFileSync collides with the same mtimeMs as the first.
+    const file = path.join(tmp, 'runtime', 'memo.jsonl');
+    const start = fs.statSync(file).mtimeMs;
+    let attempts = 0;
+    while (fs.statSync(file).mtimeMs === start && attempts++ < 20) {
+      m.bump('memo', 'tool_calls');
+    }
+    const c = m._foldJournal('memo');
+    assert.notStrictEqual(a, c, 'fold after append must NOT be the cached reference');
+    assert.equal(c.counters.tool_calls >= 2, true);
+
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
   test('compact skips live (non-quiescent) journals — Codex R3 P1', () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rs-'));
     process.env.VANTA_DIR_OVERRIDE = tmp;

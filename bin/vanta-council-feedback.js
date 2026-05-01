@@ -42,6 +42,11 @@ const VANTA_DIR = path.join(os.homedir(), '.vanta');
 const FEEDBACK_FILE = path.join(VANTA_DIR, 'council-feedback.jsonl');
 const RESOLVED_FILE = path.join(VANTA_DIR, 'council-feedback-resolved.jsonl');
 
+// R4 P2 — both feedback files were unbounded. 5MB cap, keep the recent half.
+// Council feedback rows are typically ~500B; 5MB ≈ 10K findings, multiple
+// years of history. Resolution rows are smaller still.
+const MAX_BYTES = 5_000_000;
+
 function _ensureDir() {
   const dir = _vantaDir();
   if (!fs.existsSync(dir)) {
@@ -49,8 +54,19 @@ function _ensureDir() {
   }
 }
 
+function _rotateIfLarge(file) {
+  try {
+    const st = fs.statSync(file);
+    if (st.size <= MAX_BYTES) return;
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const kept = lines.slice(Math.floor(lines.length / 2));
+    fs.writeFileSync(file, kept.join('\n') + '\n');
+  } catch {}
+}
+
 function _appendLine(file, obj) {
   _ensureDir();
+  _rotateIfLarge(file);
   try { fs.appendFileSync(file, JSON.stringify(obj) + '\n'); } catch (e) {
     process.stderr.write(`failed to append to ${file}: ${e.message}\n`);
   }

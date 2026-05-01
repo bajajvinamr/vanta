@@ -59,6 +59,20 @@ function _appendLine(sessionId, obj) {
 //
 // Reduce the JSONL journal into a single state object. Walks forward;
 // snapshots reset the accumulator. Last-write-wins per (op, key/field).
+//
+// Codex R4 / Gemini R4 P1 fix — memoize by file mtime. tool-observer.js
+// calls getState() on every PreToolUse and PostToolUse event. Without
+// memoization, a session with N tool events did O(N) folds, with each
+// fold scanning the full journal — quadratic over the session. With
+// memoization, a fold runs once per (sessionId, mtime); subsequent
+// reads are O(1) until the next append updates the mtime.
+//
+// Cache scope: per-process. Each hook is its own short-lived node
+// process, so the cache only helps when multiple getState() calls
+// happen inside the same hook invocation. For long-running test/audit
+// processes (e.g. `audit() walking many sessions`) this turns N²
+// behavior into linear.
+const _foldCache = new Map();
 
 function _foldJournal(sessionId) {
   const file = _fileFor(sessionId);
@@ -72,6 +86,11 @@ function _foldJournal(sessionId) {
   };
 
   if (!fs.existsSync(file)) return acc;
+  let mtime = 0;
+  try { mtime = fs.statSync(file).mtimeMs; } catch { return acc; }
+  const cached = _foldCache.get(sessionId);
+  if (cached && cached.mtime === mtime) return cached.acc;
+
   let lines;
   try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean); }
   catch { return acc; }
@@ -100,8 +119,14 @@ function _foldJournal(sessionId) {
         break;
     }
   }
+  _foldCache.set(sessionId, { mtime, acc });
+  // Bound the memo at 64 entries to avoid retaining state for thousands
+  // of past sessions in a long-running test process.
+  if (_foldCache.size > 64) _foldCache.delete(_foldCache.keys().next().value);
   return acc;
 }
+
+function _clearFoldCache() { _foldCache.clear(); }
 
 // Compaction: rewrite the journal as a single snapshot line.
 //
@@ -211,6 +236,7 @@ function resetSession(sessionId) {
   if (!sessionId) return;
   const f = _fileFor(sessionId);
   try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
+  _foldCache.delete(sessionId);
 }
 
 function reapStale({ days = 7, compactRest = true } = {}) {
@@ -278,5 +304,5 @@ module.exports = {
   getState, shouldInject, markInjected, bump, setPhase, resetSession, reapStale,
   COOLDOWNS,
   // Internal — exported for tests:
-  _foldJournal, _compact, _fileFor,
+  _foldJournal, _compact, _fileFor, _clearFoldCache,
 };

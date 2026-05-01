@@ -16,14 +16,22 @@ Lifecycle harness for Claude Code. Composes three frameworks into three commands
 
 ## Hooks
 
-Hooks fire automatically:
-- `council-advisory.js` — PreToolUse advisory on auth/payment/migration/security file edits
+Hooks fire automatically. Single source of truth: `hooks/manifest.json` —
+`setup.sh`, `hooks/hooks.json`, and the syntax-check test all read from it.
+
+**Always-on layer (v3.6, fires on every prompt + every tool call):**
+- `session-start` — SessionStart: injects 4-line project brief into the first response
+- `prompt-context.js` — UserPromptSubmit: classifies prompt + injects 3-line factual brief, on-cooldown
+- `tool-observer.js` — Pre+PostToolUse on Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Agent|Task: shape-only telemetry to `~/.vanta/interactions.jsonl`. Never blocks, never injects.
+
+**Targeted hooks:**
+- `council-advisory.js` — PreToolUse:Write|Edit advisory on auth/payment/migration/security file edits
 - `git-guardrails.js` — PreToolUse:Bash hard-block + advisory tier for destructive git/sql/rm commands
-- `test-failure-advisor.js` — PostToolUse hard-stop on failing tests/build
-- `stack-file-nudge.js` — PostToolUse follow-up actions on config file changes
-- `code-index-watch.js` — PostToolUse incremental refresh of per-project knowledge shards
-- `plan-watcher.js` — PostToolUse Shadow Council flag on sensitive plan writes
-- `auto-sync.js` — Stop hook: sync-queue + episodic memory dedup
+- `test-failure-advisor.js` — PostToolUse:Bash hard-stop on failing tests/build
+- `stack-file-nudge.js` — PostToolUse:Write|Edit follow-up actions on config file changes
+- `code-index-watch.js` — PostToolUse:Write|Edit|NotebookEdit incremental refresh of per-project knowledge shards
+- `plan-watcher.js` — PostToolUse:Write|Edit Shadow Council flag on sensitive plan writes
+- `auto-sync.js` — Stop: sync-queue (append-only, deduped by session_id on read) + episodic memory
 
 ## Surface Impact Discipline
 

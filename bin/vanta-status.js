@@ -114,9 +114,20 @@ function readQueues() {
     let unsynced = null;
     let stagingCount = null;
     if (q.special === 'unsynced') {
+      // Codex R4 P2 fix — sync-queue is now append-only; multiple Stop hook
+      // fires for the same session produce duplicate entries. Count
+      // unsynced by latest-per-session, not raw line match.
       try {
         const raw = fs.readFileSync(q.file, 'utf8');
-        unsynced = (raw.match(/"synced"\s*:\s*false/g) || []).length;
+        const latest = new Map();
+        for (const l of raw.split('\n')) {
+          if (!l) continue;
+          try {
+            const e = JSON.parse(l);
+            if (e.session_id) latest.set(e.session_id, e.synced !== true);
+          } catch {}
+        }
+        unsynced = [...latest.values()].filter(Boolean).length;
       } catch {}
     } else if (q.special === 'staging') {
       try {
