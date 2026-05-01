@@ -89,6 +89,15 @@
       "purpose": "Shadow Council flag on sensitive plan content"
     },
     {
+      "event": "PreToolUse",
+      "matcher": "Write|Edit",
+      "file": "phase-gate.js",
+      "runtime": "node",
+      "timeout": 3,
+      "purpose": "Advisory only: surfaces .planning/ context when feature code is being written without a phase plan",
+      "added": "2026-05-02"
+    },
+    {
       "event": "PostToolUse",
       "matcher": "Write|Edit|NotebookEdit",
       "file": "code-index-watch.js",

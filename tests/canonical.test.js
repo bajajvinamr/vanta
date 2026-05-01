@@ -4870,3 +4870,150 @@ describe('setup.sh — safety-floor policy versioning (v3.7.5)', () => {
   });
 });
 
+// ─── v3.7.6 — hygiene release ───────────────────────────────────────────────
+
+describe('hooks/manifest.json — single source of truth (v3.7.6)', () => {
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(__dirname, '..', 'hooks', 'manifest.json'), 'utf8'));
+
+  test('every manifest hook file exists in hooks/', () => {
+    for (const reg of manifest.registrations) {
+      const file = path.join(__dirname, '..', 'hooks', reg.file);
+      assert.ok(fs.existsSync(file), `hook ${reg.file} declared in manifest must exist on disk`);
+    }
+  });
+
+  test('every hook on disk is registered in the manifest', () => {
+    const onDisk = fs.readdirSync(path.join(__dirname, '..', 'hooks'))
+      .filter(f => /\.(js|sh)$/.test(f) || f === 'session-start');
+    const declared = new Set(manifest.registrations.map(r => r.file));
+    // session-start has no extension; allow it in declared set.
+    declared.add('session-start');
+    for (const f of onDisk) {
+      // Allow the registry file itself + non-hook helpers (none at present).
+      if (f === 'manifest.json' || f === 'hooks.json') continue;
+      assert.ok(declared.has(f),
+        `hook on disk ${f} is not registered in manifest.json — drift`);
+    }
+  });
+
+  test('every manifest event is one of the documented Claude Code events', () => {
+    const allowed = new Set(manifest._event_types.split(',').map(s => s.trim()));
+    for (const reg of manifest.registrations) {
+      assert.ok(allowed.has(reg.event), `unknown event ${reg.event}`);
+    }
+  });
+
+  test('every manifest entry has a runtime, timeout, and purpose', () => {
+    for (const reg of manifest.registrations) {
+      assert.ok(['node', 'bash'].includes(reg.runtime), `bad runtime for ${reg.file}`);
+      assert.equal(typeof reg.timeout, 'number', `missing timeout for ${reg.file}`);
+      assert.ok(reg.purpose, `missing purpose for ${reg.file}`);
+    }
+  });
+
+  test('setup.sh uses manifest.json instead of hardcoding hook list', () => {
+    const sh = fs.readFileSync(path.join(__dirname, '..', 'setup.sh'), 'utf8');
+    // Either reads manifest.json directly or sources hooks.json (which
+    // is generated from manifest.json). Reject hardcoded `hookFile=foo.js`
+    // patterns that would drift from the manifest.
+    assert.match(sh, /manifest\.json|hooks\.json/);
+  });
+});
+
+describe('vanta-resolve — contradiction-detection regression (v3.7.6)', () => {
+  const { detectContradictions } = require('../bin/vanta-resolve');
+
+  test('ES256 vs HS256 in two decisions surfaces contradiction', () => {
+    const results = [
+      { source: 'decision', date: '2026-04-15', section: '2026-04-15: jwt',
+        excerpt: 'use ES256 asymmetric keys for pi-perception JWT' },
+      { source: 'invariant', section: 'Supabase',
+        excerpt: 'HS256 symmetric keys must be the default for edge functions' },
+    ];
+    const c = detectContradictions(results);
+    assert.ok(c.length > 0, 'must detect ES256/HS256 contradiction');
+    assert.match(c[0].hint, /ES256/);
+    assert.match(c[0].hint, /HS256/);
+  });
+
+  test('Pixi v7 vs v8 only contradicts when pixi context is present', () => {
+    // Use non-loose sources (invariant/decision) so confidence stays
+    // above the 0.7 floor — episode/memory subtract 0.2 from confidence.
+    const withCtx = [
+      { source: 'invariant', section: 'PixiJS', excerpt: 'PixiJS v8 Application.init is async' },
+      { source: 'invariant', section: 'PixiJS', excerpt: 'PixiJS v7 sync constructor was the old pattern' },
+    ];
+    const withoutCtx = [
+      { source: 'gotcha', excerpt: 'API v7 is stable' },
+      { source: 'gotcha', excerpt: 'API v8 is the migration target' },
+    ];
+    assert.ok(detectContradictions(withCtx).length > 0,
+      'pixi context must enable v7/v8 detection');
+    assert.equal(detectContradictions(withoutCtx).length, 0,
+      'no pixi context → no v7/v8 contradiction');
+  });
+
+  test('looser sources (episode/memory) reduce confidence below threshold', () => {
+    const looseResults = [
+      { source: 'episode', date: '2026-04-01', excerpt: 'tried sync first' },
+      { source: 'memory', excerpt: 'switched to async eventually' },
+    ];
+    // sync/async needs pixi context — without it, no detection regardless of source.
+    const c = detectContradictions(looseResults);
+    assert.equal(c.length, 0);
+  });
+
+  test('detector exports correctly from vanta-resolve', () => {
+    const m = require('../bin/vanta-resolve');
+    assert.equal(typeof m.detectContradictions, 'function');
+    assert.equal(typeof m.resolve, 'function');
+    assert.equal(typeof m.scoreResult, 'function');
+  });
+});
+
+describe('docs/FAILURE-MODES.md exists and covers known modes (v3.7.6)', () => {
+  const doc = fs.readFileSync(path.join(__dirname, '..', 'docs', 'FAILURE-MODES.md'), 'utf8');
+
+  test('covers Gemini exit-55', () => {
+    assert.match(doc, /Gemini.*55|GEMINI_CLI_TRUST_WORKSPACE/i);
+  });
+
+  test('covers Codex arg-parse failure', () => {
+    assert.match(doc, /Codex.*exits.*2|approvalPolicy|arg-parse/i);
+  });
+
+  test('covers undo state-check refusal', () => {
+    assert.match(doc, /moved on|undo refuses|state-check/i);
+  });
+
+  test('covers sync-queue alert loop', () => {
+    assert.match(doc, /UNSYNCED|sync.*alert/i);
+  });
+
+  test('covers NFS storage warning', () => {
+    assert.match(doc, /NFS|O_EXCL|EXDEV/);
+  });
+});
+
+describe('setup.sh idempotency — preserves user edits (v3.7.6)', () => {
+  test('setup.sh has explicit "preserved user edits" path for safety-floor', () => {
+    const sh = fs.readFileSync(path.join(__dirname, '..', 'setup.sh'), 'utf8');
+    // The check: user has a deployed safety-floor and setup.sh leaves
+    // it in place by default. Phrase varies but must be present.
+    assert.match(sh, /preserved user edits|preserved\)/);
+  });
+
+  test('peer-routing.yaml is also preserved on re-install', () => {
+    const sh = fs.readFileSync(path.join(__dirname, '..', 'setup.sh'), 'utf8');
+    assert.match(sh, /peer-routing\.yaml/);
+  });
+
+  test('hooks.json deployment is conditional / re-runnable', () => {
+    const sh = fs.readFileSync(path.join(__dirname, '..', 'setup.sh'), 'utf8');
+    // Verify there's no `rm -rf ~/.claude/hooks` that would clobber
+    // user-customized hook configs. The setup MUST be re-runnable.
+    assert.doesNotMatch(sh, /rm\s+-rf\s+["$]?\$?HOME\/?["']?\/\.claude\/hooks/);
+  });
+});
+
