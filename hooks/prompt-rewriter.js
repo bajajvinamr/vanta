@@ -7,6 +7,11 @@
 //   stdout: { hookSpecificOutput: { hookEventName: 'UserPromptSubmit',
 //             additionalContext: '<shadow rewrite>' } }
 //
+// v3.7.2: this hook is a thin adapter around vanta-executor.decide().
+// The executor composes kill-switch + safety-floor + rewriter +
+// risk-classifier into a single Decision; the hook's only job is to
+// translate that Decision into the 4-line shadow injection contract.
+//
 // Why shadow first: Claude Code hooks can INJECT context but cannot
 // REPLACE the user's prompt. Inline rewriting would require building
 // a wrapper command (e.g., `/v <prompt>`); shadow mode works through
@@ -16,8 +21,8 @@
 // Records the rewrite decision into action-log so trust-metrics can
 // compute downstream regret/interrupt rates.
 //
-// Latency budget: 5s (Claude Code's per-hook budget). Rule-based path
-// is ~10ms; LLM fallback (when wired) MUST cap at 2s with cancellation.
+// Latency budget: Decision.budget_ms (5s..300s). Rule path is ~10ms;
+// LLM fallback (when wired) MUST cap at min(budget_ms, 2s) and cancel.
 
 'use strict';
 const fs = require('fs');
@@ -67,53 +72,36 @@ process.stdin.on('end', () => {
 
   if (!prompt.trim()) return _empty();
 
-  // Resolve rewriter bin and call it directly (in-process).
-  const rewriterPath = _resolveBin('vanta-rewriter.js');
-  if (!rewriterPath) return _empty();
+  // Resolve executor bin and call it directly (in-process).
+  const executorPath = _resolveBin('vanta-executor.js');
+  if (!executorPath) return _empty();
 
-  let rewriter;
-  try { rewriter = require(rewriterPath); } catch (err) {
+  let executor;
+  try { executor = require(executorPath); } catch (err) {
     vlog().error('prompt-rewriter.load', err.message || String(err));
     return _empty();
   }
 
-  let result;
+  let decision;
   try {
-    result = rewriter.rewrite(prompt, { sessionId, cwd });
+    decision = executor.decide({ prompt, session_id: sessionId, cwd });
   } catch (err) {
-    vlog().error('prompt-rewriter.rewrite', err.message || String(err));
+    vlog().error('prompt-rewriter.decide', err.message || String(err));
     return _empty();
   }
 
-  // Pass-through with safety-floor product-decision: surface the
-  // skill route + ASK marker even though we don't inject a chain.
-  // Other passthrough cases (lookups, chitchat, kill-switch) inject
-  // nothing — keep latency near zero.
-  if (result.mode === 'passthrough') {
-    _logAction({ session_id: sessionId, cwd, action: 'rewrite-skip',
-      decision: 'auto', why: result.why || result.intent || 'passthrough',
-      subject: prompt.slice(0, 80) });
-    if (result.skill_route && result.tier === 'T3') {
-      // Product-decision floor match → 1-line ASK hint.
-      const ask = `[Vanta] ${result.skill_route} recommended · ${result.tier} ASK · ${result.floor_match ? result.floor_match.why || result.floor_match.id : 'product decision'}`;
-      process.stdout.write(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: 'UserPromptSubmit',
-          additionalContext: ask,
-        },
-      }));
-      return process.exit(0);
-    }
-    return _empty();
-  }
-
-  // ASK-mode rule (e.g., taxonomy-rename) — never inject a chain;
-  // surface a single-line "/council recommended · T3 ASK".
-  if (result.mode === 'ask') {
-    const ask = `[Vanta] ${result.skill_route || '/council'} recommended · ${result.tier || 'T3'} ASK · ${result.why || result.intent}`;
+  // ── 1. ASK at T3 (safety-floor or rewriter-ask) — surface a single
+  //       "/<route> recommended · T3 ASK · <why>" hint. Never inject a
+  //       chain — the user must confirm before Vanta does anything.
+  if (decision.decision === 'ask') {
+    const route = decision.skill_route || '/council';
+    const why = decision.floor && decision.floor.why
+      ? decision.floor.why
+      : (decision.why || decision.intent || 'product decision');
+    const ask = `[Vanta] ${route} recommended · ${decision.tier} ASK · ${why}`;
     _logAction({ session_id: sessionId, cwd, action: 'rewrite-ask',
-      decision: 'ask', why: result.why || ('ask:' + result.intent),
-      subject: prompt.slice(0, 80), tier: result.tier || 'T3' });
+      decision: 'ask', why: decision.why || ('ask:' + (decision.intent || decision.source)),
+      subject: prompt.slice(0, 80), tier: decision.tier });
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'UserPromptSubmit',
@@ -123,29 +111,37 @@ process.stdin.on('end', () => {
     return process.exit(0);
   }
 
-  // Rule rewrite — inject 4 lines max:
-  //   [Vanta] /<route> · <intent>
-  //   1. step
-  //   2. step
-  //   3. step
-  // Header carries skill_route + intent so the user knows the suggested
-  // skill flow. v3.7.1 trim: rewriter._formatChain returns ONLY the
-  // numbered steps; the hook owns the single header.
-  const header = `[Vanta] ${result.skill_route || '/' + (result.intent || 'review')} · ${result.intent || 'unknown'}`;
-  const additionalContext = [header, result.rewritten].join('\n');
+  // ── 2. Rewrite (T0/T1/T2 + rewriter rule) — inject the terse 4-line
+  //       shadow:
+  //         [Vanta] /<route> · <intent>
+  //         1. step
+  //         2. step
+  //         3. step
+  if (decision.decision === 'rewrite' && decision.rewritten) {
+    const header = `[Vanta] ${decision.skill_route || '/' + (decision.intent || 'review')} · ${decision.intent || 'unknown'}`;
+    const additionalContext = [header, decision.rewritten].join('\n');
+    _logAction({ session_id: sessionId, cwd, action: 'rewrite',
+      decision: 'auto', why: decision.why || ('intent=' + decision.intent),
+      subject: prompt.slice(0, 80), tier: decision.tier,
+      undo_hint: { kind: 'rewriter-shadow', payload: {
+        decision_id: decision.decision_id,
+        rule_id: decision.rule_id || null,
+        skill_route: decision.skill_route || null,
+      } } });
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext,
+      },
+    }));
+    return process.exit(0);
+  }
 
-  _logAction({ session_id: sessionId, cwd, action: 'rewrite',
-    decision: 'auto', why: result.why || ('intent=' + result.intent),
-    subject: prompt.slice(0, 80), tier: 'T0',
-    undo_hint: { kind: 'rewriter-shadow', payload: { rule_id: result.rule_id || null, skill_route: result.skill_route || null } } });
-
-  process.stdout.write(JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName: 'UserPromptSubmit',
-      additionalContext,
-    },
-  }));
-  process.exit(0);
+  // ── 3. Auto / passthrough — log silently, inject nothing.
+  _logAction({ session_id: sessionId, cwd, action: 'rewrite-skip',
+    decision: decision.decision, why: decision.why || decision.intent || 'passthrough',
+    subject: prompt.slice(0, 80), tier: decision.tier });
+  return _empty();
 });
 
 function _logAction(entry) {

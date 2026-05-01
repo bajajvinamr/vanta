@@ -219,35 +219,36 @@ process.stdin.on('end', () => {
       `COUNCIL ADVISORY: Editing ${trigger.reason} — ${filePath}. ` +
       `If this introduces a new flow (not a small fix), run /council first.`;
 
-    // v3.6.15 — risk classifier integration. The classifier consults
-    // safety-floor first, then 3-axis score, and produces a tier
-    // recommendation (T0/T1/T2/T3) plus a peer pick (codex/gemini/both)
-    // for T2+. Surface the recommendation so Claude sees what tier
-    // would fire if the user invoked /council on this edit.
+    // v3.7.2 — central executor. Replaces the direct
+    // vanta-risk-classifier call with executor.decide(), which composes
+    // kill-switch + safety-floor + rewriter + risk-classifier into a
+    // single Decision. The hook reads tier / decision / peer / floor
+    // off the Decision and surfaces them as advisory text.
     let tierAdvisory = '';
     try {
-      const rcPath = path.join(__dirname, '..', 'bin', 'vanta-risk-classifier.js');
-      const homeRcPath = path.join(process.env.HOME || '', '.claude', 'bin', 'vanta-risk-classifier.js');
-      let rc = null;
-      try { rc = require(homeRcPath); } catch { try { rc = require(rcPath); } catch {} }
-      if (rc) {
-        const verdict = rc.classify({
+      const exPath = path.join(__dirname, '..', 'bin', 'vanta-executor.js');
+      const homeExPath = path.join(process.env.HOME || '', '.claude', 'bin', 'vanta-executor.js');
+      let ex = null;
+      try { ex = require(homeExPath); } catch { try { ex = require(exPath); } catch {} }
+      if (ex) {
+        const verdict = ex.decide({
           prompt: `editing ${trigger.reason} ${filePath}`,
           file_path: filePath,
-          sessionId: data.session_id,
+          session_id: data.session_id,
           cwd,
         });
-        const peerHint = verdict.peer ? ` · peer=${verdict.peer.peer}` : '';
+        const peerHint = verdict.peer ? ` · peer=${verdict.peer.peer || verdict.peer}` : '';
+        const floorHint = verdict.floor ? ` · floor=${verdict.floor.id}` : '';
         tierAdvisory =
           `\n\nVANTA TIER RECOMMENDATION: ${verdict.tier} (${verdict.decision})` +
-          peerHint +
+          peerHint + floorHint +
           `\n  ${verdict.why}` +
           (verdict.tier === 'T3' ? '\n  → Run /council BEFORE writing.' : '') +
           (verdict.tier === 'T2' ? '\n  → Single peer review recommended; /council for full review.' : '') +
           (verdict.tier === 'T1' ? '\n  → Self-review only; /council if uncertain.' : '');
 
-        // Log the classification into action-log so trust-metrics
-        // captures the decision shape downstream.
+        // Log the executor decision so trust-metrics can pair it with
+        // any downstream rewriter / undo / sync events via decision_id.
         try {
           const al = require(path.join(__dirname, '..', 'bin', 'vanta-action-log.js'));
           al.record({
@@ -258,10 +259,11 @@ process.stdin.on('end', () => {
             subject: filePath,
             tier: verdict.tier,
             decision: verdict.decision,
+            decision_id: verdict.decision_id || null,
           });
         } catch { /* ledger optional */ }
       }
-    } catch { /* never block advisory on classifier failure */ }
+    } catch { /* never block advisory on executor failure */ }
 
     const constraintPack = sections.length > 0
       ? `\n\nCONSTRAINT PACK — what you already know about this:\n\n${sections.join('\n\n')}`

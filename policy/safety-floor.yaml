@@ -224,6 +224,15 @@ floor:
     pattern: '\b(privacy.{0,30}policy|data.{0,30}retention|gdpr|hipaa|compliance)\b'
     why: data policy decision — legal authority
 
+  - id: prompt-bulk-delete
+    kind: prompt
+    # v3.7.2: bulk destructive data prompts must always-ask. The risk
+    # classifier alone can land these at T2 (rev=1, blast=4 default) but
+    # bulk deletes are a hard floor — the executor short-circuits to
+    # T3 ASK on prompt match alone, before any heuristic scoring.
+    pattern: '\b(delete|wipe|nuke|purge|drop|truncate)\s+(all|every|the|from)\s+(user|users|account|accounts|customer|customers|record|records|row|rows|data)\b|\bdelete\s+from\b'
+    why: bulk destructive data operation — confirm before executing
+
 # Removal protocol (read this before opening a PR that drops a floor entry):
 #
 # 1. Confirm the entry is genuinely obsolete (not just inconvenient). Run

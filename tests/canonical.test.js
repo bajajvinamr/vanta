@@ -2863,7 +2863,9 @@ describe('hooks/prompt-rewriter.js — UserPromptSubmit injection (v3.6.14)', ()
       const entries = lines.map(l => JSON.parse(l));
       const r = entries.find(e => e.action === 'rewrite');
       assert.ok(r, 'rewrite action must be logged');
-      assert.equal(r.tier, 'T0');
+      // v3.7.2: tier is now the executor-derived value (was hardcoded T0
+      // pre-executor). For "fix the bug in auth.ts" rev=blast=4 → T1.
+      assert.equal(r.tier, 'T1');
       assert.equal(r.session_id, 'rw-test-1');
     } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
@@ -4093,6 +4095,201 @@ describe('council v3.6.20 fixes — verification (P1/P2/P3 regression guards)', 
     // "If you follow the chain, announce ..." — assert that's gone.
     assert.doesNotMatch(src, /If you follow the chain,\s*announce/,
       'user-visible magic-phrase line must be removed — was surface creep flagged in council R1');
+  });
+});
+
+// ─── v3.7.2 — central executor (vanta-executor.js) ──────────────────────────
+//
+// The executor composes kill-switch, safety-floor, rewriter, and the
+// risk-classifier into a single Decision shape. Hooks must call
+// executor.decide() and never reach into the helpers directly.
+//
+// These tests lock the canonical Decision contract + composition order.
+
+describe('vanta-executor — Decision shape (v3.7.2)', () => {
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  delete require.cache[require.resolve('../bin/vanta-safety-floor')];
+  delete require.cache[require.resolve('../bin/vanta-rewriter')];
+  delete require.cache[require.resolve('../bin/vanta-risk-classifier')];
+  delete require.cache[require.resolve('../bin/vanta-executor')];
+  // Force the safety-floor singleton to reload from the env-pointed file.
+  require('../bin/vanta-safety-floor').reload();
+  const executor = require('../bin/vanta-executor');
+
+  test('emits canonical Decision shape with required fields', () => {
+    const d = executor.decide({ prompt: 'fix this' });
+    const required = [
+      'decision_id', 'ts', 'tier', 'decision', 'source',
+      'skill_route', 'intent', 'rule_id', 'rewritten',
+      'score', 'risk', 'floor', 'kill_switch', 'peer',
+      'budget_ms', 'why', 'confidence', 'context',
+    ];
+    for (const k of required) {
+      assert.ok(k in d, `Decision must include "${k}"`);
+    }
+    assert.match(d.decision_id, /^dec-[0-9a-f]{12}$/);
+    assert.match(d.ts, /^\d{4}-\d{2}-\d{2}T/);
+    assert.ok(['T0', 'T1', 'T2', 'T3'].includes(d.tier), 'tier must be T0..T3');
+    assert.ok(['passthrough', 'auto', 'rewrite', 'ask', 'block'].includes(d.decision));
+  });
+
+  test('budget_ms is tier-derived (T0=5s ... T3=300s)', () => {
+    assert.equal(executor.BUDGET_MS.T0, 5_000);
+    assert.equal(executor.BUDGET_MS.T1, 30_000);
+    assert.equal(executor.BUDGET_MS.T2, 120_000);
+    assert.equal(executor.BUDGET_MS.T3, 300_000);
+  });
+
+  test('acceptance: "delete all users" + users.ts → T3 ASK with floor non-null', () => {
+    const d = executor.decide({ prompt: 'delete all users', file_path: 'users.ts' });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.decision, 'ask');
+    assert.ok(d.floor, 'safety-floor must catch bulk-delete prompts');
+    assert.equal(d.floor.id, 'prompt-bulk-delete');
+    assert.equal(d.budget_ms, 300_000);
+    assert.equal(d.skill_route, '/council');
+    assert.equal(d.source, 'safety-floor');
+  });
+
+  test('safety-floor product-decision prompts → T3 ASK + /council route', () => {
+    const d = executor.decide({ prompt: 'should we pivot pricing?' });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.decision, 'ask');
+    assert.equal(d.skill_route, '/council');
+    assert.equal(d.source, 'safety-floor');
+    assert.match(d.floor.id, /^prompt-pivot-decision/);
+  });
+
+  test('safety-floor command match → T3 ASK with peer route + null skill_route', () => {
+    const d = executor.decide({ prompt: '', command: 'git push --force origin main' });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.decision, 'ask');
+    assert.equal(d.source, 'safety-floor');
+    assert.equal(d.floor.id, 'git-force-push-main');
+    // Non-product floor matches leave skill_route null — user confirms or aborts.
+    assert.equal(d.skill_route, null);
+  });
+
+  test('rewriter rule "ship it" → rewrite + /ship route + numbered chain', () => {
+    const d = executor.decide({ prompt: 'ship it' });
+    assert.equal(d.decision, 'rewrite');
+    assert.equal(d.skill_route, '/ship');
+    assert.equal(d.intent, 'ship');
+    assert.equal(d.rule_id, 'ship-this');
+    assert.match(d.rewritten, /^1\./m);
+    assert.equal(d.source, 'rewriter-rule');
+  });
+
+  test('rewriter ASK rule (taxonomy-rename) → T3 ASK + /council', () => {
+    const d = executor.decide({ prompt: 'rename tier to plan_level' });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.decision, 'ask');
+    assert.equal(d.skill_route, '/council');
+    assert.equal(d.intent, 'taxonomy-rename');
+    assert.equal(d.source, 'rewriter-ask');
+  });
+
+  test('passthrough lookup → no skill_route, no chain', () => {
+    const d = executor.decide({ prompt: 'what is in this file?' });
+    assert.equal(d.decision, 'passthrough');
+    assert.equal(d.skill_route, null);
+    assert.equal(d.rewritten, null);
+    assert.equal(d.intent, 'lookup');
+  });
+
+  test('composition order: safety-floor wins over rewriter rule', () => {
+    // "ship to prod" matches BOTH the ship rewriter rule AND the
+    // prompt-launch-decision floor entry. Floor must win.
+    const d = executor.decide({ prompt: 'ship to prod' });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.decision, 'ask');
+    assert.equal(d.source, 'safety-floor');
+    assert.match(d.floor.id, /^prompt-launch-decision/);
+  });
+
+  test('kill-switch off → T0 passthrough regardless of prompt', () => {
+    // Stub kill-switch via require.cache to force `off: true`.
+    const ksPath = require.resolve('../bin/vanta-kill-switch');
+    const original = require.cache[ksPath];
+    require.cache[ksPath] = {
+      id: ksPath,
+      filename: ksPath,
+      loaded: true,
+      exports: { check: () => ({ off: true, scope: 'session' }) },
+    };
+    delete require.cache[require.resolve('../bin/vanta-executor')];
+    const stubbed = require('../bin/vanta-executor');
+    try {
+      const d = stubbed.decide({ prompt: 'delete all users' });
+      assert.equal(d.tier, 'T0');
+      assert.equal(d.decision, 'passthrough');
+      assert.equal(d.source, 'kill-switch');
+      assert.deepEqual(d.kill_switch, { off: true, scope: 'session' });
+    } finally {
+      if (original) require.cache[ksPath] = original; else delete require.cache[ksPath];
+      delete require.cache[require.resolve('../bin/vanta-executor')];
+    }
+  });
+
+  test('echoes context back so action-log can pair entries', () => {
+    const d = executor.decide({
+      prompt: 'fix this', file_path: 'src/api/auth.ts',
+      command: null, cwd: '/tmp/proj', session_id: 'sess-abc',
+    });
+    assert.equal(d.context.prompt, 'fix this');
+    assert.equal(d.context.file_path, 'src/api/auth.ts');
+    assert.equal(d.context.cwd, '/tmp/proj');
+    assert.equal(d.context.session_id, 'sess-abc');
+  });
+});
+
+describe('hooks/prompt-rewriter — executor-driven shadow injection (v3.7.2)', () => {
+  const HOOK = path.join(__dirname, '..', 'hooks', 'prompt-rewriter.js');
+
+  function spawnHook({ prompt, vantaDir }) {
+    const { execFileSync } = require('child_process');
+    return execFileSync('node', [HOOK], {
+      input: JSON.stringify({ prompt, session_id: 'rw-v372', cwd: '/tmp' }),
+      env: {
+        ...process.env,
+        HOME: vantaDir,                       // redirect ~/.vanta/* to tmp
+        VANTA_DIR_OVERRIDE: vantaDir,
+        VANTA_SAFETY_FLOOR: path.join(__dirname, '..', 'policy', 'safety-floor.yaml'),
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 5000,
+    }).toString();
+  }
+
+  test('safety-floor product-decision → 1-line ASK hint', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rw-floor-'));
+    try {
+      const out = spawnHook({ prompt: 'should we pivot pricing?', vantaDir: tmp });
+      const parsed = JSON.parse(out);
+      assert.match(parsed.hookSpecificOutput.additionalContext,
+        /^\[Vanta\]\s+\/council recommended\s+·\s+T3 ASK/);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('rewriter ASK (taxonomy-rename) → 1-line /council ASK hint', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rw-ask-'));
+    try {
+      const out = spawnHook({ prompt: 'rename tier to plan_level', vantaDir: tmp });
+      const parsed = JSON.parse(out);
+      assert.match(parsed.hookSpecificOutput.additionalContext,
+        /^\[Vanta\]\s+\/council recommended\s+·\s+T3 ASK/);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('rewrite path injects header + numbered chain', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rw-rule-'));
+    try {
+      const out = spawnHook({ prompt: 'ship it', vantaDir: tmp });
+      const parsed = JSON.parse(out);
+      assert.match(parsed.hookSpecificOutput.additionalContext,
+        /^\[Vanta\]\s+\/ship\s+·\s+ship/);
+      assert.match(parsed.hookSpecificOutput.additionalContext, /^1\./m);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 });
 
