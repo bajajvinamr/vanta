@@ -1263,6 +1263,29 @@ describe('module exports — sanity', () => {
   });
 });
 
+// ─── hook ordering (Codex+Gemini R5 P2) ────────────────────────────────────
+//
+// PreToolUse hooks fire sequentially in registration order; ANY non-zero
+// exit blocks the tool call AND aborts the chain. tool-observer must run
+// BEFORE git-guardrails so the always-on telemetry sees blocked Bash
+// attempts (the highest-risk events).
+describe('hooks — registration order (R5 P2)', () => {
+  const manifestPath = path.join(__dirname, '..', 'hooks', 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+
+  test('tool-observer registers BEFORE git-guardrails on PreToolUse', () => {
+    const preTool = manifest.registrations.filter(r => r.event === 'PreToolUse');
+    const observerIdx = preTool.findIndex(r => r.file === 'tool-observer.js');
+    const guardrailsIdx = preTool.findIndex(r => r.file === 'git-guardrails.js');
+    assert.ok(observerIdx >= 0, 'tool-observer.js must be registered');
+    assert.ok(guardrailsIdx >= 0, 'git-guardrails.js must be registered');
+    assert.ok(
+      observerIdx < guardrailsIdx,
+      `tool-observer (idx ${observerIdx}) must precede git-guardrails (idx ${guardrailsIdx}) so blocked Bash gets telemetry`,
+    );
+  });
+});
+
 // ─── hook syntax check (Codex R3 P1 test gap) ──────────────────────────────
 //
 // R3 caught a syntax error in hooks/tool-observer.js (duplicate `const event`)

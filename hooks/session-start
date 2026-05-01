@@ -28,11 +28,21 @@ if [ -z "$BRIEF_BIN" ]; then
 fi
 
 # Read cwd from stdin JSON (Claude Code SessionStart input format).
+#
+# Gemini council R5 P2 fix — `read -r` (even with -t) only consumes a single
+# line. Claude Code can deliver pretty-printed multi-line JSON; the older
+# `read` approach silently dropped everything past the first newline and
+# every cwd extraction failed → fell back to $PWD. `cat` with a 2s timeout
+# guarded by `timeout` consumes the entire payload.
 input_json=""
-read -t 2 -r input_json 2>/dev/null || input_json=""
+if [ -t 0 ]; then
+  input_json=""
+else
+  input_json=$(timeout 2 cat 2>/dev/null || echo "")
+fi
 cwd=""
 if [ -n "$input_json" ]; then
-  cwd=$(echo "$input_json" | python3 -c "import json,sys; d=json.loads(sys.stdin.read() or '{}'); print(d.get('cwd', ''))" 2>/dev/null || echo "")
+  cwd=$(printf '%s' "$input_json" | python3 -c "import json,sys; d=json.loads(sys.stdin.read() or '{}'); print(d.get('cwd', ''))" 2>/dev/null || echo "")
 fi
 [ -z "$cwd" ] && cwd="$PWD"
 

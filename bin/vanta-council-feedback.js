@@ -54,13 +54,12 @@ function _ensureDir() {
   }
 }
 
+// Codex council R5 P2 fix — atomic rotation via rename, not read-trim-write.
 function _rotateIfLarge(file) {
   try {
     const st = fs.statSync(file);
     if (st.size <= MAX_BYTES) return;
-    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-    const kept = lines.slice(Math.floor(lines.length / 2));
-    fs.writeFileSync(file, kept.join('\n') + '\n');
+    fs.renameSync(file, file + '.bak');
   } catch {}
 }
 

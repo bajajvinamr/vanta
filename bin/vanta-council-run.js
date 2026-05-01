@@ -57,13 +57,14 @@ function _ensureDir() {
   }
 }
 
+// Codex council R5 P2 fix — atomic rotation. Earlier read-trim-writeFileSync
+// could silently lose an append that hit the file between the read and the
+// rewrite. POSIX rename is atomic; concurrent writers keep working.
 function _rotateIfLarge(file) {
   try {
     const st = fs.statSync(file);
     if (st.size <= MAX_BYTES) return;
-    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-    const kept = lines.slice(Math.floor(lines.length / 2));
-    fs.writeFileSync(file, kept.join('\n') + '\n');
+    fs.renameSync(file, file + '.bak');
   } catch {}
 }
 
