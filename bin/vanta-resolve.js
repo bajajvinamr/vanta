@@ -589,10 +589,19 @@ function _logQuery(entry) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     // Atomic rotation: rename (POSIX-atomic) so concurrent appendFileSync
     // calls keep working — they either land in the old file (preserved as
-    // .bak) or the freshly-created new file. No lost-update race.
+    // .bak.<ts>) or the freshly-created new file. No lost-update race.
+    //
+    // R11 P1 — Codex council finding. Earlier rotation overwrote a single
+    // .bak on every cycle, so analyzeLog() lost everything older than the
+    // current 5MB chunk. Now: timestamped `.bak.<ts>` siblings (consistent
+    // with sync-queue/episodes/interactions from R8 P1 + R10 P2). The
+    // analyzeLog reader unions them via readMergedJsonl.
     try {
       const st = fs.statSync(file);
-      if (st.size > QUERY_LOG_MAX_BYTES) fs.renameSync(file, file + '.bak');
+      if (st.size > QUERY_LOG_MAX_BYTES) {
+        const ts = Date.now() + '.' + process.pid;
+        fs.renameSync(file, `${file}.bak.${ts}`);
+      }
     } catch { /* file doesn't exist yet — fine */ }
     // Strip identifying fields before persisting. Keep coarse counts +
     // canonical project slug + hashed topic for trend/audit utility.
@@ -822,10 +831,17 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = f
 //   - Score-distribution sketch (are top-1 results actually scoring high,
 //     or are we emitting noise that barely passes the threshold?)
 function analyzeLog({ last = 500 } = {}) {
-  if (!fs.existsSync(QUERY_LOG)) {
+  // R11 P1 — read across rotated `.bak.<ts>` siblings + live file. Earlier
+  // impl read only the live file, so analytics reset on every 5MB rotation
+  // and gap-detection / score-distribution sketches misdiagnosed long-run
+  // resolver health.
+  const { readMergedJsonl, listBaks } = require('./vanta-jsonl');
+  const baks = listBaks(QUERY_LOG);
+  if (!fs.existsSync(QUERY_LOG) && baks.length === 0) {
     return { present: false, message: 'no query log yet (~/.vanta/query-log.jsonl absent)' };
   }
-  const lines = fs.readFileSync(QUERY_LOG, 'utf8').split('\n').filter(Boolean).slice(-last);
+  const merged = readMergedJsonl(QUERY_LOG);
+  const lines = merged.split('\n').filter(Boolean).slice(-last);
   const entries = [];
   for (const l of lines) { try { entries.push(JSON.parse(l)); } catch { /* skip */ } }
   if (!entries.length) return { present: true, count: 0, message: 'log present but empty' };
