@@ -219,6 +219,50 @@ process.stdin.on('end', () => {
       `COUNCIL ADVISORY: Editing ${trigger.reason} — ${filePath}. ` +
       `If this introduces a new flow (not a small fix), run /council first.`;
 
+    // v3.6.15 — risk classifier integration. The classifier consults
+    // safety-floor first, then 3-axis score, and produces a tier
+    // recommendation (T0/T1/T2/T3) plus a peer pick (codex/gemini/both)
+    // for T2+. Surface the recommendation so Claude sees what tier
+    // would fire if the user invoked /council on this edit.
+    let tierAdvisory = '';
+    try {
+      const rcPath = path.join(__dirname, '..', 'bin', 'vanta-risk-classifier.js');
+      const homeRcPath = path.join(process.env.HOME || '', '.claude', 'bin', 'vanta-risk-classifier.js');
+      let rc = null;
+      try { rc = require(homeRcPath); } catch { try { rc = require(rcPath); } catch {} }
+      if (rc) {
+        const verdict = rc.classify({
+          prompt: `editing ${trigger.reason} ${filePath}`,
+          file_path: filePath,
+          sessionId: data.session_id,
+          cwd,
+        });
+        const peerHint = verdict.peer ? ` · peer=${verdict.peer.peer}` : '';
+        tierAdvisory =
+          `\n\nVANTA TIER RECOMMENDATION: ${verdict.tier} (${verdict.decision})` +
+          peerHint +
+          `\n  ${verdict.why}` +
+          (verdict.tier === 'T3' ? '\n  → Run /council BEFORE writing.' : '') +
+          (verdict.tier === 'T2' ? '\n  → Single peer review recommended; /council for full review.' : '') +
+          (verdict.tier === 'T1' ? '\n  → Self-review only; /council if uncertain.' : '');
+
+        // Log the classification into action-log so trust-metrics
+        // captures the decision shape downstream.
+        try {
+          const al = require(path.join(__dirname, '..', 'bin', 'vanta-action-log.js'));
+          al.record({
+            session_id: data.session_id || null,
+            project: slug || null,
+            action: 'risk-classify',
+            why: verdict.why,
+            subject: filePath,
+            tier: verdict.tier,
+            decision: verdict.decision,
+          });
+        } catch { /* ledger optional */ }
+      }
+    } catch { /* never block advisory on classifier failure */ }
+
     const constraintPack = sections.length > 0
       ? `\n\nCONSTRAINT PACK — what you already know about this:\n\n${sections.join('\n\n')}`
       : '';
@@ -226,7 +270,7 @@ process.stdin.on('end', () => {
     const result = {
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
-        additionalContext: baseAdvisory + constraintPack,
+        additionalContext: baseAdvisory + tierAdvisory + constraintPack,
       },
     };
 

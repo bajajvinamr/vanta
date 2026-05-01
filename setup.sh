@@ -43,7 +43,7 @@ echo ""
 echo "Installing hooks..."
 mkdir -p "$HOOKS_DIR"
 
-for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js code-index-watch.js git-guardrails.js prompt-context.js tool-observer.js session-start; do
+for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js code-index-watch.js git-guardrails.js prompt-context.js prompt-rewriter.js tool-observer.js session-start; do
   src="$REPO_DIR/hooks/$hook"
   if [ -f "$src" ]; then
     cp "$src" "$HOOKS_DIR/$hook"
@@ -53,10 +53,29 @@ for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto
 done
 echo ""
 
+# ── Policy (safety floor for the executor) ──────────────────────────────────
+# v3.6.13 — deterministic always-ask layer. Floor file is deployed to
+# ~/.vanta/policy/ so user-edits survive across upgrades. Repo copy is
+# the read-only baseline if the deployed copy is missing.
+mkdir -p "$HOME/.vanta/policy"
+if [ ! -f "$HOME/.vanta/policy/safety-floor.yaml" ]; then
+  cp "$REPO_DIR/policy/safety-floor.yaml" "$HOME/.vanta/policy/safety-floor.yaml"
+  echo "  ✓ safety-floor.yaml deployed to ~/.vanta/policy/"
+else
+  echo "  ✓ safety-floor.yaml present (preserved user edits)"
+fi
+if [ ! -f "$HOME/.vanta/policy/peer-routing.yaml" ]; then
+  cp "$REPO_DIR/policy/peer-routing.yaml" "$HOME/.vanta/policy/peer-routing.yaml"
+  echo "  ✓ peer-routing.yaml deployed to ~/.vanta/policy/"
+else
+  echo "  ✓ peer-routing.yaml present (preserved user edits)"
+fi
+echo ""
+
 # ── Bin (knowledge resolver and other shared scripts) ───────────────────────
 echo "Installing shared bins..."
 mkdir -p "$BIN_DIR"
-for binfile in vanta-projects.js vanta-log.js vanta-resolve.js vanta-brief.js vanta-index-code.js vanta-status.js vanta-prune.js vanta-council-health.js vanta-council-feedback.js vanta-extract-score.js vanta-council-run.js vanta-runtime-state.js vanta-prompt-brief.js vanta-interaction-log.js vanta-jsonl.js; do
+for binfile in vanta-projects.js vanta-log.js vanta-resolve.js vanta-brief.js vanta-index-code.js vanta-status.js vanta-prune.js vanta-council-health.js vanta-council-feedback.js vanta-extract-score.js vanta-council-run.js vanta-runtime-state.js vanta-prompt-brief.js vanta-interaction-log.js vanta-jsonl.js vanta-safety-floor.js vanta-kill-switch.js vanta-action-log.js vanta-trust-metrics.js vanta-rewriter.js vanta-peer-router.js vanta-risk-classifier.js vanta-undo.js vanta-regret-detector.js vanta-autonomy.js vanta-memory-promote.js vanta-confidence-decay.js; do
   src="$REPO_DIR/bin/$binfile"
   if [ -f "$src" ]; then
     cp "$src" "$BIN_DIR/$binfile"

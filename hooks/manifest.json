@@ -22,6 +22,15 @@
       "added": "2026-05-01"
     },
     {
+      "event": "UserPromptSubmit",
+      "matcher": "",
+      "file": "prompt-rewriter.js",
+      "runtime": "node",
+      "timeout": 5,
+      "purpose": "v3.6.14 shadow-mode rewriter — turns 1-line prompts into actionable engineer chains. Floor-matched + passthrough prompts inject nothing. Rule-matched prompts inject the suggested chain alongside the original.",
+      "added": "2026-05-02"
+    },
+    {
       "event": "Stop",
       "matcher": "",
       "file": "auto-sync.js",

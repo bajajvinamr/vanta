@@ -1,0 +1,239 @@
+# Vanta Safety Floor — deterministic always-ask list.
+#
+# This file is the bottom of the auto-vs-ask hierarchy. Anything matched
+# here is ASK regardless of LLM-classifier output. Adding entries is
+# permissive (broader safety net). Removing entries requires manual
+# signoff with a 7-day cool-down — see README §"safety-floor" for the
+# governance protocol.
+#
+# Match types:
+#   command:  bash command regex (anchored). Matches via vanta-safety-floor.js
+#             against `command_string` argument.
+#   file:     file-path glob. Matches against the path being written/edited.
+#   symbol:   regex against the diff body (additions only). Catches semantic
+#             changes that aren't visible from path alone.
+#   prompt:   regex against the user's prompt (case-insensitive).
+#
+# Each entry: { id, kind, pattern, why }. `id` is stable; downstream
+# tooling references it by id, never by index.
+#
+# Schema version is bumped when match-engine semantics change. Entries
+# may be added without a version bump.
+
+version: 1
+
+floor:
+  # ─── Database / migrations ─────────────────────────────────────────────────
+  - id: db-migrate-deploy
+    kind: command
+    pattern: '^prisma\s+migrate\s+deploy\b'
+    why: production migration apply — schema drift can lock prod DB
+
+  - id: db-migrate-reset
+    kind: command
+    pattern: '^prisma\s+migrate\s+reset\b'
+    why: drops all data on the connection — irreversible for prod
+
+  - id: ddl-drop-table
+    kind: symbol
+    pattern: '\b(DROP\s+TABLE|DROP\s+SCHEMA|TRUNCATE\s+TABLE)\b'
+    why: destructive DDL — data loss
+
+  - id: ddl-alter-column-type
+    kind: symbol
+    pattern: 'ALTER\s+TABLE[\s\S]{0,200}ALTER\s+COLUMN[\s\S]{0,200}TYPE'
+    why: column type-change can require backfill or break readers
+
+  - id: supabase-db-reset
+    kind: command
+    pattern: '^supabase\s+db\s+reset\b'
+    why: nukes local + linked Supabase project state
+
+  # ─── Infra / deploy ────────────────────────────────────────────────────────
+  - id: terraform-apply
+    kind: command
+    pattern: '^terraform\s+(apply|destroy)\b'
+    why: infra changes — possible blast radius beyond repo
+
+  - id: kubectl-apply-prod
+    kind: command
+    pattern: '^kubectl\s+(apply|delete)\b.*(--context\s+prod|prod-cluster)'
+    why: production cluster mutation
+
+  - id: aws-cli-prod
+    kind: command
+    pattern: '^aws\s+(s3\s+rm|rds\s+delete|lambda\s+delete|iam\s+delete)\b'
+    why: AWS resource deletion — irreversible without backup restore
+
+  - id: doctl-droplet-destroy
+    kind: command
+    pattern: '^doctl\s+compute\s+droplet\s+delete\b'
+    why: DigitalOcean droplet destroy
+
+  # ─── Git destructive ───────────────────────────────────────────────────────
+  - id: git-force-push-main
+    kind: command
+    pattern: '^git\s+push\s+(--force|-f)\b.*\b(main|master)\b'
+    why: force-push to mainline — overwrites shared history
+
+  - id: git-reset-hard
+    kind: command
+    pattern: '^git\s+reset\s+--hard\b'
+    why: discards uncommitted work — only safe for explicit recovery
+
+  - id: git-clean-fdx
+    kind: command
+    pattern: '^git\s+clean\s+-[fFdDxX]+'
+    why: deletes untracked files including .env / local notes
+
+  - id: git-branch-force-delete
+    kind: command
+    pattern: '^git\s+branch\s+-D\b'
+    why: force-deletes branch ignoring unmerged commits
+
+  - id: git-no-verify
+    kind: command
+    pattern: '^git\s+\w+\s+.*--no-verify\b'
+    why: bypasses pre-commit hooks (lint/test/security) — only with explicit reason
+
+  - id: git-rebase-onto-main
+    kind: command
+    pattern: '^git\s+rebase\s+(--onto\s+\S+\s+)?(main|master)\b'
+    why: history rewrite on shared branch — re-think before applying
+
+  # ─── Filesystem destructive ────────────────────────────────────────────────
+  - id: rm-rf-absolute
+    kind: command
+    pattern: '^rm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)[a-z]*\s+/'
+    why: rm -rf with absolute path
+
+  - id: rm-rf-home
+    kind: command
+    pattern: '^rm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)[a-z]*\s+(\$HOME|~/?)'
+    why: rm -rf hitting user home
+
+  - id: rm-rf-root-tilde
+    kind: command
+    pattern: '^rm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)[a-z]*\s+~'
+    why: rm -rf using tilde expansion
+
+  # ─── Package management (slopsquatting) ────────────────────────────────────
+  - id: npm-install-new
+    kind: command
+    pattern: '^(npm|pnpm|yarn|bun)\s+(install|add|i)\s+(?!--save-dev|-D)\S'
+    why: new dependency — slopsquatting risk ≥5% per Anthropic invariant
+
+  - id: pip-install
+    kind: command
+    pattern: '^(pip|pip3|uv\s+pip)\s+install\s+(?!-r\s)\S'
+    why: new Python dep — verify exists before install
+
+  - id: cargo-install
+    kind: command
+    pattern: '^cargo\s+install\s+'
+    why: new Rust binary install — slopsquatting risk
+
+  # ─── Secrets / config ──────────────────────────────────────────────────────
+  - id: env-file-write
+    kind: file
+    pattern: '**/.env*'
+    why: env files often contain secrets — never auto-write
+
+  - id: pem-key-write
+    kind: file
+    pattern: '**/*.{pem,key,p12,pfx}'
+    why: cryptographic key material — never auto-write
+
+  - id: aws-credentials
+    kind: file
+    pattern: '**/.aws/credentials'
+    why: AWS credentials file
+
+  - id: ssh-private-key
+    kind: file
+    pattern: '**/.ssh/id_*'
+    why: SSH private key
+
+  # ─── Pricing / billing / feature flags ─────────────────────────────────────
+  - id: pricing-constants
+    kind: symbol
+    pattern: '(price|amount|cents|MONTHLY_PRICE|YEARLY_PRICE|TIER_PRICE|stripe_price_)\s*[:=]\s*[''"]?\d'
+    why: pricing constant change — product-authority decision
+
+  - id: feature-flag-enable
+    kind: symbol
+    pattern: '(feature_flag|flag|enabled|FEATURE_)\w*\s*[:=]\s*(true|"on"|1)\b'
+    why: feature flag enable — disable is auto, enable is product decision
+
+  - id: stripe-webhook-secret
+    kind: file
+    pattern: '**/stripe-webhook*'
+    why: Stripe webhook code — payment integrity
+
+  # ─── Auth / SSO ────────────────────────────────────────────────────────────
+  - id: auth-callback-url
+    kind: symbol
+    pattern: '(callback_url|redirect_uri|allowed_origins?)\s*[:=]'
+    why: auth redirect URI change — phishing risk if mis-set
+
+  - id: jwt-secret-rotation
+    kind: symbol
+    pattern: '(jwt_secret|JWT_SECRET|signing_key)\s*[:=]'
+    why: JWT secret rotation — invalidates all live sessions
+
+  # ─── Public API / contracts ────────────────────────────────────────────────
+  - id: api-route-rename
+    kind: file
+    pattern: '**/{api,routes}/**/*.{ts,js,py,go}'
+    why: api route file edit — possible breaking change
+
+  - id: openapi-spec
+    kind: file
+    pattern: '**/openapi.{yaml,yml,json}'
+    why: API contract change — consumers may break
+
+  # ─── User-visible strings ──────────────────────────────────────────────────
+  - id: user-error-text
+    kind: symbol
+    pattern: '(toast|notify|alert|setError)\s*\(\s*[''"][A-Z]'
+    why: user-visible error/toast text — product copy decision
+
+  # ─── GDPR / data deletion ──────────────────────────────────────────────────
+  - id: customer-data-delete
+    kind: symbol
+    pattern: '\b(deleteCustomer|purgeUser|gdprDelete|wipeAccount)\s*\('
+    why: customer data deletion — irreversible, regulatory
+
+  # ─── Prompt-level always-ask ───────────────────────────────────────────────
+  - id: prompt-pivot-decision
+    kind: prompt
+    pattern: '\b(pivot|change.{0,30}business model|change.{0,30}pricing|kill.{0,30}feature|sunset.{0,30}product)\b'
+    why: business strategy decision — needs user, not Vanta
+
+  - id: prompt-launch-decision
+    kind: prompt
+    # R1 P2 (Gemini): trailing `\b` after "prod" failed on "ship production"
+    # because the next char `u` is a word-char. v3.6.20 drops the trailing
+    # boundary on the prod/live alternations and uses an explicit
+    # word/end-anchor only for the bare `launch` token.
+    pattern: '(\blaunch\b|\bship\b.{0,20}prod|\bpush\b.{0,20}live|\bgo\b.{0,20}live)'
+    why: launch decision — irreversible commitment to users
+
+  - id: prompt-data-policy
+    kind: prompt
+    pattern: '\b(privacy.{0,30}policy|data.{0,30}retention|gdpr|hipaa|compliance)\b'
+    why: data policy decision — legal authority
+
+# Removal protocol (read this before opening a PR that drops a floor entry):
+#
+# 1. Confirm the entry is genuinely obsolete (not just inconvenient). Run
+#    git log on this file to see when/why it was added.
+# 2. Open the PR with the entry's `id` in the title. Body must explain
+#    what changed in the world to make this safe to remove.
+# 3. CODEOWNERS-style review: the PR sits open for 7d minimum. During
+#    that window, the entry stays active. This prevents impulsive
+#    removals during a frustrating session.
+# 4. Reviewer (Vinamr) merges manually after the cool-down. No bot
+#    auto-merges removals.
+#
+# Adding an entry: open a PR, no cool-down. Floor expansion is always safe.
