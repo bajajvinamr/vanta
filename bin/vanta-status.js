@@ -366,10 +366,18 @@ function renderText() {
         extras.push(`${total} 24h${failures ? ` (${failures} failed)` : ''}${topStr ? ' · ' + topStr : ''}`);
       }
     }
+    // R12 P2 — Codex council finding. The R11 fix computed bytesTotal +
+    // bakCount but renderText still printed only q.bytes (live file).
+    // Disk footprint of rotated history stayed invisible. Now: when bak
+    // files exist, append "+<n> bak (<total>)" to the size column.
+    let sizeStr = bytesHuman(q.bytes).padStart(6);
+    if (q.bakCount > 0) {
+      sizeStr += ` +${q.bakCount} bak (${bytesHuman(q.bytesTotal)})`;
+    }
     console.log('  ' +
       q.name.padEnd(16) + '  ' +
       String(q.lines).padStart(4) + ' lines  ' +
-      bytesHuman(q.bytes).padStart(6) + '  ' +
+      sizeStr + '  ' +
       ageHuman(q.mtime).padEnd(10) +
       (extras.length ? '  (' + extras.join(', ') + ')' : '')
     );

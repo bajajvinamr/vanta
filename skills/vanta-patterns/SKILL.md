@@ -33,12 +33,48 @@ echo "Analyzing window: $WINDOW_START → now"
 Read four log files, all jsonl, all in `~/.vanta/`:
 
 ```bash
+# R12 P1 / R8 P1 — read across rotated `.bak.<ts>` siblings. Earlier impl
+# read only the live file, so weekly health metrics ignored everything past
+# the most recent 5MB rotation. Counts collapse falsely on long-running
+# installs. Use a small Node helper that walks bak siblings.
 _LOGS=~/.vanta
-[ -f "$_LOGS/routing-events.jsonl" ] && _ROUTES=$(awk -v w="$WINDOW_START" '$0>=w' "$_LOGS/routing-events.jsonl" | wc -l | tr -d ' ')
-[ -f "$_LOGS/missed-intents.jsonl" ] && _MISSES=$(awk -v w="$WINDOW_START" '$0>=w' "$_LOGS/missed-intents.jsonl" | wc -l | tr -d ' ')
-[ -f "$_LOGS/sync-queue.jsonl" ] && _QUEUE=$(awk -v w="$WINDOW_START" '$0>=w' "$_LOGS/sync-queue.jsonl" | wc -l | tr -d ' ')
-[ -f "$_LOGS/episodes.jsonl" ] && _EPISODES=$(awk -v w="$WINDOW_START" '$0>=w' "$_LOGS/episodes.jsonl" | wc -l | tr -d ' ')
-echo "Routes: $_ROUTES · Misses: $_MISSES · Sessions queued: $_QUEUE · Episodes: $_EPISODES"
+node - "$WINDOW_START" "$_LOGS" << 'COUNT' | while IFS=':' read -r name n; do
+  case "$name" in
+    routes)   _ROUTES="$n";;
+    misses)   _MISSES="$n";;
+    queue)    _QUEUE="$n";;
+    episodes) _EPISODES="$n";;
+  esac
+done
+const fs = require('fs');
+const path = require('path');
+const since = process.argv[2];
+const dir = process.argv[3];
+function* siblings(file) {
+  const base = path.basename(file);
+  let entries = [];
+  try { entries = fs.readdirSync(dir).filter(n => n.startsWith(base + '.bak.')); } catch {}
+  for (const e of entries.sort()) yield path.join(dir, e);
+  if (fs.existsSync(file)) yield file;
+}
+function count(file) {
+  let n = 0;
+  for (const f of siblings(file)) {
+    try {
+      for (const l of fs.readFileSync(f, 'utf8').split('\n')) {
+        if (!l) continue;
+        if (l >= since) n++;  // crude TS prefix compare; matches awk usage
+      }
+    } catch {}
+  }
+  return n;
+}
+console.log('routes:'   + count(path.join(dir, 'routing-events.jsonl')));
+console.log('misses:'   + count(path.join(dir, 'missed-intents.jsonl')));
+console.log('queue:'    + count(path.join(dir, 'sync-queue.jsonl')));
+console.log('episodes:' + count(path.join(dir, 'episodes.jsonl')));
+COUNT
+echo "Routes: ${_ROUTES:-0} · Misses: ${_MISSES:-0} · Sessions queued: ${_QUEUE:-0} · Episodes: ${_EPISODES:-0}"
 ```
 
 ### Step 3 — Compute four metrics
@@ -52,9 +88,23 @@ const path = require('path');
 const os = require('os');
 const since = process.argv[2];
 const dir = path.join(os.homedir(), '.vanta');
+// R12 P1 / R8 P1 — read across rotated `.bak.<ts>` siblings + live file.
+// Producer no longer compacts on rotate, so older entries live in baks.
 const read = f => {
-  try { return fs.readFileSync(path.join(dir, f), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse); }
-  catch { return []; }
+  try {
+    const base = path.basename(f);
+    const parts = [];
+    let baks = [];
+    try { baks = fs.readdirSync(dir).filter(n => n.startsWith(base + '.bak.')).sort(); } catch {}
+    for (const b of baks) {
+      try { parts.push(fs.readFileSync(path.join(dir, b), 'utf8')); } catch {}
+    }
+    try { parts.push(fs.readFileSync(path.join(dir, f), 'utf8')); } catch {}
+    const merged = parts.map(p => p.endsWith('\n') ? p : p + '\n').join('');
+    return merged.trim().split('\n').filter(Boolean).map(l => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean);
+  } catch { return []; }
 };
 
 const routes = read('routing-events.jsonl').filter(e => (e.ts || '') >= since);
