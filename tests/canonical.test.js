@@ -4658,3 +4658,102 @@ describe('vanta-undo — state-check refuses dirty undo (v3.7.3)', () => {
   });
 });
 
+// ─── v3.7.4 — open-loop wires ───────────────────────────────────────────────
+//
+// 1. Trust→mode signal      : Decision carries inline_ready bool
+// 2. Effort escalation      : big diffs / many files bump tier
+// 3. Uncertainty escalation : confidence drops to medium on sparse signal
+// 4. Inline marker in hook  : [Vanta INLINE] when inline_ready=true
+
+describe('vanta-executor — effort / uncertainty / inline_ready (v3.7.4)', () => {
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  delete require.cache[require.resolve('../bin/vanta-safety-floor')];
+  delete require.cache[require.resolve('../bin/vanta-executor')];
+  require('../bin/vanta-safety-floor').reload();
+  const executor = require('../bin/vanta-executor');
+
+  test('huge diff (≥800 lines) forces minimum tier T2 even on benign rule', () => {
+    const bigDiff = 'x\n'.repeat(900);
+    const d = executor.decide({ prompt: 'fix this', file_path: 'src/a.ts', diff: bigDiff });
+    assert.ok(d.effort);
+    assert.equal(d.effort.level, 'huge');
+    assert.ok(d.tier === 'T2' || d.tier === 'T3');
+  });
+
+  test('multi-file change (≥5 files) bumps tier by one', () => {
+    const d = executor.decide({ prompt: 'ship it', file_path: 'src/a.ts', file_count: 7 });
+    assert.ok(d.effort);
+    assert.equal(d.effort.level, 'high');
+    // ship-this rule lands at T1 by default; effort bump → T2.
+    assert.equal(d.tier, 'T2');
+  });
+
+  test('small diff + few files → no effort signal', () => {
+    const d = executor.decide({ prompt: 'fix this', diff: 'one line\n', file_count: 1 });
+    assert.equal(d.effort, null);
+  });
+
+  test('Decision shape includes effort, uncertainty, inline_ready fields', () => {
+    const d = executor.decide({ prompt: 'fix this' });
+    assert.ok('effort' in d);
+    assert.ok('uncertainty' in d);
+    assert.ok('inline_ready' in d);
+    assert.equal(typeof d.inline_ready, 'boolean');
+  });
+
+  test('confidence drops to medium when classifier hits default 4/4 without a rule', () => {
+    const d = executor.decide({ prompt: 'do something' });
+    // No rewriter rule, classifier defaults rev=4/blast=4 → confidence=medium.
+    assert.equal(d.confidence, 'medium');
+  });
+
+  test('confidence stays high when rewriter rule matches', () => {
+    const d = executor.decide({ prompt: 'fix this' });
+    assert.equal(d.confidence, 'high');
+  });
+
+  test('inline_ready stubbed via trust-metrics — true flows into Decision', () => {
+    const tmPath = require.resolve('../bin/vanta-trust-metrics');
+    const exPath = require.resolve('../bin/vanta-executor');
+    const orig = require.cache[tmPath];
+    require.cache[tmPath] = {
+      id: tmPath, filename: tmPath, loaded: true,
+      exports: {
+        compute: () => ({ ready_for_inline: true }),
+        readyForInline: () => true,
+      },
+    };
+    delete require.cache[exPath];
+    const stubbed = require('../bin/vanta-executor');
+    try {
+      const d = stubbed.decide({ prompt: 'fix this' });
+      assert.equal(d.inline_ready, true);
+    } finally {
+      if (orig) require.cache[tmPath] = orig; else delete require.cache[tmPath];
+      delete require.cache[exPath];
+    }
+  });
+});
+
+describe('hooks/prompt-rewriter — inline marker on trust-ready (v3.7.4)', () => {
+  const HOOK = path.join(__dirname, '..', 'hooks', 'prompt-rewriter.js');
+
+  test('default header is [Vanta] when inline_ready=false', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rw-default-'));
+    try {
+      const { execFileSync } = require('child_process');
+      const out = execFileSync('node', [HOOK], {
+        input: JSON.stringify({ prompt: 'fix this', session_id: 'rw-v374', cwd: '/tmp' }),
+        env: {
+          ...process.env, HOME: tmp, VANTA_DIR_OVERRIDE: tmp,
+          VANTA_SAFETY_FLOOR: path.join(__dirname, '..', 'policy', 'safety-floor.yaml'),
+        },
+        stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
+      }).toString();
+      const parsed = JSON.parse(out);
+      assert.match(parsed.hookSpecificOutput.additionalContext, /^\[Vanta\]\s+\/investigate/);
+      assert.doesNotMatch(parsed.hookSpecificOutput.additionalContext, /\[Vanta INLINE\]/);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+});
+

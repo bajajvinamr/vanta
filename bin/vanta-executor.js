@@ -26,7 +26,7 @@ const os = require('os');
 
 // Lazy-load helpers so hooks/tests can stub them and so a missing helper
 // degrades to a permissive default rather than crashing the executor.
-let _killSwitch, _safetyFloor, _rewriter, _riskClassifier, _peerRouter, _escalation;
+let _killSwitch, _safetyFloor, _rewriter, _riskClassifier, _peerRouter, _escalation, _trust;
 
 function _resolve(name) {
   for (const p of [
@@ -44,6 +44,57 @@ function rewriter()         { return _rewriter       || (_rewriter       = _reso
 function riskClassifier()   { return _riskClassifier || (_riskClassifier = _resolve('vanta-risk-classifier.js')); }
 function peerRouter()       { return _peerRouter     || (_peerRouter     = _resolve('vanta-peer-router.js'));     }
 function failureEscalation(){ return _escalation    || (_escalation    = _resolve('vanta-failure-escalation.js'));}
+function trustMetrics()     { return _trust         || (_trust         = _resolve('vanta-trust-metrics.js'));    }
+
+// v3.7.4 — effort signal. A "big" change is risk-elevating regardless
+// of file path or prompt. Two cheap inputs: diff-body size and
+// multi-file edits (when caller passes file_count). The signals stack
+// with failure-escalation (both can fire in the same Decision).
+const EFFORT_DIFF_LINES_HIGH    = 200;     // > 200 lines added/removed → elevated
+const EFFORT_DIFF_LINES_HUGE    = 800;     // > 800 lines → force at least T2
+const EFFORT_FILE_COUNT_HIGH    = 5;
+function _effortSignal(diff, fileCount) {
+  if (!diff && (fileCount || 0) < EFFORT_FILE_COUNT_HIGH) return null;
+  const lines = diff ? (diff.match(/\n/g) || []).length : 0;
+  if (lines >= EFFORT_DIFF_LINES_HUGE) {
+    return { level: 'huge', lines, file_count: fileCount || 0,
+             why: `huge diff: ${lines} lines (≥${EFFORT_DIFF_LINES_HUGE})`, force_min_tier: 'T2' };
+  }
+  if (lines >= EFFORT_DIFF_LINES_HIGH || (fileCount || 0) >= EFFORT_FILE_COUNT_HIGH) {
+    return { level: 'high', lines, file_count: fileCount || 0,
+             why: `effort: ${lines} diff lines / ${fileCount || 0} files`, bump: 1 };
+  }
+  return null;
+}
+
+// v3.7.4 — uncertainty signal. The risk-classifier returns a score
+// in 1..5 per axis. Borderline values (rev=2, blast=2..3) are exactly
+// where the heuristic is least trustworthy — bump up by one tier when
+// both axes land in the borderline band AND no rule matched.
+function _uncertaintySignal(cls, routingMode) {
+  if (!cls || routingMode === 'rule' || routingMode === 'llm') return null;
+  const r = cls.score && cls.score.reversibility;
+  const b = cls.score && cls.score.blast_radius;
+  // Borderline band: both axes in 2..3 AND we don't have a high-confidence
+  // rule. The classifier produced a tier from sparse signal — distrust it.
+  if (r != null && b != null && r >= 2 && r <= 3 && b >= 2 && b <= 3) {
+    return { bump: 1, why: `borderline-risk (rev=${r}, blast=${b}); no rule match` };
+  }
+  return null;
+}
+
+// Apply tier bumps in priority order. Higher priority signals dominate.
+const TIER_BUMP = { T0: 'T1', T1: 'T2', T2: 'T3', T3: 'T3' };
+function _bumpTier(tier, n) {
+  let t = tier;
+  for (let i = 0; i < (n || 0); i++) t = TIER_BUMP[t] || t;
+  return t;
+}
+const TIER_ORDER = ['T0', 'T1', 'T2', 'T3'];
+function _maxTier(...tiers) {
+  return tiers.filter(Boolean).reduce((max, t) =>
+    TIER_ORDER.indexOf(t) > TIER_ORDER.indexOf(max) ? t : max, 'T0');
+}
 
 // v3.7.3 — semantic product-decision detector. Cheap regex over phrases
 // that read like "asking for a strategic call" combined with strategic
@@ -322,6 +373,39 @@ function decide(input = {}) {
     escalatedTier = fe.applyEscalation(cls.tier, escalation);
   }
 
+  // 4b. Effort signal — big diffs / many files elevate risk.
+  const effort = _effortSignal(ctx.diff, input.file_count);
+  if (effort) {
+    if (effort.force_min_tier) {
+      escalatedTier = _maxTier(escalatedTier, effort.force_min_tier);
+    } else if (effort.bump) {
+      escalatedTier = _bumpTier(escalatedTier, effort.bump);
+    }
+  }
+
+  // 4c. Uncertainty signal — borderline classifier output without a
+  //     matching rewriter rule means the heuristic is firing on sparse
+  //     signal. Bump by one to surface the doubt to the user.
+  const uncertainty = _uncertaintySignal(cls, routing.mode);
+  if (uncertainty && uncertainty.bump) {
+    escalatedTier = _bumpTier(escalatedTier, uncertainty.bump);
+  }
+
+  // 4d. Trust→inline mode signal. The Decision carries `inline_ready:
+  //     bool` so consumers (prompt-rewriter hook) can opt to flip from
+  //     shadow to inline once trust thresholds clear (14d span, low
+  //     undo / interrupt rates). v3.7.4 only SURFACES the signal —
+  //     the actual mode flip lands in v3.8 once the migration design
+  //     is council-reviewed.
+  let inline_ready = false;
+  const tm = trustMetrics();
+  if (tm && tm.compute) {
+    try {
+      const m = tm.compute({ days: 30 });
+      inline_ready = !!m.ready_for_inline;
+    } catch (_) { inline_ready = false; }
+  }
+
   // 5. Compose final decision.
   //   - tier wins from classifier, optionally bumped by failure escalation
   //   - decision combines rewriter routing + tier:
@@ -345,7 +429,15 @@ function decide(input = {}) {
     escalation && (escalation.bump > 0 || escalation.force_tier)
       ? `escalation:${escalation.why}`
       : null,
+    effort      ? `effort:${effort.why}`            : null,
+    uncertainty ? `uncertainty:${uncertainty.why}`  : null,
   ].filter(Boolean).join(' · ');
+
+  // v3.7.4: confidence reflects all three signals. Any uncertainty
+  // bump or borderline-classifier hit drops it to medium.
+  const confidence = (uncertainty || (cls.score && cls.score.reversibility === 4 && cls.score.blast_radius === 4 && !routing.rule_id))
+    ? 'medium'
+    : 'high';
 
   return _make(ctx, ts, decision_id, {
     tier,
@@ -360,7 +452,10 @@ function decide(input = {}) {
     risk: cls.risk,
     peer: cls.peer,
     escalation: escalation && (escalation.bump > 0 || escalation.force_tier) ? escalation : null,
-    confidence: 'high',
+    effort:     effort      || null,
+    uncertainty: uncertainty || null,
+    inline_ready,
+    confidence,
   });
 }
 
@@ -381,6 +476,9 @@ function _make(ctx, ts, decision_id, d) {
     kill_switch: d.kill_switch || null,
     peer:        d.peer || null,
     escalation:  d.escalation || null,
+    effort:      d.effort || null,
+    uncertainty: d.uncertainty || null,
+    inline_ready: d.inline_ready === true,
     budget_ms:   BUDGET_MS[d.tier] || BUDGET_MS.T0,
     why:         d.why || '',
     confidence:  d.confidence || 'high',

@@ -117,8 +117,14 @@ process.stdin.on('end', () => {
   //         1. step
   //         2. step
   //         3. step
+  //
+  //       v3.7.4: when trust thresholds clear (`inline_ready`), prepend
+  //       a single "[Vanta INLINE]" marker so the user can see the
+  //       state transition. The actual mode flip (replace prompt vs
+  //       inject context) lands in v3.8.
   if (decision.decision === 'rewrite' && decision.rewritten) {
-    const header = `[Vanta] ${decision.skill_route || '/' + (decision.intent || 'review')} · ${decision.intent || 'unknown'}`;
+    const tag = decision.inline_ready ? '[Vanta INLINE]' : '[Vanta]';
+    const header = `${tag} ${decision.skill_route || '/' + (decision.intent || 'review')} · ${decision.intent || 'unknown'}`;
     const additionalContext = [header, decision.rewritten].join('\n');
     _logAction({ session_id: sessionId, cwd, action: 'rewrite',
       decision: 'auto', why: decision.why || ('intent=' + decision.intent),
