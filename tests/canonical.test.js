@@ -2880,3 +2880,137 @@ describe('hooks/prompt-rewriter.js — UserPromptSubmit injection (v3.6.14)', ()
   });
 });
 
+// ─── v3.6.15 — Days 6-7: hybrid risk classifier + 4-tier council + peer router ─
+
+describe('vanta-peer-router — stack-aware peer pick (v3.6.15)', () => {
+  delete require.cache[require.resolve('../bin/vanta-peer-router')];
+  process.env.VANTA_PEER_ROUTING = path.join(__dirname, '..', 'policy', 'peer-routing.yaml');
+  const router = require('../bin/vanta-peer-router');
+  router.reload();
+
+  test('auth/security routes to BOTH peers', () => {
+    const r = router.pick({ prompt: 'fix the JWT auth flow' });
+    assert.equal(r.peer, 'both');
+  });
+
+  test('payment/billing routes to BOTH peers', () => {
+    const r = router.pick({ prompt: 'add a stripe billing webhook' });
+    assert.equal(r.peer, 'both');
+  });
+
+  test('.tsx file routes to codex', () => {
+    const r = router.pick({ file_path: 'apps/web/src/components/Header.tsx' });
+    assert.equal(r.peer, 'codex');
+  });
+
+  test('.py file routes to gemini', () => {
+    const r = router.pick({ file_path: 'src/extract.py' });
+    assert.equal(r.peer, 'gemini');
+  });
+
+  test('infra (terraform/k8s) routes to gemini', () => {
+    const r = router.pick({ prompt: 'add a terraform module' });
+    assert.equal(r.peer, 'gemini');
+  });
+
+  test('migration prompts route to BOTH peers', () => {
+    const r = router.pick({ prompt: 'add a prisma migration for users.tier' });
+    assert.equal(r.peer, 'both');
+  });
+
+  test('unmatched signals fall back to default (codex)', () => {
+    const r = router.pick({ prompt: 'wlonkadonk gibberish input' });
+    assert.equal(r.peer, 'codex');
+    assert.equal(r.rule_index, -1);
+  });
+
+  test('listRules returns the rule table', () => {
+    const list = router.listRules();
+    assert.ok(list.length >= 8, `expected ≥8 routing rules, got ${list.length}`);
+    assert.ok(list.some(r => r.peer === 'both'));
+    assert.ok(list.some(r => r.peer === 'codex'));
+    assert.ok(list.some(r => r.peer === 'gemini'));
+  });
+});
+
+describe('vanta-risk-classifier — hybrid floor + 3-axis (v3.6.15)', () => {
+  delete require.cache[require.resolve('../bin/vanta-risk-classifier')];
+  delete require.cache[require.resolve('../bin/vanta-safety-floor')];
+  delete require.cache[require.resolve('../bin/vanta-peer-router')];
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  process.env.VANTA_PEER_ROUTING = path.join(__dirname, '..', 'policy', 'peer-routing.yaml');
+  delete process.env.VANTA_EXECUTOR;
+  const rc = require('../bin/vanta-risk-classifier');
+
+  test('safety-floor match → T3 + ASK + floor_match populated', () => {
+    const v = rc.classify({ command: 'git push --force origin main' });
+    assert.equal(v.tier, 'T3');
+    assert.equal(v.decision, 'ask');
+    assert.ok(v.floor_match);
+    assert.equal(v.floor_match.id, 'git-force-push-main');
+  });
+
+  test('product-authority phrasing → T3 + ASK', () => {
+    const v = rc.classify({ prompt: 'should we pivot the pricing model?' });
+    // Floor match for prompt-pivot-decision happens first → still T3 + ASK.
+    assert.equal(v.tier, 'T3');
+    assert.equal(v.decision, 'ask');
+  });
+
+  test('low-risk lookup-style prompt → T0 or T1, decision=auto', () => {
+    const v = rc.classify({ prompt: 'read the README' });
+    assert.ok(v.tier === 'T0' || v.tier === 'T1', `expected T0/T1, got ${v.tier}`);
+    assert.equal(v.decision, 'auto');
+  });
+
+  test('mid-risk: refactor a non-prod file → T1 or T2', () => {
+    const v = rc.classify({ prompt: 'refactor the parser', file_path: 'src/parse.ts' });
+    assert.ok(['T1', 'T2'].includes(v.tier), `expected T1/T2, got ${v.tier}`);
+    assert.equal(v.decision, 'auto');
+  });
+
+  test('high-risk: prod migration prompt → T3 + ASK', () => {
+    const v = rc.classify({
+      prompt: 'deploy a migration to drop the users.tier column in production',
+    });
+    assert.equal(v.tier, 'T3');
+    assert.equal(v.decision, 'ask');
+  });
+
+  test('peer is populated for T2/T3, null for T0/T1', () => {
+    const high = rc.classify({ prompt: 'deploy auth changes to production' });
+    assert.ok(high.peer, 'T3 must include peer pick');
+    const low = rc.classify({ prompt: 'show me the file contents' });
+    if (low.tier === 'T0' || low.tier === 'T1') {
+      assert.equal(low.peer, null, 'T0/T1 should not include peer');
+    }
+  });
+
+  test('kill-switch off → T0 + auto regardless of risk', () => {
+    process.env.VANTA_EXECUTOR = 'off';
+    delete require.cache[require.resolve('../bin/vanta-kill-switch')];
+    delete require.cache[require.resolve('../bin/vanta-risk-classifier')];
+    const rc2 = require('../bin/vanta-risk-classifier');
+    try {
+      const v = rc2.classify({
+        prompt: 'deploy a migration to drop the users table in production',
+      });
+      assert.equal(v.tier, 'T0');
+      assert.equal(v.decision, 'auto');
+      assert.match(v.why, /kill-switch:global/);
+    } finally {
+      delete process.env.VANTA_EXECUTOR;
+      delete require.cache[require.resolve('../bin/vanta-kill-switch')];
+      delete require.cache[require.resolve('../bin/vanta-risk-classifier')];
+    }
+  });
+
+  test('score axes are populated and within 1-5 range', () => {
+    const v = rc.classify({ prompt: 'fix a bug in src/util.ts' });
+    assert.ok(v.score.reversibility >= 1 && v.score.reversibility <= 5);
+    assert.ok(v.score.blast_radius   >= 1 && v.score.blast_radius   <= 5);
+    assert.equal(typeof v.score.product_authority, 'boolean');
+    assert.ok(v.risk >= 0 && v.risk <= 10);
+  });
+});
+

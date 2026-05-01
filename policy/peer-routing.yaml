@@ -1,0 +1,82 @@
+# Vanta peer-routing — pick a council peer (Codex, Gemini, both) per
+# stack/topic. The 4-tier council picker reads this when choosing T2
+# (single peer) or T3 (full council).
+#
+# Why per-stack: Codex and Gemini have different blind spots.
+#   - Codex: stronger on JS/TS frontend, React, package management
+#   - Gemini: stronger on Python, infra/CI, large-context architecture
+#   - Both: security-sensitive code where blind-spot diversity matters
+#
+# Match precedence: first matching `pattern` wins. `default` applies
+# when no rule matches. Patterns can match against {file_path,
+# command, prompt} — the classifier passes whichever signal it has.
+
+version: 1
+
+rules:
+  # Security-sensitive — both peers, regardless of stack.
+  - pattern: '(auth|jwt|session|password|crypto|encrypt|gdpr|pii|credential|secret)'
+    against: prompt|file_path
+    peer: both
+    why: security blind-spot diversity required
+
+  - pattern: '(payment|stripe|billing|subscription|invoice|refund)'
+    against: prompt|file_path
+    peer: both
+    why: payment/billing affects revenue + compliance
+
+  # Frontend / React / TS — Codex.
+  - pattern: '\.(tsx|jsx)$'
+    against: file_path
+    peer: codex
+    why: codex stronger on React/JSX patterns
+
+  - pattern: '\b(react|tailwind|shadcn|component|hook|next\.?js)\b'
+    against: prompt
+    peer: codex
+    why: codex frontend coverage
+
+  # Python — Gemini.
+  - pattern: '\.py$'
+    against: file_path
+    peer: gemini
+    why: gemini better at Python idioms
+
+  - pattern: '\b(python|pytest|fastapi|django|pandas|numpy)\b'
+    against: prompt
+    peer: gemini
+    why: python stack
+
+  # Infra / DevOps — Gemini.
+  - pattern: '(terraform|docker|kubernetes|k8s|ansible|github actions|circleci|gitlab ci)'
+    against: prompt|file_path
+    peer: gemini
+    why: gemini stronger on infra/CI
+
+  - pattern: '\.(yml|yaml|tf|hcl)$'
+    against: file_path
+    peer: gemini
+    why: infra-as-code files
+
+  # Backend / systems — split by language.
+  - pattern: '\.(go|rs)$'
+    against: file_path
+    peer: gemini
+    why: systems languages — gemini coverage
+
+  - pattern: '\.(ts|js|mjs|cjs)$'
+    against: file_path
+    peer: codex
+    why: node/bun backend — codex coverage
+
+  # Database / migrations — both (high blast radius even mid-migration).
+  - pattern: '(migration|schema|prisma|drizzle|alembic|knex)'
+    against: prompt|file_path
+    peer: both
+    why: schema changes affect production durability
+
+# Default when no rule matches: alternate to balance load.
+# 'auto' lets the picker choose by current cost-budget headroom + last
+# 24h availability (council-health). If both healthy + cost-headroom
+# OK, picks Codex by default (slightly faster, slightly cheaper).
+default: codex

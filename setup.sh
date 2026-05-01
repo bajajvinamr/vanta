@@ -64,12 +64,18 @@ if [ ! -f "$HOME/.vanta/policy/safety-floor.yaml" ]; then
 else
   echo "  ✓ safety-floor.yaml present (preserved user edits)"
 fi
+if [ ! -f "$HOME/.vanta/policy/peer-routing.yaml" ]; then
+  cp "$REPO_DIR/policy/peer-routing.yaml" "$HOME/.vanta/policy/peer-routing.yaml"
+  echo "  ✓ peer-routing.yaml deployed to ~/.vanta/policy/"
+else
+  echo "  ✓ peer-routing.yaml present (preserved user edits)"
+fi
 echo ""
 
 # ── Bin (knowledge resolver and other shared scripts) ───────────────────────
 echo "Installing shared bins..."
 mkdir -p "$BIN_DIR"
-for binfile in vanta-projects.js vanta-log.js vanta-resolve.js vanta-brief.js vanta-index-code.js vanta-status.js vanta-prune.js vanta-council-health.js vanta-council-feedback.js vanta-extract-score.js vanta-council-run.js vanta-runtime-state.js vanta-prompt-brief.js vanta-interaction-log.js vanta-jsonl.js vanta-safety-floor.js vanta-kill-switch.js vanta-action-log.js vanta-trust-metrics.js vanta-rewriter.js; do
+for binfile in vanta-projects.js vanta-log.js vanta-resolve.js vanta-brief.js vanta-index-code.js vanta-status.js vanta-prune.js vanta-council-health.js vanta-council-feedback.js vanta-extract-score.js vanta-council-run.js vanta-runtime-state.js vanta-prompt-brief.js vanta-interaction-log.js vanta-jsonl.js vanta-safety-floor.js vanta-kill-switch.js vanta-action-log.js vanta-trust-metrics.js vanta-rewriter.js vanta-peer-router.js vanta-risk-classifier.js; do
   src="$REPO_DIR/bin/$binfile"
   if [ -f "$src" ]; then
     cp "$src" "$BIN_DIR/$binfile"
