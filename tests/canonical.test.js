@@ -1752,26 +1752,115 @@ describe('vanta-jsonl — torn-line resilience (R9 P1)', () => {
   });
 });
 
-describe('auto-sync — rotation does not destroy concurrent appends (R8 P1)', () => {
-  test('rotation produces .bak.<ts> file and does NOT call fs.writeFileSync', () => {
-    // Static-source sanity check. The fix removes the in-rotation
-    // fs.writeFileSync(file, folded). Verify by reading the source — if
-    // someone re-introduces it, this test catches it.
-    const src = fs.readFileSync(path.join(__dirname, '..', 'hooks', 'auto-sync.js'), 'utf8');
-    // Must rotate via timestamped suffix.
-    assert.match(src, /\.bak\.\$\{ts\}/, 'rotation must use timestamped .bak.<ts>');
-    // Strip comments and string literals so the regex doesn't match the
-    // word in explanatory prose. Crude but sufficient: drop // line
-    // comments before scanning.
-    const code = src.split('\n')
-      .map(l => l.replace(/\s*\/\/.*$/, ''))
-      .join('\n');
-    // Find the appendJsonl arrow function body.
-    const fnMatch = code.match(/const appendJsonl = \(file, newEntry\) => \{[\s\S]*?\n    \};/);
-    assert.ok(fnMatch, 'appendJsonl helper must be present');
-    // Now check for an actual fs.writeFileSync call inside.
-    assert.equal(/fs\.writeFileSync/.test(fnMatch[0]), false,
-      'appendJsonl must not fs.writeFileSync (would clobber concurrent appenders)');
+describe('auto-sync — rotation behavior (R8 P1, v3.6.12 behavior)', () => {
+  // v3.6.12: replaced static-source grep with end-to-end spawn that drives
+  // the actual hook with VANTA_DIR_OVERRIDE pointed at a fixture dir, then
+  // observes the resulting filesystem. Catches any future regression that
+  // re-introduces fold-then-writeFileSync (which would cause the live file
+  // to contain folded history instead of just the rotator's fresh entry).
+  const { execFileSync } = require('node:child_process');
+  const HOOK = path.join(__dirname, '..', 'hooks', 'auto-sync.js');
+
+  function makeTranscript(p, toolCalls = 10) {
+    const lines = [];
+    for (let i = 0; i < toolCalls; i++) lines.push(JSON.stringify({ type: 'tool_use', tool: 'Edit' }));
+    lines.push(JSON.stringify({ type: 'text', text: 'shipped the fix' }));
+    fs.writeFileSync(p, lines.join('\n') + '\n');
+  }
+
+  function spawnAutoSync({ vantaDir, sessionId, transcriptPath }) {
+    const stdin = JSON.stringify({
+      session_id: sessionId,
+      transcript_path: transcriptPath,
+      cwd: vantaDir,
+      hook_event_name: 'Stop',
+    });
+    return execFileSync(process.execPath, [HOOK], {
+      input: stdin,
+      env: { ...process.env, VANTA_DIR_OVERRIDE: vantaDir, HOME: path.join(vantaDir, 'home') },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 10000,
+    });
+  }
+
+  test('small live file: appends without rotation', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r8b-noroll-'));
+    try {
+      const transcript = path.join(tmp, 'transcript.jsonl');
+      makeTranscript(transcript);
+      spawnAutoSync({ vantaDir: tmp, sessionId: 'fresh-A', transcriptPath: transcript });
+      const baks = fs.readdirSync(tmp).filter(n => n.startsWith('sync-queue.jsonl.bak.'));
+      assert.equal(baks.length, 0, 'fresh small file must not rotate');
+      const live = fs.readFileSync(path.join(tmp, 'sync-queue.jsonl'), 'utf8');
+      assert.match(live, /"session_id":"fresh-A"/, 'new entry must land in live file');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('rotation: file > 5MB triggers .bak.<ts>; live becomes fresh with only the new entry', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r8b-roll-'));
+    try {
+      const queueFile = path.join(tmp, 'sync-queue.jsonl');
+      const filler = '{"old":"' + 'x'.repeat(500) + '"}\n';
+      let total = '';
+      while (total.length < 5_100_000) total += filler;
+      fs.writeFileSync(queueFile, total);
+      assert.ok(fs.statSync(queueFile).size > 5_000_000, 'precondition: live file > MAX_BYTES');
+
+      const transcript = path.join(tmp, 'transcript.jsonl');
+      makeTranscript(transcript);
+      spawnAutoSync({ vantaDir: tmp, sessionId: 'roll-A', transcriptPath: transcript });
+
+      const baks = fs.readdirSync(tmp).filter(n => n.startsWith('sync-queue.jsonl.bak.'));
+      assert.equal(baks.length, 1, 'rotation must produce exactly one bak sibling');
+      assert.match(baks[0], /sync-queue\.jsonl\.bak\.\d+\.\d+$/,
+        'bak name must include Date.now() + pid suffix');
+
+      const bakSize = fs.statSync(path.join(tmp, baks[0])).size;
+      assert.ok(bakSize > 5_000_000, 'bak retains pre-rotation contents intact');
+
+      // Live file is now fresh — must NOT be a fold-then-writeFileSync of
+      // the entire history. If someone re-introduces the v3.5 fold path,
+      // live would be ~5MB; with rename-only rotation it's a single entry.
+      const live = fs.readFileSync(queueFile, 'utf8');
+      assert.ok(live.length < 10_000,
+        `live file must be small post-rotation (got ${live.length}B — fold was re-introduced?)`);
+      assert.match(live, /"session_id":"roll-A"/, 'rotator entry lands in fresh live file');
+      const liveLines = live.split('\n').filter(Boolean);
+      assert.equal(liveLines.length, 1,
+        `live file must contain exactly 1 entry post-rotation (got ${liveLines.length})`);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('readMergedJsonl after rotation surfaces both old and new entries', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r8b-merge-'));
+    try {
+      const queueFile = path.join(tmp, 'sync-queue.jsonl');
+      // Pre-populate with discoverable old entries near 5MB threshold.
+      const oldEntries = [];
+      for (let i = 0; i < 10; i++) {
+        oldEntries.push(JSON.stringify({ session_id: `old-${i}`, ts: '2025-01-01' }));
+      }
+      const padding = '{"pad":"' + 'x'.repeat(500) + '"}\n';
+      let pre = oldEntries.join('\n') + '\n';
+      while (pre.length < 5_100_000) pre += padding;
+      fs.writeFileSync(queueFile, pre);
+
+      const transcript = path.join(tmp, 'transcript.jsonl');
+      makeTranscript(transcript);
+      spawnAutoSync({ vantaDir: tmp, sessionId: 'new-1', transcriptPath: transcript });
+
+      const merged = require('../bin/vanta-jsonl').readMergedJsonl(queueFile);
+      const seen = new Set();
+      for (const line of merged.split('\n')) {
+        if (!line.trim()) continue;
+        try { const e = JSON.parse(line); if (e.session_id) seen.add(e.session_id); } catch {}
+      }
+      // All 10 old entries plus the new one must be visible.
+      for (let i = 0; i < 10; i++) {
+        assert.ok(seen.has(`old-${i}`), `old-${i} must survive rotation in bak file`);
+      }
+      assert.ok(seen.has('new-1'), 'new-1 must appear in live file');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 });
 
@@ -1864,15 +1953,58 @@ describe('manifest — tool-observer is prepended for composability (R10 P1)', (
 
 // ─── R10 lockdown — IMPORT_LINE no longer hardcoded (Codex+Gemini R10 P1) ────
 
-describe('setup.sh — IMPORT_LINE derived from REPO_DIR (R10 P1)', () => {
-  test('uses $REPO_DIR/skills/using-vanta, not the literal ~/Projects/vanta path', () => {
-    const src = fs.readFileSync(path.join(__dirname, '..', 'setup.sh'), 'utf8');
-    // Must reference REPO_DIR in the import-line construction.
-    assert.match(src, /\$REPO_DIR\/skills\/using-vanta\/SKILL\.md/,
-      'IMPORT_LINE must derive path from $REPO_DIR');
-    // The verbatim "@~/Projects/vanta/..." literal must be gone.
-    assert.equal(/IMPORT_LINE="@~\/Projects\/vanta\//.test(src), false,
-      'hardcoded ~/Projects/vanta path was replaced (R10 P1)');
+describe('setup.sh — IMPORT_LINE derived from REPO_DIR (R10 P1, v3.6.12 behavior)', () => {
+  // v3.6.12: replaced static-source grep with end-to-end install run.
+  // Spawn setup.sh with HOME=tmpdir; assert the resulting CLAUDE.md
+  // contains an @-import that resolves to the real repo path (not the
+  // legacy hardcoded ~/Projects/vanta literal).
+  const { execFileSync } = require('node:child_process');
+  const REPO = path.resolve(path.join(__dirname, '..'));
+  const SETUP = path.join(REPO, 'setup.sh');
+
+  test('CLAUDE.md @-import points at $REPO_DIR/skills/using-vanta/SKILL.md', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r10b-setup-'));
+    try {
+      execFileSync('bash', [SETUP], {
+        env: { ...process.env, HOME: tmp },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 30000,
+      });
+      const claudeMd = path.join(tmp, '.claude', 'CLAUDE.md');
+      assert.ok(fs.existsSync(claudeMd), 'setup.sh must create ~/.claude/CLAUDE.md');
+      const content = fs.readFileSync(claudeMd, 'utf8');
+
+      // Setup translates $HOME → ~ for cosmetic tidiness; HOME=tmp here, so
+      // the repo (under /Users/...) resolves to an absolute @-import.
+      const expected = '@' + path.join(REPO, 'skills', 'using-vanta', 'SKILL.md');
+      assert.ok(content.includes(expected),
+        `CLAUDE.md must contain "${expected}"; got these using-vanta lines:\n` +
+        content.split('\n').filter(l => l.includes('using-vanta')).join('\n'));
+
+      // Legacy hardcoded literal must NOT appear as the import line.
+      assert.equal(/^@~\/Projects\/vanta\/skills\/using-vanta\/SKILL\.md\s*$/m.test(content), false,
+        'hardcoded ~/Projects/vanta/... was replaced (R10 P1)');
+
+      // Setup also deploys skills + hooks under the fixture HOME.
+      assert.ok(fs.existsSync(path.join(tmp, '.claude', 'skills', 'vanta-run', 'SKILL.md')),
+        'vanta-run skill must be deployed');
+      assert.ok(fs.existsSync(path.join(tmp, '.claude', 'hooks', 'auto-sync.js')),
+        'auto-sync.js hook must be deployed');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('re-running setup.sh is idempotent — does not duplicate the @-import', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r10b-idempotent-'));
+    try {
+      const env = { ...process.env, HOME: tmp };
+      execFileSync('bash', [SETUP], { env, stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 });
+      execFileSync('bash', [SETUP], { env, stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 });
+      const content = fs.readFileSync(path.join(tmp, '.claude', 'CLAUDE.md'), 'utf8');
+      const importLines = content.split('\n')
+        .filter(l => l.includes('skills/using-vanta/SKILL.md'));
+      assert.equal(importLines.length, 1,
+        `setup must dedupe @-import; got ${importLines.length} lines:\n${importLines.join('\n')}`);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 });
 
@@ -1905,67 +2037,205 @@ describe('uninstall.sh — strips using-vanta @-import (R10 P2)', () => {
 
 // ─── R11 lockdown — observability surface (Codex+Gemini R11 P1/P2) ───────────
 
-describe('vanta-status — surfaces R7-R10 sentinels (R11 P1)', () => {
-  test('reads ~/.vanta/.bin-missing sentinel and emits CRITICAL suggestion', () => {
-    // R8 P2 prompt-context touches the sentinel when bins fail to load.
-    // R11 P1 requires vanta-status to read it and surface a CRITICAL hint.
-    // Verify by source: vanta-status must reference .bin-missing in its
-    // suggestions block.
-    const src = fs.readFileSync(
-      path.join(__dirname, '..', 'bin', 'vanta-status.js'), 'utf8');
-    assert.match(src, /\.bin-missing/,
-      'vanta-status must check the .bin-missing sentinel');
-    assert.match(src, /CRITICAL.*always-on layer disabled/,
-      'vanta-status must surface CRITICAL when sentinel exists');
+describe('vanta-status — surfaces R7-R10 sentinels (R11 P1, v3.6.12 behavior)', () => {
+  // v3.6.12: replaced static-source greps with subprocess invocation.
+  // Spawns vanta-status with HOME pointed at a fixture, writes the
+  // sentinel/queues, and asserts on the actual rendered output a user
+  // would see. Catches output-format regressions that source-grep can't.
+  const { execFileSync } = require('node:child_process');
+  const STATUS_BIN = path.join(__dirname, '..', 'bin', 'vanta-status.js');
+
+  function runStatus(home, args = []) {
+    return execFileSync(process.execPath, [STATUS_BIN, ...args], {
+      env: { ...process.env, HOME: home },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 5000,
+    }).toString();
+  }
+
+  test('CRITICAL line surfaces when .bin-missing sentinel exists', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r11b-bin-'));
+    try {
+      const vanta = path.join(tmp, '.vanta');
+      fs.mkdirSync(vanta, { recursive: true });
+      fs.writeFileSync(path.join(vanta, '.bin-missing'),
+        '2026-04-30T12:00:00Z prompt-context.js failed to require vanta-resolve\n');
+      const out = runStatus(tmp);
+      assert.match(out, /CRITICAL/, 'CRITICAL marker must appear in user-visible output');
+      assert.match(out, /always-on layer disabled/, 'reason text must surface');
+      assert.match(out, /prompt-context\.js failed to require/,
+        'last-line detail from sentinel must be included for diagnostics');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 
-  test('reports total disk footprint including rotated .bak.<ts> siblings', () => {
-    const src = fs.readFileSync(
-      path.join(__dirname, '..', 'bin', 'vanta-status.js'), 'utf8');
-    // Must call listBaks and aggregate sizes.
-    assert.match(src, /listBaks/,
-      'vanta-status must enumerate bak siblings via listBaks');
-    assert.match(src, /bytesTotal/,
-      'queue stat output must include bytesTotal (live + bak aggregate)');
-    assert.match(src, /bakCount/,
-      'queue stat output must include bakCount');
+  test('NO CRITICAL line when sentinel absent (regression guard)', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r11b-clean-'));
+    try {
+      fs.mkdirSync(path.join(tmp, '.vanta'), { recursive: true });
+      const out = runStatus(tmp);
+      // No false-positive CRITICAL when sentinel absent.
+      assert.equal(/CRITICAL/.test(out), false,
+        'CRITICAL must not appear when no sentinel exists');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 });
 
-describe('session-start — routes brief stderr to hook.log (R11 P1 / R12 P2)', () => {
-  test('does not swallow vanta-brief.js stderr to /dev/null', () => {
-    const src = fs.readFileSync(
-      path.join(__dirname, '..', 'hooks', 'session-start'), 'utf8');
-    // R12 P2 — stderr now wrapped through python to emit the structured
-    // `ISO | ERROR | session-start.brief | <msg>` shape vanta-status reads.
-    // Test for HOOK_LOG presence + structured prefix, not the raw redirect.
-    assert.match(src, /HOOK_LOG/,
-      'brief invocation must reference $HOOK_LOG');
-    assert.match(src, /session-start\.brief/,
-      'stderr wrapper must tag entries with the structured source name');
-    // Old shape must NOT be present.
-    assert.equal(/node\s+"\$BRIEF_BIN".*2>\/dev\/null/.test(src), false,
-      '2>/dev/null swallow was replaced (R11 P1) — silent brief crashes');
+describe('session-start — routes brief stderr to hook.log (R11 P1 / R12 P2, v3.6.12 behavior)', () => {
+  // v3.6.12: replaced static-source grep with a real spawn. Stub a brief
+  // generator that throws, run session-start, assert hook.log captures a
+  // structured `ISO | ERROR | session-start.brief | <msg>` line that
+  // vanta-status's reader can parse and count.
+  const { execFileSync } = require('node:child_process');
+  const HOOK = path.join(__dirname, '..', 'hooks', 'session-start');
+
+  test('brief stderr lands in $HOME/.vanta/hook.log with structured prefix', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r11b-stderr-'));
+    try {
+      // Stub vanta-brief.js — write to deployed location so session-start finds it.
+      const stubDir = path.join(tmp, '.claude', 'bin');
+      fs.mkdirSync(stubDir, { recursive: true });
+      const stubPath = path.join(stubDir, 'vanta-brief.js');
+      fs.writeFileSync(stubPath,
+        '#!/usr/bin/env node\n' +
+        'console.error("stub-brief: simulated boom on init");\n' +
+        'process.exit(1);\n');
+      fs.chmodSync(stubPath, 0o755);
+
+      // Provide a valid cwd via stdin (session-start expects {cwd} JSON).
+      const stdinJson = JSON.stringify({ cwd: tmp });
+      const out = execFileSync('bash', [HOOK], {
+        input: stdinJson,
+        env: { ...process.env, HOME: tmp },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 8000,
+      }).toString();
+
+      // Hook still emits valid JSON output even when brief throws.
+      const parsed = JSON.parse(out);
+      assert.equal(parsed.hookSpecificOutput.hookEventName, 'SessionStart');
+      assert.equal(parsed.hookSpecificOutput.additionalContext, '',
+        'when brief throws, additionalContext must be empty (no broken brief shown)');
+
+      // hook.log must contain a STRUCTURED line vanta-status can parse.
+      const hookLog = path.join(tmp, '.vanta', 'hook.log');
+      assert.ok(fs.existsSync(hookLog), 'hook.log must be created when brief writes stderr');
+      const log = fs.readFileSync(hookLog, 'utf8');
+      // Format vanta-status reads: `ISO-ts | ERROR | source | message`.
+      // R12 P2 fix: stderr is wrapped through python to produce this shape.
+      assert.match(log,
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z?\s*\|\s*ERROR\s*\|\s*session-start\.brief\s*\|.*stub-brief: simulated boom/m,
+        `hook.log must contain structured ISO|ERROR|session-start.brief|... line; got:\n${log}`);
+
+      // Cross-check: vanta-status's hook-error reader (same parser) finds it.
+      const STATUS = path.join(__dirname, '..', 'bin', 'vanta-status.js');
+      const statusOut = execFileSync(process.execPath, [STATUS, '--json'], {
+        env: { ...process.env, HOME: tmp },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      }).toString();
+      const status = JSON.parse(statusOut);
+      assert.ok(status.hookErr.counts['session-start.brief'] >= 1,
+        `vanta-status must count this error under "session-start.brief"; got counts: ${JSON.stringify(status.hookErr.counts)}`);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('hook.log NOT polluted when brief succeeds (no false-positive ERROR line)', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r11b-clean-'));
+    try {
+      // Stub a brief that succeeds silently (no stderr, exit 0).
+      const stubDir = path.join(tmp, '.claude', 'bin');
+      fs.mkdirSync(stubDir, { recursive: true });
+      const stubPath = path.join(stubDir, 'vanta-brief.js');
+      fs.writeFileSync(stubPath,
+        '#!/usr/bin/env node\n' +
+        'process.stdout.write("[Vanta] Active: foo · bar\\n");\n');
+      fs.chmodSync(stubPath, 0o755);
+
+      execFileSync('bash', [HOOK], {
+        input: JSON.stringify({ cwd: tmp }),
+        env: { ...process.env, HOME: tmp },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 8000,
+      });
+
+      const hookLog = path.join(tmp, '.vanta', 'hook.log');
+      if (fs.existsSync(hookLog)) {
+        const log = fs.readFileSync(hookLog, 'utf8');
+        assert.equal(log.includes('session-start.brief'), false,
+          `successful brief must NOT add ERROR line to hook.log; got:\n${log}`);
+      }
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 });
 
-describe('vanta-resolve — query-log analyze across .bak.<ts> (R11 P1)', () => {
-  test('analyzeLog uses readMergedJsonl, not single-file read', () => {
-    const src = fs.readFileSync(
-      path.join(__dirname, '..', 'bin', 'vanta-resolve.js'), 'utf8');
-    // analyzeLog must require vanta-jsonl and use readMergedJsonl.
-    const fnMatch = src.match(/function analyzeLog\([\s\S]*?\n\}/);
-    assert.ok(fnMatch, 'analyzeLog must be present');
-    assert.match(fnMatch[0], /readMergedJsonl/,
-      'analyzeLog must merge across rotated bak siblings');
+describe('vanta-resolve — query-log rotation + analyze (R11 P1, v3.6.12 behavior)', () => {
+  // v3.6.12: replaced static-source greps with a spawn that exhausts the
+  // 5MB query-log threshold, fires a real resolve() to trigger rotation,
+  // then runs --analyze and asserts the merged history is visible.
+  const { execFileSync } = require('node:child_process');
+  const RESOLVE_BIN = path.join(__dirname, '..', 'bin', 'vanta-resolve.js');
+
+  function runResolve(args, vantaDir, timeout = 10000) {
+    return execFileSync(process.execPath, [RESOLVE_BIN, ...args], {
+      env: { ...process.env, VANTA_DIR_OVERRIDE: vantaDir, HOME: path.join(vantaDir, 'home') },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout,
+    }).toString();
+  }
+
+  test('5MB query-log rotates to .bak.<ts> on next resolve(); analyzeLog merges history', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r11b-qlog-'));
+    try {
+      const queryLog = path.join(tmp, 'query-log.jsonl');
+      // Pre-fill with valid JSON entries past MAX_BYTES.
+      const beacons = [];
+      for (let i = 0; i < 50; i++) {
+        beacons.push(JSON.stringify({
+          ts: '2025-01-01', topic_hash: `beacon-${i}`, count: i, top: [],
+        }));
+      }
+      const padding = JSON.stringify({
+        ts: '2025-01-01', topic_hash: 'pad', count: 0, top: [],
+        _pad: 'x'.repeat(2000),
+      }) + '\n';
+      let pre = beacons.join('\n') + '\n';
+      while (pre.length < 5_100_000) pre += padding;
+      fs.writeFileSync(queryLog, pre);
+      assert.ok(fs.statSync(queryLog).size > 5_000_000, 'precondition: log > MAX_BYTES');
+
+      // Drive a real resolve() — _logQuery checks size and rotates first,
+      // then appends the new entry to a fresh live file.
+      runResolve(['--topic', 'jwt', '--project', 'pi-perception'], tmp);
+
+      const baks = fs.readdirSync(tmp).filter(n => n.startsWith('query-log.jsonl.bak.'));
+      assert.equal(baks.length, 1, 'rotation must produce exactly one bak sibling');
+      assert.match(baks[0], /query-log\.jsonl\.bak\.\d+\.\d+$/,
+        'bak suffix uses Date.now() + pid (timestamped)');
+      // Bak retains pre-rotation contents intact.
+      assert.ok(fs.statSync(path.join(tmp, baks[0])).size > 5_000_000,
+        'bak preserves pre-rotation bytes');
+      // Live file shrunk to just the post-rotation entry (or two).
+      assert.ok(fs.statSync(queryLog).size < 100_000,
+        'live file is fresh after rotation');
+
+      // analyzeLog must merge live + bak.
+      const out = runResolve(['--analyze', '--format', 'json'], tmp);
+      const parsed = JSON.parse(out);
+      assert.equal(parsed.present, true, 'analyzeLog must report present=true');
+      // Old beacons plus padding survive in bak; new entry in live. The
+      // analyzer caps at last=500, so sampleSize is the merged tail size.
+      assert.ok(parsed.sampleSize >= 50,
+        `analyzeLog must merge bak history; sampleSize=${parsed.sampleSize}`);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 
-  test('rotation uses .bak.<ts> not single .bak (consistent with sync-queue)', () => {
-    const src = fs.readFileSync(
-      path.join(__dirname, '..', 'bin', 'vanta-resolve.js'), 'utf8');
-    // _logQuery must use timestamped suffix.
-    assert.match(src, /\$\{file\}\.bak\.\$\{ts\}/,
-      'query-log rotation must use timestamped .bak.<ts>');
+  test('analyzeLog returns "no log yet" when no live file and no baks exist', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r11b-qlog-empty-'));
+    try {
+      const out = runResolve(['--analyze', '--format', 'json'], tmp);
+      const parsed = JSON.parse(out);
+      assert.equal(parsed.present, false, 'analyzeLog reports absent for fresh tmpdir');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 });
 
@@ -2013,16 +2283,74 @@ describe('vanta-runtime-state — reapStaleBaks retention (R12 P1)', () => {
   });
 });
 
-describe('vanta-status renders disk footprint with bak count (R12 P2)', () => {
-  test('renderText size string includes "+<n> bak" suffix when baks exist', () => {
-    // Static-source: render block must format bytesTotal + bakCount when
-    // bakCount > 0. Verify the conditional + format string are wired.
-    const src = fs.readFileSync(
-      path.join(__dirname, '..', 'bin', 'vanta-status.js'), 'utf8');
-    assert.match(src, /q\.bakCount\s*>\s*0/,
-      'render must branch on bakCount > 0');
-    assert.match(src, /bak \(\$\{bytesHuman\(q\.bytesTotal\)\}\)/,
-      'render must format the bak summary suffix');
+describe('vanta-status — disk footprint with bak count (R11 P2 / R12 P2, v3.6.12 behavior)', () => {
+  // v3.6.12: replaced static-source greps with subprocess invocation
+  // against a fixture HOME. Write a fake queue + N bak files, run
+  // vanta-status, assert the "+N bak (M.MK)" suffix renders correctly.
+  const { execFileSync } = require('node:child_process');
+  const STATUS_BIN = path.join(__dirname, '..', 'bin', 'vanta-status.js');
+
+  function runStatus(home, args = []) {
+    return execFileSync(process.execPath, [STATUS_BIN, ...args], {
+      env: { ...process.env, HOME: home },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 5000,
+    }).toString();
+  }
+
+  test('renders "+<n> bak" suffix with aggregate size when bak siblings exist', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r11b-foot-'));
+    try {
+      const vanta = path.join(tmp, '.vanta');
+      fs.mkdirSync(vanta, { recursive: true });
+      // Live queue with one entry.
+      const live = JSON.stringify({ session_id: 'live-1', synced: false });
+      fs.writeFileSync(path.join(vanta, 'sync-queue.jsonl'), live + '\n');
+      // 3 bak siblings, each ~1KB.
+      const oneK = '{"pad":"' + 'x'.repeat(900) + '"}\n';
+      for (let i = 1; i <= 3; i++) {
+        fs.writeFileSync(path.join(vanta, `sync-queue.jsonl.bak.${100 + i}`), oneK);
+      }
+      const out = runStatus(tmp);
+      // Suffix shape: "+3 bak (3.5K)" or similar — assert presence of count.
+      assert.match(out, /\+3\s+bak/,
+        `output must show "+3 bak" suffix; got:\n${out.slice(0, 800)}`);
+      // Aggregate human-readable size must mention K (3 × ~1K + live).
+      assert.match(out, /\+3\s+bak\s+\(\d/,
+        'bak suffix must include parenthetical size');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('does NOT show bak suffix when no bak siblings exist', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r11b-nobak-'));
+    try {
+      const vanta = path.join(tmp, '.vanta');
+      fs.mkdirSync(vanta, { recursive: true });
+      fs.writeFileSync(path.join(vanta, 'sync-queue.jsonl'),
+        JSON.stringify({ session_id: 's1' }) + '\n');
+      const out = runStatus(tmp);
+      assert.equal(/\+\d+\s+bak/.test(out), false,
+        'no bak suffix expected when bak count is 0');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('JSON mode reports bytesTotal and bakCount fields', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r11b-json-'));
+    try {
+      const vanta = path.join(tmp, '.vanta');
+      fs.mkdirSync(vanta, { recursive: true });
+      fs.writeFileSync(path.join(vanta, 'sync-queue.jsonl'),
+        JSON.stringify({ session_id: 's1' }) + '\n');
+      fs.writeFileSync(path.join(vanta, 'sync-queue.jsonl.bak.999'),
+        JSON.stringify({ session_id: 'old' }) + '\n');
+      const out = runStatus(tmp, ['--json']);
+      const parsed = JSON.parse(out);
+      const queue = (parsed.queues || []).find(q => q.name === 'sync-queue');
+      assert.ok(queue, 'sync-queue must appear in JSON output');
+      assert.equal(queue.bakCount, 1, 'bakCount must reflect actual bak files');
+      assert.ok(queue.bytesTotal > queue.bytes,
+        `bytesTotal (${queue.bytesTotal}) must exceed live bytes (${queue.bytes}) when bak exists`);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 });
 
