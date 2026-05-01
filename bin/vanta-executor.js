@@ -47,20 +47,33 @@ function failureEscalation(){ return _escalation    || (_escalation    = _resolv
 function trustMetrics()     { return _trust         || (_trust         = _resolve('vanta-trust-metrics.js'));    }
 function projects()         { return _projects      || (_projects      = _resolve('vanta-projects.js'));        }
 
-// R2 council fix — share one canonical project-slug derivation between
-// executor and hooks. `canonProject` expects a SLUG (basename), not a
-// full path: feeding `/Users/vinamr/Projects/vanta` returns the path
-// itself lowercased, which never matches the slug used by action-log
-// rows. Always basename first, canonProject second, identity fallback.
+// R3 council fix — delegate to the shared `slugFromCwd()` resolver in
+// vanta-projects.js, which already handles:
+//   - symlinks (fs.realpathSync)
+//   - git remote.origin.url org-repo slugs (globally unique)
+//   - monorepo subdirs (git rev-parse --show-toplevel takes basename
+//     of repo root, not cwd, so /repo/packages/api → 'repo' not 'api')
+//   - ambiguous basenames ($HOME, /tmp, etc. → null)
+//   - canonical keyword aliases (PROJECT_KEYWORDS lookup)
+//
+// R2's basename + canonProject sandwich missed the monorepo case because
+// `path.basename('/repo/packages/api')` is `api`, fragmenting trust per
+// subdirectory. slugFromCwd walks up to the git root first.
+//
 // Mirrored in hooks/prompt-rewriter.js — keep in sync.
 function _canonProjectFromCwd(cwd) {
   if (!cwd) return null;
-  const slug = path.basename(cwd);
   const p = projects();
+  if (p && typeof p.slugFromCwd === 'function') {
+    try { return p.slugFromCwd(cwd) || null; } catch (_) { /* fall through */ }
+  }
+  // Defensive fallback only fires if vanta-projects.js fails to load
+  // or throws. Keeps decide() from crashing in degraded environments.
   if (p && typeof p.canonProject === 'function') {
+    const slug = path.basename(cwd);
     return p.canonProject(slug) || slug;
   }
-  return slug;
+  return path.basename(cwd);
 }
 
 // v3.7.4 — effort signal. A "big" change is risk-elevating regardless
@@ -103,11 +116,20 @@ function _uncertaintySignal(cls, routingMode) {
 // R2 council fix — trust-metrics cache. `tm.compute()` reads the entire
 // `~/.vanta/interactions.jsonl` (and any rotated `.bak` siblings) into
 // memory and JSON-parses each line; on a heavy user this is tens of MBs
-// of work re-done on every UserPromptSubmit. The metrics shift on the
-// scale of hours, not milliseconds — a 60s TTL per (project) keeps the
-// hot path predictable. The cache lives at module scope so the same
-// node-process executor reuses the entry across decide() calls.
-const _TRUST_TTL_MS = 60_000;
+// of work re-done on every UserPromptSubmit. The cache lives at module
+// scope so the same node-process executor reuses the entry across
+// decide() calls.
+//
+// R3 council tuning:
+//  - TTL 60s → 15s. Gemini R3 P3 noted that an undo/interrupt should
+//    flip trust immediately. 15s still relieves the hot path (typical
+//    session: << 1 prompt/sec) but caps the lag where inline_ready
+//    stays true after a regret signal.
+//  - Cache size capped at 64 entries. Gemini R3 P4 — long-running
+//    daemon with churning cwds would bleed memory unbounded. 64 is
+//    well above realistic project counts for any single user.
+const _TRUST_TTL_MS = 15_000;
+const _TRUST_CACHE_MAX = 64;
 const _trustCache = new Map(); // key = project || '__null__' → {ts, m}
 function _cachedTrust(tm, project) {
   if (!tm || typeof tm.compute !== 'function') return null;
@@ -117,6 +139,12 @@ function _cachedTrust(tm, project) {
   if (hit && (now - hit.ts) < _TRUST_TTL_MS) return hit.m;
   let m = null;
   try { m = tm.compute({ days: 30, project }); } catch (_) { m = null; }
+  if (_trustCache.size >= _TRUST_CACHE_MAX) {
+    // Evict oldest by insertion order — Map preserves insertion order
+    // for iteration. Cheap, deterministic, no extra bookkeeping.
+    const firstKey = _trustCache.keys().next().value;
+    if (firstKey !== undefined) _trustCache.delete(firstKey);
+  }
   _trustCache.set(key, { ts: now, m });
   return m;
 }

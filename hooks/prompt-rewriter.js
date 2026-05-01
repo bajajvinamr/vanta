@@ -77,23 +77,26 @@ process.stdin.on('end', () => {
   // Without this, `vanta-trust-metrics.compute({project})` filters out
   // every rewrite event and inline_ready never earns a project signal.
   //
-  // R2 fix — `canonProject` expects a SLUG (basename), not a full path.
-  // Passing the full path lowercases it and falls through to the
-  // identity branch, returning `/users/vinamr/projects/vanta` instead
-  // of `vanta`. The action-log row then never matches a
-  // `compute({project: 'vanta'})` query and the v3.7.5 scoping fix
-  // remains effectively dead. Always basename first, canonProject second.
-  const slug = path.basename(cwd);
-  let project = slug;
+  // R3 fix — delegate to vanta-projects.slugFromCwd(), which walks up
+  // to the git repo root before slugging. Without this, monorepo
+  // subdirs (`/repo/packages/api`) get slug `api` instead of `repo`,
+  // and trust signals fragment across the workspace. The executor uses
+  // the same helper (bin/vanta-executor.js _canonProjectFromCwd) — keep
+  // them in sync.
+  let project = null;
   try {
     const projectsPath = _resolveBin('vanta-projects.js');
     if (projectsPath) {
-      const { canonProject } = require(projectsPath);
-      project = (canonProject ? canonProject(slug) : slug) || slug;
+      const projectsMod = require(projectsPath);
+      if (typeof projectsMod.slugFromCwd === 'function') {
+        project = projectsMod.slugFromCwd(cwd) || null;
+      } else if (typeof projectsMod.canonProject === 'function') {
+        const slug = path.basename(cwd);
+        project = projectsMod.canonProject(slug) || slug;
+      }
     }
-  } catch (_) {
-    project = slug;
-  }
+  } catch (_) { /* fall through to basename */ }
+  if (!project) project = path.basename(cwd);
 
   // Resolve executor bin and call it directly (in-process).
   const executorPath = _resolveBin('vanta-executor.js');
