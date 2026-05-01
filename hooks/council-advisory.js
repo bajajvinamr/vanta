@@ -28,6 +28,15 @@ for (const p of [
     break;
   } catch { /* keep looking */ }
 }
+let _runtimeState = null;
+function rs() {
+  if (_runtimeState !== null) return _runtimeState;
+  for (const p of [
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-runtime-state.js'),
+    path.join(os.homedir(), 'Projects', 'vanta', 'bin', 'vanta-runtime-state.js'),
+  ]) { try { _runtimeState = require(p); break; } catch {} }
+  return _runtimeState;
+}
 
 // Cleanup #11: lazy logger.
 let _vlog;
@@ -141,15 +150,40 @@ process.stdin.on('end', () => {
 
     // Tier 6 #14: detect contradictions in the SAME slice the LLM will see.
     // Surfaced first so the warning lands before either contradictory entry.
+    //
+    // R6 P3 fix — dedup with prompt-context. Track shown contradictions in
+    // runtime-state under `contradiction-shown:<token-hash>`. Whichever
+    // hook fires first (council-advisory on Write|Edit, prompt-context on
+    // UserPromptSubmit) wins the slot for 10 minutes; the other stays
+    // silent on that contradiction.
     let contradictionSection = null;
     if (detectContradictions) {
       try {
         const sigs = detectContradictions(topAggregated);
         if (sigs.length > 0) {
-          contradictionSection =
-            '⚠️  CONTRADICTION DETECTED — sources disagree, resolve before implementing:\n' +
-            sigs.map(c => `- ${c.hint} [confidence ${c.confidence}]`).join('\n') +
-            '\n  → Newer source typically wins. If the older entry is wrong, deprecate via /council.';
+          const sessionId = data.session_id;
+          const stateMod = rs();
+          const fresh = [];
+          for (const c of sigs) {
+            const tokens = (c.tokens || []).slice().sort().join('-').toLowerCase();
+            const cKey = `contradiction-shown:${tokens || c.hint.slice(0, 30)}`;
+            let canShow = true;
+            if (sessionId && stateMod) {
+              try { canShow = stateMod.shouldInject(sessionId, cKey); } catch { canShow = true; }
+            }
+            if (canShow) {
+              fresh.push(c);
+              if (sessionId && stateMod) {
+                try { stateMod.markInjected(sessionId, cKey); } catch {}
+              }
+            }
+          }
+          if (fresh.length > 0) {
+            contradictionSection =
+              '⚠️  CONTRADICTION DETECTED — sources disagree, resolve before implementing:\n' +
+              fresh.map(c => `- ${c.hint} [confidence ${c.confidence}]`).join('\n') +
+              '\n  → Newer source typically wins. If the older entry is wrong, deprecate via /council.';
+          }
         }
       } catch (e) { /* never block on detector failure */ }
     }

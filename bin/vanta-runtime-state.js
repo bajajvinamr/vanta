@@ -172,13 +172,18 @@ function _compact(sessionId, { force = false } = {}) {
 }
 
 // ─── cooldown table ────────────────────────────────────────────────────────
-
+//
+// Codex+Gemini council R6 P3 fix — pruned dead entries. Earlier the table
+// listed cooldowns for council-advisory + tool-observer but neither hook
+// called shouldInject/markInjected. The aspirational entries were
+// misleading: a reader of this code would think those hooks dedup, but
+// they fire every event. Now: only the hooks that actually call
+// shouldInject are listed.
 const COOLDOWNS = {
-  'council-advisory:': 30 * 60_000,
-  'prompt-context:':   10 * 60_000,
-  'tool-observer:':    15 * 60_000,
-  'stack-file-nudge:': 60 * 60_000,
-  'default':            5 * 60_000,
+  'prompt-context:':       10 * 60_000,
+  'stack-file-nudge:':     60 * 60_000,
+  'contradiction-shown:':  10 * 60_000,  // R6 P3 dedup between council-advisory + prompt-context
+  'default':                5 * 60_000,
 };
 
 function _cooldownFor(key) {

@@ -103,6 +103,9 @@ function readQueues() {
     { name: 'sync-queue',     file: path.join(VANTA_DIR, 'sync-queue.jsonl'),     special: 'unsynced' },
     { name: 'episodes',       file: path.join(VANTA_DIR, 'episodes.jsonl'),       special: null      },
     { name: 'missed-intents', file: path.join(VANTA_DIR, 'missed-intents.jsonl'), special: null      },
+    // R6 P2 fix — surface always-on telemetry so it isn't a write-only tax.
+    // Counts events in the last 24h so the user sees active hook coverage.
+    { name: 'interactions',   file: path.join(VANTA_DIR, 'interactions.jsonl'),   special: 'interactions' },
     // Tier 6 #16: surface staged invariants pending review so they don't
     // pile up silently. Counts <!-- vanta-sync: --> blocks.
     { name: 'staging-invariants', file: path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.staging.md'), special: 'staging' },
@@ -135,6 +138,29 @@ function readQueues() {
         stagingCount = (raw.match(/<!-- vanta-sync:/g) || []).length;
       } catch {}
     }
+    let interactions24h = null;
+    if (q.special === 'interactions') {
+      // Cheap pass: count events in last 24h, count failures, top 3 tools.
+      // No fold — interactions.jsonl is shape-only and rotated at 5MB.
+      try {
+        const raw = fs.readFileSync(q.file, 'utf8');
+        const cutoff = Date.now() - 24 * 60 * 60_000;
+        let total = 0, failures = 0;
+        const byTool = new Map();
+        for (const l of raw.split('\n')) {
+          if (!l) continue;
+          try {
+            const e = JSON.parse(l);
+            if (Date.parse(e.ts) < cutoff) continue;
+            total++;
+            if (e.ok === false) failures++;
+            byTool.set(e.tool, (byTool.get(e.tool) || 0) + 1);
+          } catch {}
+        }
+        const topTools = [...byTool.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+        interactions24h = { total, failures, topTools };
+      } catch {}
+    }
     out.push({
       name: q.name,
       present: true,
@@ -143,6 +169,7 @@ function readQueues() {
       mtime: st.mtimeMs,
       unsynced,
       stagingCount,
+      interactions24h,
     });
   }
   return out;
@@ -311,6 +338,13 @@ function renderText() {
     if (q.unsynced != null && q.unsynced > 0) extras.push(`${q.unsynced} unsynced`);
     if (q.unsynced === 0) extras.push('all synced');
     if (q.stagingCount != null && q.stagingCount > 0) extras.push(`${q.stagingCount} pending review`);
+    if (q.interactions24h) {
+      const { total, failures, topTools } = q.interactions24h;
+      if (total > 0) {
+        const topStr = topTools.map(([t, n]) => `${t}:${n}`).join(' ');
+        extras.push(`${total} 24h${failures ? ` (${failures} failed)` : ''}${topStr ? ' · ' + topStr : ''}`);
+      }
+    }
     console.log('  ' +
       q.name.padEnd(16) + '  ' +
       String(q.lines).padStart(4) + ' lines  ' +
