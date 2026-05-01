@@ -3185,3 +3185,110 @@ describe('vanta-regret-detector — silent regret across sessions (v3.6.16)', ()
   });
 });
 
+// ─── v3.6.17 — Day 11: autonomy levels + project-context auto-detect ─────────
+
+describe('vanta-autonomy — project-context detection (v3.6.17)', () => {
+  const auto = require('../bin/vanta-autonomy');
+  const { execSync } = require('node:child_process');
+
+  test('non-repo cwd: kind=non-repo, level=L0', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-auto-norepo-'));
+    try {
+      const eff = auto.effectiveLevel(tmp);
+      assert.equal(eff.level, 'L0');
+      assert.equal(eff.detected.kind, 'non-repo');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('repo with no code markers: kind=doc, level=L0', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-auto-doc-'));
+    try {
+      execSync('git init -q', { cwd: tmp });
+      fs.writeFileSync(path.join(tmp, 'README.md'), 'just a doc\n');
+      const eff = auto.effectiveLevel(tmp);
+      assert.equal(eff.detected.kind, 'doc');
+      assert.equal(eff.level, 'L0', 'doc repos must default to L0');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('code repo (package.json): kind=code, default level=L1', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-auto-code-'));
+    try {
+      execSync('git init -q', { cwd: tmp });
+      fs.writeFileSync(path.join(tmp, 'package.json'), '{}\n');
+      const eff = auto.effectiveLevel(tmp);
+      assert.equal(eff.detected.kind, 'code');
+      assert.equal(eff.level, 'L1', 'code repos default to L1');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('code repo (pyproject.toml): kind=code', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-auto-py-'));
+    try {
+      execSync('git init -q', { cwd: tmp });
+      fs.writeFileSync(path.join(tmp, 'pyproject.toml'), '[project]\nname = "x"\n');
+      assert.equal(auto.effectiveLevel(tmp).detected.kind, 'code');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('explicit config wins over default', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-auto-explicit-'));
+    try {
+      execSync('git init -q', { cwd: tmp });
+      fs.writeFileSync(path.join(tmp, 'package.json'), '{}\n');
+      auto.writeConfig(tmp, { level: 'L2' });
+      const eff = auto.effectiveLevel(tmp);
+      assert.equal(eff.level, 'L2');
+      assert.equal(eff.reason, 'explicit config');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('manual upgrade: L1 → L2 writes config + records action-log', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-auto-upg-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      execSync('git init -q', { cwd: tmp });
+      fs.writeFileSync(path.join(tmp, 'package.json'), '{}\n');
+      const r = auto.manualUpgrade(tmp);
+      assert.equal(r.changed, true);
+      assert.equal(r.prior, 'L1');
+      assert.equal(r.level, 'L2');
+      assert.equal(auto.effectiveLevel(tmp).level, 'L2');
+      // Action-log should have the autonomy-promote entry.
+      const al3 = require('../bin/vanta-action-log');
+      const entries = al3.read({ action: 'autonomy-promote' });
+      assert.ok(entries.length >= 1);
+      assert.equal(entries[0].undo_hint.kind, 'autonomy-promote');
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('tick on stable code repo with no metrics: returns stable, no change', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-auto-tick-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      execSync('git init -q', { cwd: tmp });
+      fs.writeFileSync(path.join(tmp, 'package.json'), '{}\n');
+      const r = auto.tick(tmp);
+      assert.equal(r.changed, false);
+      assert.equal(r.level, 'L1');
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('detectProjectKind respects standard markers', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-auto-det-'));
+    try {
+      execSync('git init -q', { cwd: tmp });
+      assert.equal(auto.detectProjectKind(tmp).kind, 'doc');
+      fs.writeFileSync(path.join(tmp, 'go.mod'), 'module x\n');
+      assert.equal(auto.detectProjectKind(tmp).kind, 'code');
+      assert.equal(auto.detectProjectKind(tmp).marker, 'go.mod');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+});
+
