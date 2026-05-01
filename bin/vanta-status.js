@@ -166,11 +166,27 @@ function readQueues() {
         interactions24h = { total, failures, topTools };
       } catch {}
     }
+    // R11 P2 — Codex+Gemini council finding. Earlier impl reported only
+    // the live file's size. After R8 P1 moved rotation to `.bak.<ts>`
+    // siblings (no fold-on-rotate), bak files accumulate across the year
+    // and were invisible to vanta-status. Now: aggregate live + all baks
+    // so the user actually sees disk footprint and rotation count.
+    let bakBytes = 0, bakCount = 0;
+    try {
+      const { listBaks } = require('./vanta-jsonl');
+      const baks = listBaks(q.file);
+      bakCount = baks.length;
+      for (const b of baks) {
+        try { bakBytes += fs.statSync(b).size; } catch {}
+      }
+    } catch { /* vanta-jsonl optional — degrade gracefully */ }
     out.push({
       name: q.name,
       present: true,
       lines: countLines(q.file),
       bytes: st.size,
+      bytesTotal: st.size + bakBytes,
+      bakCount,
       mtime: st.mtimeMs,
       unsynced,
       stagingCount,
@@ -445,6 +461,19 @@ function renderText() {
 
   // Suggestions
   const sugg = [];
+  // R11 P1 — Codex+Gemini council finding. The R8 P2 fix touched
+  // `~/.vanta/.bin-missing` when prompt-context couldn't load deps, but
+  // vanta-status never read it. The user could be running with the
+  // always-on layer entirely disabled and never know. Surface it as a
+  // CRITICAL suggestion so the diagnostic loop closes.
+  try {
+    const sentinel = path.join(VANTA_DIR, '.bin-missing');
+    if (fs.existsSync(sentinel)) {
+      const content = fs.readFileSync(sentinel, 'utf8').trim();
+      const firstLine = content.split('\n').pop() || '(no detail)';
+      sugg.push(`CRITICAL: bin-missing sentinel set — always-on layer disabled. Last: ${firstLine.slice(0, 120)}`);
+    }
+  } catch { /* never block status */ }
   const unsynced = (queues.find(q => q.name === 'sync-queue') || {}).unsynced || 0;
   if (unsynced > 0)        sugg.push(`/vanta-sync to clear ${unsynced} unsynced session(s)`);
   const staging = (queues.find(q => q.name === 'staging-invariants') || {}).stagingCount || 0;

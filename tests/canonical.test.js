@@ -1903,3 +1903,66 @@ describe('uninstall.sh — strips using-vanta @-import (R10 P2)', () => {
   });
 });
 
+// ─── R11 lockdown — observability surface (Codex+Gemini R11 P1/P2) ───────────
+
+describe('vanta-status — surfaces R7-R10 sentinels (R11 P1)', () => {
+  test('reads ~/.vanta/.bin-missing sentinel and emits CRITICAL suggestion', () => {
+    // R8 P2 prompt-context touches the sentinel when bins fail to load.
+    // R11 P1 requires vanta-status to read it and surface a CRITICAL hint.
+    // Verify by source: vanta-status must reference .bin-missing in its
+    // suggestions block.
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'bin', 'vanta-status.js'), 'utf8');
+    assert.match(src, /\.bin-missing/,
+      'vanta-status must check the .bin-missing sentinel');
+    assert.match(src, /CRITICAL.*always-on layer disabled/,
+      'vanta-status must surface CRITICAL when sentinel exists');
+  });
+
+  test('reports total disk footprint including rotated .bak.<ts> siblings', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'bin', 'vanta-status.js'), 'utf8');
+    // Must call listBaks and aggregate sizes.
+    assert.match(src, /listBaks/,
+      'vanta-status must enumerate bak siblings via listBaks');
+    assert.match(src, /bytesTotal/,
+      'queue stat output must include bytesTotal (live + bak aggregate)');
+    assert.match(src, /bakCount/,
+      'queue stat output must include bakCount');
+  });
+});
+
+describe('session-start — routes brief stderr to hook.log (R11 P1)', () => {
+  test('does not swallow vanta-brief.js stderr to /dev/null', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'hooks', 'session-start'), 'utf8');
+    // The brief invocation line must NOT use `2>/dev/null`. It must
+    // append stderr to $HOOK_LOG so failures surface via vanta-status.
+    assert.match(src, /node\s+"\$BRIEF_BIN".*2>>"\$HOOK_LOG"/,
+      'brief invocation must append stderr to $HOOK_LOG');
+    // Old shape must NOT be present.
+    assert.equal(/node\s+"\$BRIEF_BIN".*2>\/dev\/null/.test(src), false,
+      '2>/dev/null swallow was replaced (R11 P1) — silent brief crashes');
+  });
+});
+
+describe('vanta-resolve — query-log analyze across .bak.<ts> (R11 P1)', () => {
+  test('analyzeLog uses readMergedJsonl, not single-file read', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'bin', 'vanta-resolve.js'), 'utf8');
+    // analyzeLog must require vanta-jsonl and use readMergedJsonl.
+    const fnMatch = src.match(/function analyzeLog\([\s\S]*?\n\}/);
+    assert.ok(fnMatch, 'analyzeLog must be present');
+    assert.match(fnMatch[0], /readMergedJsonl/,
+      'analyzeLog must merge across rotated bak siblings');
+  });
+
+  test('rotation uses .bak.<ts> not single .bak (consistent with sync-queue)', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'bin', 'vanta-resolve.js'), 'utf8');
+    // _logQuery must use timestamped suffix.
+    assert.match(src, /\$\{file\}\.bak\.\$\{ts\}/,
+      'query-log rotation must use timestamped .bak.<ts>');
+  });
+});
+
