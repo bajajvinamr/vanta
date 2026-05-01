@@ -150,9 +150,13 @@ function _compact(sessionId, { force = false } = {}) {
   const file = _fileFor(sessionId);
   if (!fs.existsSync(file)) return;
   try {
+    let preMtimeMs = 0;
     if (!force) {
       const st = fs.statSync(file);
       if (Date.now() - st.mtimeMs < QUIESCE_MS) return;  // live — skip.
+      preMtimeMs = st.mtimeMs;
+    } else {
+      try { preMtimeMs = fs.statSync(file).mtimeMs; } catch {}
     }
     const state = _foldJournal(sessionId);
     const snapshotLine = JSON.stringify({
@@ -167,6 +171,19 @@ function _compact(sessionId, { force = false } = {}) {
     }) + '\n';
     const tmp = file + '.compact';
     fs.writeFileSync(tmp, snapshotLine);
+    // R8 P3 — Gemini council finding. A dormant session can wake up
+    // (user returns from coffee, sends a prompt) AFTER we read mtime
+    // for the QUIESCE check but BEFORE we rename. The rename then
+    // clobbers the new appendLine. Re-check mtime right before rename;
+    // if it changed, abort and leave the journal alone — fold-cache
+    // will pick up the new line on next read.
+    try {
+      const stNow = fs.statSync(file);
+      if (preMtimeMs && stNow.mtimeMs !== preMtimeMs) {
+        try { fs.unlinkSync(tmp); } catch {}
+        return;  // session woke up mid-compact; skip this round.
+      }
+    } catch { /* file may have been removed; let rename throw if so */ }
     fs.renameSync(tmp, file);
   } catch { /* never block */ }
 }
@@ -217,7 +234,14 @@ function shouldInject(sessionId, key, { cooldownMs } = {}) {
   const last = state.injected[key];
   if (typeof last !== 'number') return true;
   const window = typeof cooldownMs === 'number' ? cooldownMs : _cooldownFor(key);
-  return (Date.now() - last) >= window;
+  // R8 P3 — Codex council finding. If the wall clock rolls back (DST,
+  // manual correction, machine asleep then woken to a stale RTC), `now -
+  // last` goes negative and the cooldown stays active for hours. Treat
+  // negative deltas as "expired" — re-inject is safer than suppressing
+  // the always-on layer until real time catches up.
+  const delta = Date.now() - last;
+  if (delta < 0) return true;
+  return delta >= window;
 }
 
 function markInjected(sessionId, key) {
@@ -251,11 +275,25 @@ function reapStale({ days = 7, compactRest = true } = {}) {
   try {
     if (!fs.existsSync(dir)) return 0;
     const cutoff = Date.now() - days * 86400_000;
+    // R8 P2 — sweep stale tmp/.compact leaks (Gemini council). When a hook
+    // is SIGKILL'd between writeFileSync(tmp) and renameSync(tmp, file),
+    // tmp/compact files leak forever. Reap any older than 1 hour.
+    const tmpCutoff = Date.now() - 60 * 60_000;
     for (const f of fs.readdirSync(dir)) {
       if (!f.endsWith('.jsonl')) {
         // Backwards-compat: clean up old .json snapshots from v3.6.0.
         if (f.endsWith('.json')) {
           try { fs.unlinkSync(path.join(dir, f)); } catch {}
+        }
+        // R8 P2: stale tmp from interrupted compaction.
+        if (f.endsWith('.compact') || /\.tmp(\.|$)/.test(f)) {
+          try {
+            const st = fs.statSync(path.join(dir, f));
+            if (st.mtimeMs < tmpCutoff) {
+              fs.unlinkSync(path.join(dir, f));
+              removed++;
+            }
+          } catch {}
         }
         continue;
       }
@@ -270,6 +308,28 @@ function reapStale({ days = 7, compactRest = true } = {}) {
       } catch {}
     }
   } catch {}
+  return removed;
+}
+
+// R8 P2 — sweep tmp/compact files outside the runtime dir too. Used by the
+// Stop hook to clean .vanta/* and ~/.vanta/knowledge/*.tmp.* leaks from
+// indexer SIGKILL events. Returns count of files removed.
+function reapStaleTmp(dirs, ageHours = 1) {
+  const cutoff = Date.now() - ageHours * 60 * 60_000;
+  let removed = 0;
+  for (const dir of dirs) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      for (const f of fs.readdirSync(dir)) {
+        if (!/\.tmp(\.|$)|\.compact$/.test(f)) continue;
+        try {
+          const full = path.join(dir, f);
+          const st = fs.statSync(full);
+          if (st.mtimeMs < cutoff) { fs.unlinkSync(full); removed++; }
+        } catch {}
+      }
+    } catch {}
+  }
   return removed;
 }
 
@@ -306,7 +366,7 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
-  getState, shouldInject, markInjected, bump, setPhase, resetSession, reapStale,
+  getState, shouldInject, markInjected, bump, setPhase, resetSession, reapStale, reapStaleTmp,
   COOLDOWNS,
   // Internal — exported for tests:
   _foldJournal, _compact, _fileFor, _clearFoldCache,

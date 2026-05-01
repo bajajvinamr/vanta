@@ -1545,3 +1545,208 @@ describe('vanta-projects — slugFromCwd', () => {
     assert.equal(slugFromCwd(undefined), null);
   });
 });
+
+// ─── R8 lockdown — rotation rename-only + merged read (Gemini R8 P1) ────────
+
+describe('vanta-jsonl — merged read across .bak.<ts> rotations', () => {
+  const { readMergedJsonl, readDedupedJsonl, listBaks } = require('../bin/vanta-jsonl');
+
+  test('reads live + bak files in age order (oldest first)', () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-jsonl-'));
+    const file = path.join(tmpdir, 'q.jsonl');
+    // Three "rotations": old bak, mid bak, live.
+    fs.writeFileSync(file + '.bak.1000', '{"id":"a","v":1}\n');
+    fs.writeFileSync(file + '.bak.2000', '{"id":"b","v":2}\n{"id":"a","v":2}\n');
+    fs.writeFileSync(file,               '{"id":"c","v":3}\n{"id":"b","v":3}\n');
+    try {
+      const out = readMergedJsonl(file);
+      const lines = out.split('\n').filter(Boolean);
+      // Older first, live last. Expected order: a v1, b v2, a v2, c v3, b v3.
+      assert.equal(lines.length, 5);
+      assert.match(lines[0], /"v":1/);
+      assert.match(lines[4], /"v":3/);
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  test('readDedupedJsonl: latest wins per session_id', () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-jsonl-'));
+    const file = path.join(tmpdir, 'q.jsonl');
+    fs.writeFileSync(file + '.bak.1', '{"session_id":"s1","synced":false}\n');
+    fs.writeFileSync(file,            '{"session_id":"s1","synced":true}\n');
+    try {
+      const m = readDedupedJsonl(file);
+      assert.equal(m.size, 1);
+      assert.equal(m.get('s1').synced, true, 'live file wins over .bak');
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  test('listBaks returns sorted bak siblings', () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-jsonl-'));
+    const file = path.join(tmpdir, 'q.jsonl');
+    fs.writeFileSync(file + '.bak.20', '');
+    fs.writeFileSync(file + '.bak.10', '');
+    fs.writeFileSync(file + '.bak.30', '');
+    try {
+      const baks = listBaks(file);
+      assert.equal(baks.length, 3);
+      // Sorted by string (which == numeric for these simple suffixes).
+      assert.match(baks[0], /\.bak\.10$/);
+      assert.match(baks[2], /\.bak\.30$/);
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  test('handles empty/missing live file gracefully', () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-jsonl-empty-'));
+    const file = path.join(tmpdir, 'noexist.jsonl');
+    try {
+      // Live missing, bak present.
+      fs.writeFileSync(file + '.bak.1', '{"x":1}\n');
+      const out = readMergedJsonl(file);
+      assert.match(out, /"x":1/);
+      // Both missing.
+      fs.unlinkSync(file + '.bak.1');
+      assert.equal(readMergedJsonl(file).trim(), '');
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── R8 lockdown — clock rollback (Codex R8 P3) ──────────────────────────────
+
+describe('vanta-runtime-state — clock rollback handling (R8 P3)', () => {
+  test('shouldInject returns true on negative time delta (clock rolled back)', () => {
+    // Force a fresh require so we don't share state with the other suite.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rs-r8-'));
+    process.env.VANTA_DIR_OVERRIDE = tmpDir;
+    delete require.cache[require.resolve('../bin/vanta-runtime-state')];
+    const rs = require('../bin/vanta-runtime-state');
+    try {
+      const sid = 'clock-test';
+      const key = 'prompt-context:abc';
+      // Mark injection at a FUTURE time (simulating a system clock that
+      // was set forward then rolled back). After mark, Date.now() < last.
+      rs.markInjected(sid, key);
+      // Manually overwrite the journaled timestamp to be in the future.
+      const file = path.join(tmpDir, 'runtime', sid + '.jsonl');
+      const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+      const futureNow = Date.now() + 24 * 3600_000;  // +1 day
+      const fixed = lines.map(l => {
+        try { const e = JSON.parse(l); if (e.op === 'inject') e.value = futureNow; return JSON.stringify(e); }
+        catch { return l; }
+      }).join('\n') + '\n';
+      fs.writeFileSync(file, fixed);
+      // Refresh fold cache by clearing.
+      if (rs._clearFoldCache) rs._clearFoldCache();
+      const can = rs.shouldInject(sid, key);
+      assert.equal(can, true, 'negative delta must return true (re-inject), not suppress until time catches up');
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      delete require.cache[require.resolve('../bin/vanta-runtime-state')];
+    }
+  });
+});
+
+// ─── R8 lockdown — v3.6.0 episode shape compat (Codex R8 P3) ─────────────────
+
+describe('vanta-resolve — legacy episode shape (R8 P3)', () => {
+  test('reads v3.6.0 episodes that used `topic` and `project` fields', () => {
+    // Pre-v3.6.6 episodes had {topic, decision, outcome, date, project} per
+    // the auto-sync.js header doc. Current shape is {topics, slug}.
+    // Both must read.
+    const episodesFile = path.join(os.homedir(), '.vanta', 'episodes.jsonl');
+    let prior = null;
+    try { prior = fs.readFileSync(episodesFile, 'utf8'); } catch {}
+    fs.mkdirSync(path.dirname(episodesFile), { recursive: true });
+
+    // Ensure no rotated baks interfere — save and clear them.
+    const dir = path.dirname(episodesFile);
+    const base = path.basename(episodesFile);
+    const baks = (() => {
+      try { return fs.readdirSync(dir).filter(n => n.startsWith(base + '.bak.')); }
+      catch { return []; }
+    })();
+    const bakBackups = baks.map(b => {
+      const p = path.join(dir, b);
+      const c = fs.readFileSync(p, 'utf8');
+      fs.unlinkSync(p);
+      return { p, c };
+    });
+
+    // One legacy entry, one current entry.
+    const legacy = JSON.stringify({
+      ts: '2026-04-01T00:00:00Z',
+      session_id: 'r8-legacy',
+      topic: 'r8legacytopic',  // singular
+      project: 'r8legacyproj',
+      decision: 'r8legacytopic was the right call',
+      outcome: 'resolved',
+    });
+    const current = JSON.stringify({
+      ts: '2026-04-02T00:00:00Z',
+      session_id: 'r8-current',
+      topics: ['r8currenttopic'],
+      slug: 'r8currentproj',
+      decision: 'r8currenttopic shipped clean',
+      outcome: 'resolved',
+    });
+    fs.writeFileSync(episodesFile, legacy + '\n' + current + '\n');
+
+    delete require.cache[require.resolve('../bin/vanta-resolve')];
+    const resolver = require('../bin/vanta-resolve');
+    try {
+      resolver.clearCache();
+      // Query the LEGACY entry's topic.
+      const out = resolver.resolve({ topic: 'r8legacytopic', max: 5 });
+      const sawLegacy = out.results.some(r =>
+        r.source === 'episode' && /right call/.test(r.excerpt));
+      assert.equal(sawLegacy, true, 'legacy episode shape must be readable');
+
+      // Query the CURRENT entry's topic.
+      resolver.clearCache();
+      const out2 = resolver.resolve({ topic: 'r8currenttopic', max: 5 });
+      const sawCurrent = out2.results.some(r =>
+        r.source === 'episode' && /shipped clean/.test(r.excerpt));
+      assert.equal(sawCurrent, true, 'current episode shape must be readable');
+    } finally {
+      if (prior !== null) fs.writeFileSync(episodesFile, prior);
+      else { try { fs.unlinkSync(episodesFile); } catch {} }
+      // Restore any bak backups we moved aside.
+      for (const b of bakBackups) fs.writeFileSync(b.p, b.c);
+      resolver.clearCache();
+      delete require.cache[require.resolve('../bin/vanta-resolve')];
+    }
+  });
+});
+
+// ─── R8 lockdown — auto-sync rotation rename-only (Gemini R8 P1) ─────────────
+
+describe('auto-sync — rotation does not destroy concurrent appends (R8 P1)', () => {
+  test('rotation produces .bak.<ts> file and does NOT call fs.writeFileSync', () => {
+    // Static-source sanity check. The fix removes the in-rotation
+    // fs.writeFileSync(file, folded). Verify by reading the source — if
+    // someone re-introduces it, this test catches it.
+    const src = fs.readFileSync(path.join(__dirname, '..', 'hooks', 'auto-sync.js'), 'utf8');
+    // Must rotate via timestamped suffix.
+    assert.match(src, /\.bak\.\$\{ts\}/, 'rotation must use timestamped .bak.<ts>');
+    // Strip comments and string literals so the regex doesn't match the
+    // word in explanatory prose. Crude but sufficient: drop // line
+    // comments before scanning.
+    const code = src.split('\n')
+      .map(l => l.replace(/\s*\/\/.*$/, ''))
+      .join('\n');
+    // Find the appendJsonl arrow function body.
+    const fnMatch = code.match(/const appendJsonl = \(file, newEntry\) => \{[\s\S]*?\n    \};/);
+    assert.ok(fnMatch, 'appendJsonl helper must be present');
+    // Now check for an actual fs.writeFileSync call inside.
+    assert.equal(/fs\.writeFileSync/.test(fnMatch[0]), false,
+      'appendJsonl must not fs.writeFileSync (would clobber concurrent appenders)');
+  });
+});
