@@ -13,7 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 
 // Cleanup #11: log unexpected errors so silently-broken hooks become visible.
 // Logger lives at ~/.claude/bin/vanta-log.js (deployed by setup.sh) or repo
@@ -98,13 +98,18 @@ async function main() {
   const projectRoot = findProjectRoot(filePath);
   if (!projectRoot) return exitOk();
 
+  // Codex council R7 P1 fix — shell injection.
+  // The earlier execSync interpolated `filePath` and `projectRoot` into
+  // a shell command, so a path containing `"` or `$()` was code execution
+  // inside this hook. Now: execFileSync passes argv directly with
+  // shell:false. No shell parser ever sees user-controlled data.
   // Run indexer in --quiet --file mode — single-file reindex, no console noise.
   // Timeout aggressively (1s) so a stuck indexer can't slow the user.
   try {
-    execSync(`node "${indexer}" --cwd "${projectRoot}" --file "${filePath}" --quiet`, {
-      stdio: ['ignore', 'ignore', 'ignore'],
-      timeout: 1000,
-    });
+    execFileSync(process.execPath,
+      [indexer, '--cwd', projectRoot, '--file', filePath, '--quiet'],
+      { stdio: ['ignore', 'ignore', 'ignore'], timeout: 1000, shell: false },
+    );
   } catch (err) {
     // Cleanup #11: log so broken indexer doesn't rot invisibly.
     vlog().error('code-index-watch', `indexer failed for ${filePath}: ${err.message}`);

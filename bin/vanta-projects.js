@@ -92,6 +92,65 @@ function projectPatternsFor(slug) {
   return PROJECT_SPECIFIC_PATTERNS[canonProject(slug)] || [];
 }
 
+// Codex council R7 P2 fix — centralize slug computation.
+//
+// Earlier callers used `path.basename(cwd)` directly, which collapsed two
+// projects with the same basename ("/Users/x/work/api" and
+// "/Users/x/personal/api") into the same slug. That mixed their decisions,
+// gotchas, episodes, and code-knowledge.
+//
+// Strategy:
+//   1. Resolve symlinks via fs.realpathSync — symlinked worktrees no longer
+//      slug to the symlink's basename.
+//   2. Try `git config --get remote.origin.url` to derive an org-repo slug.
+//      Globally unique when present.
+//   3. Try `git rev-parse --show-toplevel` for the repo root and use its
+//      basename — better than cwd basename for subdirs.
+//   4. Try canonical-keyword matching for known projects.
+//   5. Last resort: basename. Returns null when basename is ambiguous
+//      (cwd is $HOME, /, /tmp, etc.) so callers disable project-scoped
+//      reads/writes rather than collide with a neighbor.
+const _fs = require('fs');
+const _path = require('path');
+const _child = require('child_process');
+
+const AMBIGUOUS_BASENAMES = new Set([
+  '', '/', 'tmp', 'var', 'home', 'usr', 'root', 'desktop', 'documents',
+  'downloads', 'projects', 'src', 'code', 'repo', 'repos', 'work',
+]);
+
+function slugFromCwd(cwd) {
+  if (!cwd) return null;
+  let real = cwd;
+  try { real = _fs.realpathSync(cwd); } catch { /* not a real path; use as-is */ }
+
+  try {
+    const remote = _child.execFileSync('git',
+      ['-C', real, 'config', '--get', 'remote.origin.url'],
+      { stdio: ['ignore', 'pipe', 'ignore'], timeout: 1000, shell: false },
+    ).toString().trim();
+    const m = remote.match(/[:/]([\w.-]+)\/([\w.-]+?)(?:\.git)?$/);
+    if (m) return `${m[1]}-${m[2]}`;
+  } catch { /* no git, no remote, or timeout */ }
+
+  let repoRoot = null;
+  try {
+    repoRoot = _child.execFileSync('git',
+      ['-C', real, 'rev-parse', '--show-toplevel'],
+      { stdio: ['ignore', 'pipe', 'ignore'], timeout: 1000, shell: false },
+    ).toString().trim();
+  } catch { /* not a git repo */ }
+  const target = repoRoot || real;
+  const base = _path.basename(target).toLowerCase();
+
+  if (AMBIGUOUS_BASENAMES.has(base)) return null;
+
+  const canon = canonProject(base);
+  if (canon) return canon;
+
+  return base;
+}
+
 module.exports = {
   PROJECT_KEYWORDS,
   PROJECT_SPECIFIC_PATTERNS,
@@ -100,5 +159,6 @@ module.exports = {
   isKnownProject,
   detectProject,
   slugForFilesystem,
+  slugFromCwd,
   projectPatternsFor,
 };

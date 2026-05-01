@@ -1358,3 +1358,190 @@ describe('hooks — syntax sanity (Codex R3)', () => {
     });
   }
 });
+
+// ─── R7 lockdown — same-slug-different-cwd cross-leak (Codex R7 P2) ──────────
+//
+// Two unrelated projects under the same canonical slug must NOT bleed
+// code-knowledge into each other. Indexer tags each entry with `projectRoot`;
+// resolver drops entries whose projectRoot doesn't match the active cwd.
+
+describe('vanta-resolve — projectRoot scope filter (R7 P2)', () => {
+  const resolver = require('../bin/vanta-resolve');
+
+  test('drops code-knowledge entries with mismatched projectRoot', () => {
+    // Set up a fake shard with two entries that both canonicalize to the
+    // same slug but have different projectRoot values. Pretend project="api".
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r7p2-'));
+    const cwdA = path.join(tmpdir, 'work-api');
+    const cwdB = path.join(tmpdir, 'personal-api');
+    fs.mkdirSync(cwdA);
+    fs.mkdirSync(cwdB);
+    // Write a CLAUDE.md in each so cwd is real.
+    fs.writeFileSync(path.join(cwdA, 'CLAUDE.md'), '# work\n');
+    fs.writeFileSync(path.join(cwdB, 'CLAUDE.md'), '# personal\n');
+
+    const knowledgeDir = path.join(os.homedir(), '.vanta', 'knowledge');
+    fs.mkdirSync(knowledgeDir, { recursive: true });
+    const shard = path.join(knowledgeDir, 'r7p2test.jsonl');
+    // Save existing content if any so we restore.
+    let prior = null;
+    try { prior = fs.readFileSync(shard, 'utf8'); } catch {}
+    const entryA = JSON.stringify({
+      ts: '2026-04-01T00:00:00Z',
+      project: 'r7p2test',
+      projectRoot: cwdA,
+      category: 'work-secret',
+      // jwt with whitespace boundary so the topic regex matches.
+      snippet: 'WORK_API_KEY uses jwt session abc',
+      source: 'work-api/secret.ts:1',
+      pathRank: 1.0,
+    });
+    const entryB = JSON.stringify({
+      ts: '2026-04-01T00:00:00Z',
+      project: 'r7p2test',
+      projectRoot: cwdB,
+      category: 'personal-secret',
+      snippet: 'PERSONAL_API_KEY uses jwt session xyz',
+      source: 'personal-api/secret.ts:1',
+      pathRank: 1.0,
+    });
+    fs.writeFileSync(shard, entryA + '\n' + entryB + '\n');
+
+    try {
+      resolver.clearCache();
+      // Query from cwdA — should ONLY see entryA (work).
+      const fromA = resolver.resolve({ topic: 'jwt', project: 'r7p2test', cwd: cwdA, max: 5 });
+      const fromARaws = fromA.results.filter(r => r.source === 'code').map(r => r.excerpt);
+      const sawWorkA    = fromARaws.some(s => /WORK_API_KEY/.test(s));
+      const sawPersonalA = fromARaws.some(s => /PERSONAL_API_KEY/.test(s));
+      assert.equal(sawWorkA, true,    'cwdA query must surface its own entry');
+      assert.equal(sawPersonalA, false, 'cwdA query must NOT leak entries from cwdB');
+
+      resolver.clearCache();
+      const fromB = resolver.resolve({ topic: 'jwt', project: 'r7p2test', cwd: cwdB, max: 5 });
+      const fromBRaws = fromB.results.filter(r => r.source === 'code').map(r => r.excerpt);
+      const sawWorkB     = fromBRaws.some(s => /WORK_API_KEY/.test(s));
+      const sawPersonalB = fromBRaws.some(s => /PERSONAL_API_KEY/.test(s));
+      assert.equal(sawPersonalB, true, 'cwdB query must surface its own entry');
+      assert.equal(sawWorkB, false,    'cwdB query must NOT leak entries from cwdA');
+    } finally {
+      if (prior !== null) fs.writeFileSync(shard, prior);
+      else fs.unlinkSync(shard);
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+      resolver.clearCache();
+    }
+  });
+
+  test('legacy entries without projectRoot still pass (back-compat)', () => {
+    const knowledgeDir = path.join(os.homedir(), '.vanta', 'knowledge');
+    fs.mkdirSync(knowledgeDir, { recursive: true });
+    const shard = path.join(knowledgeDir, 'r7p2legacy.jsonl');
+    let prior = null;
+    try { prior = fs.readFileSync(shard, 'utf8'); } catch {}
+    const legacy = JSON.stringify({
+      ts: '2026-04-01T00:00:00Z',
+      project: 'r7p2legacy',
+      // NO projectRoot field — pre-Tier-5 entry
+      category: 'legacy',
+      snippet: 'jwt secret rotation policy',
+      source: 'old/file.ts:1',
+      pathRank: 1.0,
+    });
+    fs.writeFileSync(shard, legacy + '\n');
+
+    try {
+      resolver.clearCache();
+      const out = resolver.resolve({
+        topic: 'jwt', project: 'r7p2legacy',
+        cwd: '/some/random/cwd', max: 5,
+      });
+      const sawLegacy = out.results.some(r => /rotation policy/.test(r.excerpt));
+      assert.equal(sawLegacy, true, 'legacy entries without projectRoot must still surface');
+    } finally {
+      if (prior !== null) fs.writeFileSync(shard, prior);
+      else fs.unlinkSync(shard);
+      resolver.clearCache();
+    }
+  });
+});
+
+// ─── R7 lockdown — git-guardrails ReDoS bounds (Codex R7 P3) ─────────────────
+
+describe('git-guardrails — bounded quantifiers (R7 P3)', () => {
+  const { checkCommand, HARD_BLOCK } = require('../hooks/git-guardrails');
+
+  test('all HARD_BLOCK regex sources use bounded {0,N} not unbounded *', () => {
+    // Lockdown: any regex containing `[^\n]*` (unbounded) OR `.*` between
+    // capture groups is a ReDoS risk. The single allowed `[^\n]*` callsites
+    // are NONE — every dotted/exclusion class must be quantified bounded.
+    for (const rule of HARD_BLOCK) {
+      const src = rule.re.source;
+      // Allow `[^\n]{0,N}` (bounded). Reject `[^\n]*` and `[^\n]+`.
+      // Allow `\s+` (well-defined chars, not the catastrophic class).
+      assert.equal(/\[\^\\n\]\*/.test(src), false,
+        `HARD_BLOCK rule has unbounded [^\\n]*: ${src}`);
+      assert.equal(/\[\^\\n\]\+/.test(src), false,
+        `HARD_BLOCK rule has unbounded [^\\n]+: ${src}`);
+    }
+  });
+
+  test('long adversarial input does not stall the regex matcher', () => {
+    // Build a 100KB single-line command that LOOKS like git push but has
+    // no force flag and no main/master. Pre-R7 patterns could backtrack
+    // for seconds on this. With bounded quantifiers worst case is bounded.
+    const noise = 'x '.repeat(50_000);  // 100KB of "x x x..."
+    const evil = `git push ${noise} feature-branch`;
+    const t0 = Date.now();
+    const v = checkCommand(evil);
+    const elapsed = Date.now() - t0;
+    assert.equal(v.action, 'allow', 'no force flag → must be allow');
+    assert.ok(elapsed < 250, `regex must complete fast (was ${elapsed}ms)`);
+  });
+
+  test('still hard-blocks the documented force-push patterns', () => {
+    // Original behavior preserved — bounded quantifiers don't hide real matches.
+    assert.equal(checkCommand('git push -f origin main').action, 'block');
+    assert.equal(checkCommand('git push --force-with-lease origin master').action, 'block');
+    assert.equal(checkCommand('git push origin main --force').action, 'block');
+  });
+});
+
+// ─── R7 lockdown — slugFromCwd basename collisions (Codex R7 P2) ─────────────
+
+describe('vanta-projects — slugFromCwd', () => {
+  const { slugFromCwd } = require('../bin/vanta-projects');
+
+  test('returns null for ambiguous bare basenames', () => {
+    // Don't crash; don't return a slug that would collide with neighbors.
+    // /tmp, /home, /Users, /var basenames must refuse.
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-slug-'));
+    const fakeTmp = path.join(tmpdir, 'tmp');
+    fs.mkdirSync(fakeTmp);
+    try {
+      assert.equal(slugFromCwd(fakeTmp), null,
+        'basename "tmp" is ambiguous — must return null');
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  test('falls back to basename when no git context', () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-slug-named-'));
+    // Single token (no dash) — canonProject won't strip a user-prefix.
+    const proj = path.join(tmpdir, 'uniquerepo');
+    fs.mkdirSync(proj);
+    try {
+      const slug = slugFromCwd(proj);
+      assert.ok(slug && slug.length > 0, 'must return a slug for unambiguous dir');
+      assert.equal(slug, 'uniquerepo');
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  test('returns null for empty / null input', () => {
+    assert.equal(slugFromCwd(null), null);
+    assert.equal(slugFromCwd(''),   null);
+    assert.equal(slugFromCwd(undefined), null);
+  });
+});

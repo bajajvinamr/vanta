@@ -44,21 +44,30 @@ function vlog() {
 // These match the "Guardrails (non-negotiable)" section of ~/.claude/CLAUDE.md.
 // Exit 1 = tool call is blocked. The user explicitly authorized only one
 // escape path: removing this hook from settings.json (manual config change).
+//
+// R7 P3 — bounded quantifiers. The previous patterns used `[^\n]*` between
+// adjacent capture groups. On adversarial inputs (a 1MB single-line
+// command with no `main`/`master` token), the engine could backtrack
+// O(n²) trying alternate splits. All `[^\n]*` are now capped at
+// `{0,256}` — long enough for any realistic shell command, short enough
+// that worst-case match time is bounded. Also removed the alternate-
+// ordering rule: the unified pattern below covers both `git push -f main`
+// and `git push main -f` shapes via the optional middle segment.
 const HARD_BLOCK = [
   {
-    re: /\bgit\s+push\s+(?:[^\n]*\s)?(?:-f\b|--force\b|--force-with-lease\b)[^\n]*\b(?:main|master|origin\s+main|origin\s+master)\b/,
+    re: /\bgit\s+push\s+(?:[^\n]{0,128}\s)?(?:-f\b|--force\b|--force-with-lease\b)[^\n]{0,256}\b(?:main|master|origin\s+main|origin\s+master)\b/,
     msg: 'force-push to main/master is non-negotiable per CLAUDE.md guardrails',
   },
   {
-    re: /\bgit\s+push\s+(?:-f|--force|--force-with-lease)[^\n]*\b(?:main|master)\b/,
-    msg: 'force-push to main/master (alternate ordering) is blocked per CLAUDE.md',
+    re: /\bgit\s+push\s+(?:[^\n]{0,128}\s)?\b(?:main|master|origin\s+main|origin\s+master)\b[^\n]{0,128}(?:-f\b|--force\b|--force-with-lease\b)/,
+    msg: 'force-push to main/master (target-first ordering) is blocked per CLAUDE.md',
   },
   {
-    re: /\bgit\s+(?:commit|push|merge|rebase|cherry-pick)\s+[^\n]*--no-verify\b/,
+    re: /\bgit\s+(?:commit|push|merge|rebase|cherry-pick)\s+[^\n]{0,256}--no-verify\b/,
     msg: '--no-verify bypasses pre-commit hooks — non-negotiable per CLAUDE.md',
   },
   {
-    re: /\bgit\s+(?:commit|push|merge)\s+[^\n]*--no-gpg-sign\b/,
+    re: /\bgit\s+(?:commit|push|merge)\s+[^\n]{0,256}--no-gpg-sign\b/,
     msg: '--no-gpg-sign bypasses signing — never use unless explicitly authorized',
   },
   {
@@ -93,7 +102,7 @@ const ADVISORY = [
     msg: 'git checkout/restore . discards all uncommitted changes',
   },
   {
-    re: /\bgit\s+clean\s+[^\n]*-[fF][^\n]*/,
+    re: /\bgit\s+clean\s+[^\n]{0,128}-[fF]/,
     msg: 'git clean -f deletes untracked files (potential lost work)',
   },
   {
