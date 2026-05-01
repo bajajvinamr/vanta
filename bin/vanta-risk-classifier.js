@@ -53,7 +53,13 @@ function peerRouter() {
 // data), 5 = trivial (a doc edit that git can revert).
 const REVERSIBILITY_SIGNALS = [
   { rx: /\b(deploy|prod|production|migrate|drop\s+table|truncate)\b/i, score: 1, axis: 'reversibility' },
-  { rx: /\b(force.?push|reset.?--hard|rm\s+-rf|delete.{0,30}user)\b/i,  score: 1, axis: 'reversibility' },
+  // R1 P2 (Codex): the `delete.{0,30}user` form was singular — "delete
+  // all users from the database" escaped to T1. v3.6.20 widens to plural
+  // user(s)/account(s)/customer(s)/record(s) and adds the bare DELETE
+  // FROM / DROP DATABASE / wipe-state phrasings.
+  { rx: /\b(force.?push|reset.?--hard|rm\s+-rf)\b/i,                     score: 1, axis: 'reversibility' },
+  { rx: /\bdelete\b[^.?!\n]{0,40}\b(user|users|account|accounts|customer|customers|record|records|row|rows|database|table)s?\b/i, score: 1, axis: 'reversibility' },
+  { rx: /\b(delete\s+from|drop\s+database|wipe|nuke|purge)\b/i,          score: 1, axis: 'reversibility' },
   { rx: /\b(merge|push|publish|release)\b/i,                            score: 2, axis: 'reversibility' },
   { rx: /\b(commit|tag)\b/i,                                            score: 3, axis: 'reversibility' },
   { rx: /\b(refactor|rename|move\s+file)\b/i,                           score: 4, axis: 'reversibility' },
@@ -90,28 +96,39 @@ const FILE_PATH_SIGNALS = [
 ];
 
 function _scoreAxis(prompt, filePath, axisName, signalsList) {
-  // We want the WORST (lowest = riskiest) score across all matches.
-  // Default 4 (mostly-safe) when no signal hits.
-  let worst = 4;
+  // Score range: 1 (worst/riskiest) → 5 (safest). Aggregation:
+  //   - RISKY signals (score ≤ 4) lower the worst score → take MIN.
+  //   - SAFE  signals (score = 5) raise it → take MAX.
+  // R1-R2 P1 (Gemini): the original implementation only took MIN, so
+  //   safe signals (e.g., README.md → rev=5) had no effect when default
+  //   started at 4 — risk floor was 4, T0 unreachable. v3.6.20 splits:
+  //   safety markers can confirm-up; risky markers always pull-down.
+  let worst = 4;     // default = "mostly safe but no positive signal"
+  let safest = 4;    // default = same; max from any explicit safe rule
   let why = null;
-  for (const s of signalsList) {
-    if (s.axis && s.axis !== axisName) continue;
-    if (s.rx.test(prompt) && s.score < worst) {
+  const apply = (s, source) => {
+    if (s.axis && s.axis !== axisName) return;
+    if (s.score >= 5 && s.score > safest) {
+      safest = s.score;
+      why = `${source}: "${s.rx.source}" (safe)`;
+    } else if (s.score < worst) {
       worst = s.score;
-      why = `prompt: "${s.rx.source}"`;
+      why = `${source}: "${s.rx.source}" (risky)`;
     }
+  };
+  for (const s of signalsList) {
+    if (s.rx.test(prompt)) apply(s, 'prompt');
   }
   if (filePath) {
     for (const s of FILE_PATH_SIGNALS) {
-      if (s.axis !== axisName) continue;
-      if (s.rx.test(filePath) && s.score < worst) {
-        worst = s.score;
-        why = `file: ${s.rx.source}`;
-      }
+      if (s.rx.test(filePath)) apply(s, 'file');
     }
   }
-  return { score: worst, why };
+  // Risky wins over safe by design (safety bias): if a risky signal hit,
+  // ignore the safe override. Otherwise return the highest safe score.
+  return { score: worst < 4 ? worst : safest, why };
 }
+
 
 function _hasProductAuthority(prompt) {
   for (const rx of PRODUCT_AUTHORITY_SIGNALS) {
@@ -123,10 +140,15 @@ function _hasProductAuthority(prompt) {
 function _scoreToTier(reversibility, blastRadius, productAuthority) {
   if (productAuthority) return 'T3';
   // Higher score = safer. Convert to risk: 6 - score per axis (1..5).
+  // R1-R2 P1 (Gemini): the risk floor is 2 (rev=5 + blast=5 → 1+1).
+  // The original `risk >= 2` made T0 unreachable via heuristic. v3.6.20
+  // shifts the threshold so risk=2 (the safest reachable state) maps
+  // to T0 — restoring the documented "skip auto-execute on truly safe
+  // prompts" path. Still requires kill-switch behavior unchanged.
   const risk = (6 - reversibility) + (6 - blastRadius);
   if (risk >= 8)  return 'T3';
   if (risk >= 5)  return 'T2';
-  if (risk >= 2)  return 'T1';
+  if (risk >= 3)  return 'T1';
   return 'T0';
 }
 

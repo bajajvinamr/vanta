@@ -212,7 +212,11 @@ floor:
 
   - id: prompt-launch-decision
     kind: prompt
-    pattern: '\b(launch|ship.{0,20}prod|push.{0,20}live|go.{0,20}live)\b'
+    # R1 P2 (Gemini): trailing `\b` after "prod" failed on "ship production"
+    # because the next char `u` is a word-char. v3.6.20 drops the trailing
+    # boundary on the prod/live alternations and uses an explicit
+    # word/end-anchor only for the bare `launch` token.
+    pattern: '(\blaunch\b|\bship\b.{0,20}prod|\bpush\b.{0,20}live|\bgo\b.{0,20}live)'
     why: launch decision — irreversible commitment to users
 
   - id: prompt-data-policy

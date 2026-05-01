@@ -41,21 +41,41 @@ const INTERRUPT_RX = /\b(stop|undo|revert.{0,15}that|don'?t|no.{0,4}actually|wai
 
 // undo_within_2m: an auto-action is "regretted" if a vanta-undo entry
 // references it and lands within 2 min of the original.
+//
+// R1 P2 (Codex): the original implementation matched by subject equality
+// when no id was present. One undo on `foo.ts` was attributed to every
+// recent auto-action on `foo.ts`, spiking undo_24h above 5% and triggering
+// false autonomy demotions. v3.6.20 fix: prefer id match when present
+// (which is now ALWAYS, since action-log assigns one), fall back to
+// subject only when targets_action_id is null AND the timing is unique
+// within the window (no other auto-actions on the same subject in the
+// 2-min window).
 function _undoWithin2m(entries) {
   const auto = entries.filter(e => e.decision === 'auto' && e.action !== 'undo');
   if (auto.length === 0) return { rate: 0, n: 0, regretted: 0 };
   const undoEntries = entries.filter(e => e.action === 'undo');
   let regretted = 0;
+  // Pre-compute: for each undo, did it have a targets_action_id?
+  // If so, only match against the action with that id — never fan out
+  // attribution to siblings on the same subject.
   for (const a of auto) {
     const aMs = Date.parse(a.ts);
     const found = undoEntries.find(u => {
-      if (!u.subject || !a.subject) return false;
-      // Match by undo_hint.payload referencing this action's subject,
-      // OR by subject equality (file path / command match).
-      const hintRefs = u.undo_hint && u.undo_hint.targets_action_id === a._id;
-      const subjectMatch = u.subject === a.subject;
       const within = (Date.parse(u.ts) - aMs) <= TWO_MIN_MS && (Date.parse(u.ts) - aMs) >= 0;
-      return within && (hintRefs || subjectMatch);
+      if (!within) return false;
+      const targetId = u.undo_hint && u.undo_hint.payload && u.undo_hint.payload.targets_action_id;
+      if (targetId) {
+        // Authoritative: only attribute to the action whose id matches.
+        return a.id === targetId;
+      }
+      // Backward compat: undo logs from before v3.6.20 have no id.
+      // Fall back to subject only when there's exactly ONE auto-action
+      // with that subject in the 2-min window — otherwise we can't tell.
+      if (!u.subject || !a.subject || u.subject !== a.subject) return false;
+      const sameSubjectInWindow = auto.filter(x =>
+        x.subject === a.subject &&
+        Math.abs(Date.parse(x.ts) - aMs) <= TWO_MIN_MS).length;
+      return sameSubjectInWindow === 1;
     });
     if (found) regretted++;
   }

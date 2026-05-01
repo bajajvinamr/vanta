@@ -28,6 +28,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 const { appendJsonlLine, readMergedJsonl } = require('./vanta-jsonl');
 
@@ -48,21 +49,46 @@ function _vantaDir() {
 function _file() { return path.join(_vantaDir(), 'actions.jsonl'); }
 const MAX_BYTES = 5_000_000;
 
+// Generate a stable 12-char id for an action — enough collision space
+// (16^12 ≈ 2.8e14) for an append-only log that gets at most ~10K entries
+// per active project per quarter. Used by undo to target by id, not
+// subject (R1 P2: subject-based attribution over-counts).
+function _newActionId() {
+  return 'act-' + crypto.randomBytes(6).toString('hex');
+}
+
 // Append-only writer. Rotates file via rename when > MAX_BYTES.
 // Mirrors auto-sync.js rotation semantics for consistency.
+//
+// Rotation race (R1 P3, Gemini): two concurrent writers both see
+// size > MAX_BYTES, both rename. The first wins (file moves to bak);
+// the second's rename either fails (file gone) or rotates the new tiny
+// file. We bound the damage by re-statting after acquiring the file
+// descriptor — if the file is now small, skip rotation.
 function record(entry) {
   try {
     fs.mkdirSync(_vantaDir(), { recursive: true });
     const file = _file();
     if (fs.existsSync(file)) {
-      const st = fs.statSync(file);
-      if (st.size > MAX_BYTES) {
+      let st;
+      try { st = fs.statSync(file); } catch { st = null; }
+      if (st && st.size > MAX_BYTES) {
         const ts = Date.now() + '.' + process.pid;
-        try { fs.renameSync(file, `${file}.bak.${ts}`); } catch { /* race */ }
+        const target = `${file}.bak.${ts}`;
+        // Re-stat with the same inode immediately before rename. If
+        // a peer rotated already, the inode no longer matches and we
+        // skip — prevents rotating tiny new file.
+        try {
+          const verify = fs.statSync(file);
+          if (verify.ino === st.ino && verify.size > MAX_BYTES) {
+            fs.renameSync(file, target);
+          }
+        } catch { /* peer rotated, race lost — fine */ }
       }
     }
     const full = {
       ts: new Date().toISOString(),
+      id: entry.id || _newActionId(),  // R1 P2: stable id for undo target tracking
       session_id: entry.session_id || process.env.CLAUDE_SESSION_ID || null,
       project: entry.project || null,
       branch: entry.branch || null,

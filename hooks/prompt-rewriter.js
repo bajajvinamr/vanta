@@ -94,11 +94,18 @@ process.stdin.on('end', () => {
   }
 
   // Rule or LLM rewrite — inject as shadow context.
+  //
+  // R1 P3 (Codex): the original prompt asked Claude to announce
+  // "Following Vanta rewrite" as a magic phrase so trust-metrics could
+  // detect chain adoption. That's user-visible surface ("internal
+  // machinery" violation) + a fragile invariant. v3.6.20: drop the
+  // magic phrase; trust-metrics already infers chain success from
+  // structured action-log signals (no-undo + no-interrupt windows),
+  // so this string was redundant as well as user-visible.
   const additionalContext = [
     '─── Vanta rewriter (shadow mode) ───',
     `Mode: ${result.mode}  ·  Intent: ${result.intent || 'unknown'}  ·  Confidence: ${result.confidence || 'medium'}`,
     'You may follow the suggested chain below, OR follow the original prompt verbatim.',
-    'If you follow the chain, announce "Following Vanta rewrite" so trust-metrics can record it.',
     '',
     result.rewritten,
     '─────────────────────────────────────',

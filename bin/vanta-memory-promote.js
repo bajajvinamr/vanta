@@ -69,8 +69,15 @@ function _rejectsPath() {
 // Candidates are individual bullets with conf= metadata. We parse
 // section + bullet + conf and emit a unique fingerprint per candidate.
 
-function _fingerprint(text) {
-  return 'inv-' + crypto.createHash('sha256').update(text.trim()).digest('hex').slice(0, 12);
+// Fingerprint includes the section header so identical bullet text in
+// different sections produces distinct ids. Without this, accept(id)
+// could not distinguish the two and removed the wrong line — Council
+// R1 P2 (Codex) bug.
+function _fingerprint(section, text) {
+  // Backward-compat call: if only one arg, treat as text-only.
+  if (text === undefined) { text = section; section = ''; }
+  const seed = (section || '') + '\n' + (text || '').trim();
+  return 'inv-' + crypto.createHash('sha256').update(seed).digest('hex').slice(0, 12);
 }
 
 function loadStaged() {
@@ -90,7 +97,7 @@ function loadStaged() {
     const confMatch = meta.match(/conf\s*=\s*([\d.]+)/);
     const tsMatch = meta.match(/ts\s*=\s*(\S+)/);
     out.push({
-      id: _fingerprint(text),
+      id: _fingerprint(section || 'Uncategorized', text),
       section: section || 'Uncategorized',
       text,
       confidence: confMatch ? parseFloat(confMatch[1]) : 0.5,
@@ -168,13 +175,35 @@ function accept(id) {
     return { ok: false, reason: `write global failed: ${err.message}` };
   }
 
-  // Remove from staging.
+  // Remove from staging — line-by-line walk anchored to the candidate's
+  // section header, NOT a global text-only regex.
+  //
+  // R1 P2 (Codex): the original text-only regex removed the FIRST matching
+  // bullet anywhere in the file. Two staged sections containing the same
+  // bullet text would lose the wrong one — accepted invariant kept
+  // re-surfacing because the duplicate in section A was deleted instead.
+  // v3.6.20: walk lines, track current section, only remove the bullet
+  // when both section AND text match the target.
   const stagingFile = _stagingPath();
   try {
     const stagingSrc = fs.readFileSync(stagingFile, 'utf8');
-    const escapedText = target.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const removeRx = new RegExp(`^[-*]\\s+${escapedText}.*\\n?`, 'm');
-    fs.writeFileSync(stagingFile, stagingSrc.replace(removeRx, ''));
+    const lines = stagingSrc.split('\n');
+    let currentSection = null;
+    let removed = false;
+    const out = [];
+    for (const raw of lines) {
+      const sectionMatch = raw.match(/^##\s+(.+)$/);
+      if (sectionMatch) { currentSection = sectionMatch[1].trim(); out.push(raw); continue; }
+      if (!removed && currentSection === target.section) {
+        const bulletMatch = raw.match(/^[-*]\s+(.+?)(?:\s*<!--.*?-->)?\s*$/);
+        if (bulletMatch && bulletMatch[1].trim() === target.text) {
+          removed = true;
+          continue;  // skip — this is the line we're removing
+        }
+      }
+      out.push(raw);
+    }
+    fs.writeFileSync(stagingFile, out.join('\n'));
   } catch (err) {
     vlog().warn('memory-promote.staging-remove', err.message);
   }
@@ -202,13 +231,28 @@ function reject(id) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   appendJsonlLine(file, { id, text: target.text, ts: new Date().toISOString() });
 
-  // Remove from staging.
+  // Remove from staging using the same section+text walk as accept()
+  // (R1 P2 fix — same duplicate-text bug applies on the reject path).
   try {
     const stagingFile = _stagingPath();
     const stagingSrc = fs.readFileSync(stagingFile, 'utf8');
-    const escapedText = target.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const removeRx = new RegExp(`^[-*]\\s+${escapedText}.*\\n?`, 'm');
-    fs.writeFileSync(stagingFile, stagingSrc.replace(removeRx, ''));
+    const lines = stagingSrc.split('\n');
+    let currentSection = null;
+    let removed = false;
+    const out = [];
+    for (const raw of lines) {
+      const sectionMatch = raw.match(/^##\s+(.+)$/);
+      if (sectionMatch) { currentSection = sectionMatch[1].trim(); out.push(raw); continue; }
+      if (!removed && currentSection === target.section) {
+        const bulletMatch = raw.match(/^[-*]\s+(.+?)(?:\s*<!--.*?-->)?\s*$/);
+        if (bulletMatch && bulletMatch[1].trim() === target.text) {
+          removed = true;
+          continue;
+        }
+      }
+      out.push(raw);
+    }
+    fs.writeFileSync(stagingFile, out.join('\n'));
   } catch {}
 
   al.record({

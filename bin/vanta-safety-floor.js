@@ -142,8 +142,20 @@ function _globToRegex(glob) {
   while (i < glob.length) {
     const ch = glob[i];
     if (ch === '*') {
-      if (glob[i + 1] === '*') { out += '.*'; i += 2; }
-      else                     { out += '[^/]*'; i += 1; }
+      // `**/` → optional any-dir prefix so root-level files still match.
+      // Without this, `**/.env*` compiles to `.*/\.env.*` and root `.env`
+      // (no leading slash) bypasses the floor — the bug both R1 reviewers
+      // flagged as P1 in v3.6.20.
+      if (glob[i + 1] === '*' && glob[i + 2] === '/') {
+        out += '(?:.*/)?';
+        i += 3;
+      } else if (glob[i + 1] === '*') {
+        out += '.*';
+        i += 2;
+      } else {
+        out += '[^/]*';
+        i += 1;
+      }
     } else if (ch === '{') {
       const close = glob.indexOf('}', i + 1);
       if (close < 0) {

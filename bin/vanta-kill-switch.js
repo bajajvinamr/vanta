@@ -42,10 +42,20 @@ function _repoRoot(cwd) {
 
 // Main predicate. Pass { sessionId, cwd } so we can scope-check correctly
 // without globals. Both default to env / process.cwd().
+//
+// Scope priority is session > repo > global. Each scope can independently
+// say "off" OR "force-on" (the latter via a `.resumed` marker file). This
+// lets a session UN-pause itself even when the global env says off — the
+// fix Gemini R1 P4 flagged ("session > repo > global was unidirectional").
 function check({ sessionId, cwd } = {}) {
-  // 1. Session scope — most specific.
+  // 1. Session scope — most specific. Resumed beats paused; both beat
+  //    fall-through to lower scopes.
   const sid = sessionId || process.env.CLAUDE_SESSION_ID || null;
   if (sid) {
+    const sessionResumed = path.join(_runtimeDir(), `${sid}.resumed`);
+    if (fs.existsSync(sessionResumed)) {
+      return { off: false, scope: 'session', reason: 'session-resumed' };
+    }
     const sessionFile = path.join(_runtimeDir(), `${sid}.paused`);
     if (fs.existsSync(sessionFile)) {
       let reason = 'session-paused';
@@ -57,6 +67,10 @@ function check({ sessionId, cwd } = {}) {
   // 2. Repo scope — current working tree.
   const root = _repoRoot(cwd);
   if (root) {
+    const repoResumed = path.join(root, '.vanta', 'resumed');
+    if (fs.existsSync(repoResumed)) {
+      return { off: false, scope: 'repo', reason: 'repo-resumed' };
+    }
     const repoFile = path.join(root, '.vanta', 'paused');
     if (fs.existsSync(repoFile)) {
       let reason = 'repo-paused';
@@ -65,7 +79,7 @@ function check({ sessionId, cwd } = {}) {
     }
   }
 
-  // 3. Global scope — env var.
+  // 3. Global scope — env var. Only consulted when no session/repo signal.
   const envVal = (process.env.VANTA_EXECUTOR || '').toLowerCase();
   if (envVal === 'off' || envVal === '0' || envVal === 'false') {
     return { off: true, scope: 'global', reason: 'VANTA_EXECUTOR=' + envVal };

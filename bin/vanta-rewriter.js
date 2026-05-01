@@ -215,11 +215,17 @@ function rewrite(prompt, context = {}) {
     }
   }
 
-  // 2. Safety floor — floor-matched prompts must NOT be auto-rewritten.
-  // The user is supposed to confirm; making it easier is the wrong move.
+  // 2. Safety floor — floor-matched prompts/commands/files must NOT be
+  // auto-rewritten. The user is supposed to confirm; making it easier is
+  // the wrong move. R1 (Codex P2): the original implementation only
+  // consulted matchPrompt, so `rewrite('write tests', { file_path: '.env.local' })`
+  // produced a `write-tests` chain instead of passthrough. v3.6.20:
+  // also consult matchFile and matchCommand using the caller's context.
   const sf = safetyFloor();
   if (sf) {
-    const f = sf.matchPrompt(prompt);
+    let f = sf.matchPrompt(prompt);
+    if (!f && context.command) f = sf.matchCommand(context.command);
+    if (!f && context.file_path) f = sf.matchFile(context.file_path);
     if (f) {
       return { mode: 'passthrough', original: prompt, why: `safety-floor:${f.id}`, floor_match: f };
     }

@@ -79,20 +79,45 @@ function _undoFileDelete(payload) {
   }
 }
 
+// Refuse SHA values shorter than this — `head.startsWith("")` is true
+// (empty-sha bypass found in council R1, P1).
+const MIN_SHA_LEN = 7;
+
+// Branches we refuse to rewrite history on. Extended in v3.6.20 from
+// just main/master after R1: long-lived release branches share history
+// with deployments and must not be reset --soft from automation.
+const PROTECTED_BRANCH_RX = /^(main|master|release\/.*|hotfix\/.*|prod|production)$/;
+
 function _undoGitCommit(payload) {
   if (!payload || !payload.sha) return { ok: false, reason: 'missing payload.sha' };
-  // Refuse to undo on main/master (safety floor — never touch shared history).
+  if (typeof payload.sha !== 'string' || payload.sha.length < MIN_SHA_LEN) {
+    return { ok: false, reason: `refused — payload.sha must be ≥${MIN_SHA_LEN} chars (got ${payload.sha.length}). Empty / short SHA can match anything.` };
+  }
+  // Refuse on protected branches AND on detached HEAD (detached HEAD
+  // returns "HEAD" from --abbrev-ref, which doesn't match any branch
+  // guard and was a R1 bypass vector).
   try {
     const branch = execSync('git rev-parse --abbrev-ref HEAD', { stdio: ['pipe', 'pipe', 'ignore'] }).toString().trim();
-    if (branch === 'main' || branch === 'master') {
-      return { ok: false, reason: `refused — current branch is ${branch} (mainline). Use git revert manually.` };
+    if (branch === 'HEAD') {
+      return { ok: false, reason: 'refused — detached HEAD. Check out a branch before undoing.' };
+    }
+    if (PROTECTED_BRANCH_RX.test(branch)) {
+      return { ok: false, reason: `refused — current branch is ${branch} (protected). Use git revert manually.` };
     }
   } catch {}
-  // Verify commit is HEAD (safest case — only reverse the immediate previous commit).
+  // Verify commit is HEAD via FULL-sha resolution (rev-parse the stored
+  // payload.sha to its canonical 40-char id, then exact-compare). This
+  // closes the prefix-collision angle Codex flagged in R1.
   try {
     const head = execSync('git rev-parse HEAD', { stdio: ['pipe', 'pipe', 'ignore'] }).toString().trim();
-    if (!head.startsWith(payload.sha) && !payload.sha.startsWith(head)) {
-      return { ok: false, reason: `refused — commit ${payload.sha.slice(0,8)} is not HEAD (got ${head.slice(0,8)}). Use git revert manually for non-HEAD commits.` };
+    let resolved;
+    try {
+      resolved = execSync(`git rev-parse --verify ${payload.sha}^{commit}`, { stdio: ['pipe', 'pipe', 'ignore'] }).toString().trim();
+    } catch {
+      return { ok: false, reason: `refused — payload.sha ${payload.sha.slice(0,8)} could not be resolved to a unique commit.` };
+    }
+    if (resolved !== head) {
+      return { ok: false, reason: `refused — commit ${payload.sha.slice(0,8)} (resolved ${resolved.slice(0,8)}) is not HEAD (${head.slice(0,8)}). Use git revert manually for non-HEAD commits.` };
     }
     execSync('git reset --soft HEAD~1', { stdio: ['pipe', 'pipe', 'ignore'] });
     return { ok: true, kind: 'git-commit', sha: payload.sha };
@@ -168,6 +193,10 @@ function undo({ action, subject } = {}) {
   const result = reverser(target.undo_hint.payload || {});
   // Record the undo attempt regardless of outcome — trust-metrics
   // counts undo events whether they succeed or not (success is gravy).
+  // R1 P2 (Codex): target the undo by stable id, not by ts+subject. Subject
+  // attribution over-counted because one undo on `foo.ts` matched every
+  // recent action on `foo.ts` — the trust-metric undo_24h spiked falsely
+  // and triggered autonomy demotion oscillation.
   try {
     al.record({
       session_id: target.session_id,
@@ -176,7 +205,11 @@ function undo({ action, subject } = {}) {
       decision: 'auto',
       why: result.ok ? `reversed ${target.action}` : `attempt failed: ${result.reason}`,
       subject: target.subject,
-      undo_hint: { kind: 'undo', payload: { targets_action_ts: target.ts, targets_action: target.action } },
+      undo_hint: { kind: 'undo', payload: {
+        targets_action_id: target.id || null,
+        targets_action_ts: target.ts,
+        targets_action: target.action,
+      } },
     });
   } catch (err) { vlog().error('undo.record', err.message); }
   return { ...result, target };

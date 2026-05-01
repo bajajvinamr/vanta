@@ -3810,7 +3810,7 @@ describe('integration: trust-metrics ↔ autonomy gating (v3.6.19)', () => {
     }
   });
 
-  test('manualUpgrade L0 → L1 records autonomy-promote action with payload', () => {
+  test('manualUpgrade from default (L1, no config) → L2 records autonomy-promote action with payload', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-int-auton-upgrade-'));
     try {
       process.env.VANTA_DIR_OVERRIDE = tmp;
@@ -3834,6 +3834,255 @@ describe('integration: trust-metrics ↔ autonomy gating (v3.6.19)', () => {
       fs.rmSync(tmp, { recursive: true, force: true });
       delete require.cache[require.resolve('../bin/vanta-autonomy')];
     }
+  });
+
+  // Council R1 P3 (Codex): the documented L0 → L1 manual path was not
+  // tested. Original test misnamed the L1→L2 path as L0→L1. v3.6.20: add
+  // a real L0 fixture (explicit config: L0) and verify upgrade lands at L1.
+  test('manualUpgrade from explicit L0 → L1 (the documented opt-in path)', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-int-auton-l0-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      fs.writeFileSync(path.join(tmp, 'package.json'), '{}');
+      fs.mkdirSync(path.join(tmp, '.git'), { recursive: true });
+      fs.mkdirSync(path.join(tmp, '.vanta'), { recursive: true });
+      fs.writeFileSync(path.join(tmp, '.vanta', 'config.yaml'), 'level: L0\n');
+      delete require.cache[require.resolve('../bin/vanta-autonomy')];
+      const auton = require('../bin/vanta-autonomy');
+      const r = auton.manualUpgrade(tmp);
+      assert.equal(r.changed, true);
+      assert.equal(r.prior, 'L0');
+      assert.equal(r.level, 'L1');
+      const events = al2.read({ action: 'autonomy-promote' });
+      const ev = events.reverse().find(e => e.subject === tmp && e.undo_hint.payload.new_level === 'L1');
+      assert.ok(ev, 'L0→L1 manual upgrade must be recorded');
+      assert.equal(ev.undo_hint.payload.prior_level, 'L0');
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+      delete require.cache[require.resolve('../bin/vanta-autonomy')];
+    }
+  });
+
+  // Council R1-R2 P1 (Gemini): the heuristic risk floor was 2 (rev=5+blast=5
+  // → 1+1), making T0 unreachable via the 3-axis path. v3.6.20 lowered the
+  // T1 threshold so risk=2 maps to T0. Pin that contract.
+  test('truly safe prompts (rev=5, blast=5) reach T0 via heuristic, not just kill-switch', () => {
+    delete require.cache[require.resolve('../bin/vanta-risk-classifier')];
+    const classifier = require('../bin/vanta-risk-classifier');
+    // explain + .md file should produce the math floor (rev=5, blast=5 → risk=2).
+    const r = classifier.classify({ prompt: 'explain the local sandbox', file_path: 'docs/notes.md' });
+    assert.equal(r.tier, 'T0', `safe prompt+file must reach T0; got ${r.tier} (risk=${r.risk})`);
+    assert.equal(r.peer, null);
+  });
+});
+
+// ─── Council R1-R2 fix verification (v3.6.20) ───────────────────────────────
+//
+// One test per council finding. Each one would have caught the bug pre-fix,
+// pinning the contract so a regression here re-triggers council-level concern.
+
+describe('council v3.6.20 fixes — verification (P1/P2/P3 regression guards)', () => {
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  delete require.cache[require.resolve('../bin/vanta-safety-floor')];
+  const sf2 = require('../bin/vanta-safety-floor');
+  sf2.reload();
+
+  test('P1 fix: root .env file matches **/.env* (was bypass pre-v3.6.20)', () => {
+    const r = sf2.matchFile('.env');
+    assert.ok(r && r.ask, 'root .env must match safety-floor — was the council P1 bypass');
+    const r2 = sf2.matchFile('.env.local');
+    assert.ok(r2 && r2.ask, 'root .env.local must match');
+    // Sanity: nested still matches (didn't break the existing case).
+    const r3 = sf2.matchFile('apps/web/.env.local');
+    assert.ok(r3 && r3.ask);
+  });
+
+  test('P1 fix: empty / short SHA in undo payload is refused', () => {
+    const undo = require('../bin/vanta-undo');
+    const al2 = require('../bin/vanta-action-log');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-int-undo-empty-sha-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      al2.record({
+        session_id: 's-empty-sha', action: 'auto-commit', subject: 'foo',
+        decision: 'auto', why: 'test', undo_hint: { kind: 'git-commit', payload: { sha: '' } },
+      });
+      const r = undo.undo({});
+      assert.equal(r.ok, false, 'empty sha must be refused');
+      assert.match(r.reason, /sha must be ≥|missing payload\.sha/);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('P2 fix: rewriter consults matchFile for context.file_path', () => {
+    delete require.cache[require.resolve('../bin/vanta-rewriter')];
+    const rw = require('../bin/vanta-rewriter');
+    const r = rw.rewrite('write tests for this function', { file_path: '.env.local' });
+    assert.equal(r.mode, 'passthrough', '.env.local context must trigger floor passthrough');
+    assert.match(r.why || '', /^safety-floor:/, `expected safety-floor reason, got "${r.why}"`);
+  });
+
+  test('P2 fix: rewriter consults matchCommand for context.command', () => {
+    delete require.cache[require.resolve('../bin/vanta-rewriter')];
+    const rw = require('../bin/vanta-rewriter');
+    const r = rw.rewrite('ship this', { command: 'git push --force origin main' });
+    assert.equal(r.mode, 'passthrough', 'force-push command must trigger floor passthrough');
+    assert.match(r.why || '', /^safety-floor:/);
+  });
+
+  test('P2 fix: "delete all users from the database" classifies as T3', () => {
+    delete require.cache[require.resolve('../bin/vanta-risk-classifier')];
+    const classifier = require('../bin/vanta-risk-classifier');
+    const r = classifier.classify({ prompt: 'delete all users from the database' });
+    // Either T3 (production keyword + delete users) or at minimum T2.
+    assert.ok(['T2', 'T3'].includes(r.tier),
+      `destructive plural-users prompt must escape T0/T1; got ${r.tier} (risk=${r.risk})`);
+  });
+
+  test('P2 fix: "ship production" hits prompt-launch-decision floor', () => {
+    const r = sf2.matchPrompt('ship production now');
+    assert.ok(r && r.ask, '"ship production" must match prompt-launch-decision (was \\b boundary fail)');
+    assert.equal(r.id, 'prompt-launch-decision');
+  });
+
+  test('P2 fix: undo writes targets_action_id pointing at the original action id', () => {
+    const al2 = require('../bin/vanta-action-log');
+    const undo = require('../bin/vanta-undo');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-int-undo-id-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      // Record an autonomy-promote that captures its assigned id.
+      const captured = al2.record({
+        session_id: 's-id-test',
+        action: 'autonomy-promote',
+        subject: tmp,
+        decision: 'auto',
+        why: 'test promotion',
+        undo_hint: { kind: 'autonomy-promote', payload: { repo: tmp, prior_level: 'L1', new_level: 'L2' } },
+      });
+      assert.ok(captured.id, 'record must return entry with id');
+      assert.match(captured.id, /^act-/, 'id must use act- prefix');
+      undo.undo({});
+      const undoEntries = al2.read({ action: 'undo' });
+      const u = undoEntries[0];
+      assert.equal(u.undo_hint.payload.targets_action_id, captured.id,
+        'undo must reference the original action id, not just timestamp');
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('P2 fix: memory-promote removes the right line when bullet text duplicates across sections', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-int-mp-dup-'));
+    try {
+      const stagingFile = path.join(tmp, 'staging.md');
+      const globalFile = path.join(tmp, 'global.md');
+      // Same bullet text in two different sections.
+      fs.writeFileSync(stagingFile,
+        '## Section A\n\n- duplicate text  <!-- conf=0.91 -->\n' +
+        '## Section B\n\n- duplicate text  <!-- conf=0.95 -->\n');
+      fs.writeFileSync(globalFile, '');
+      process.env.VANTA_STAGING_FILE = stagingFile;
+      process.env.VANTA_INVARIANTS_FILE = globalFile;
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      delete require.cache[require.resolve('../bin/vanta-memory-promote')];
+      const mp = require('../bin/vanta-memory-promote');
+      // The higher-confidence one (Section B) is what nextCandidate returns.
+      const cand = mp.nextCandidate({ minConfidence: 0.85 });
+      assert.equal(cand.section, 'Section B');
+      mp.accept(cand.id);
+      const remaining = fs.readFileSync(stagingFile, 'utf8');
+      // Section A bullet must remain; Section B bullet must be gone.
+      assert.match(remaining, /## Section A[\s\S]*- duplicate text/,
+        'Section A duplicate must be preserved (bug removed wrong one pre-v3.6.20)');
+      assert.doesNotMatch(remaining, /## Section B[\s\S]*- duplicate text/,
+        'Section B accepted bullet must be removed');
+    } finally {
+      delete process.env.VANTA_STAGING_FILE;
+      delete process.env.VANTA_INVARIANTS_FILE;
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('P2 fix: autonomy demotion respects 24h cooldown (no cascade)', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-int-auton-cd-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      fs.writeFileSync(path.join(tmp, 'package.json'), '{}');
+      fs.mkdirSync(path.join(tmp, '.git'), { recursive: true });
+      fs.mkdirSync(path.join(tmp, '.vanta'), { recursive: true });
+      fs.writeFileSync(path.join(tmp, '.vanta', 'config.yaml'), 'level: L2\n');
+      // Inject a recent autonomy-demote so the cooldown gate trips.
+      const al2 = require('../bin/vanta-action-log');
+      al2.record({
+        session_id: 's-cd', action: 'autonomy-demote', subject: tmp,
+        decision: 'auto', why: 'spike',
+        undo_hint: { kind: 'autonomy-promote', payload: { repo: tmp, prior_level: 'L3', new_level: 'L2' } },
+      });
+      delete require.cache[require.resolve('../bin/vanta-autonomy')];
+      const auton = require('../bin/vanta-autonomy');
+      const r = auton.tick(tmp);
+      // Even if a fresh spike were to be detected, cooldown blocks the cascade.
+      assert.notEqual(r.kind, 'demote', 'cooldown must block cascade demotion');
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+      delete require.cache[require.resolve('../bin/vanta-autonomy')];
+    }
+  });
+
+  test('P3 fix: confidence-decay preserves ordering for negative scores', () => {
+    delete require.cache[require.resolve('../bin/vanta-confidence-decay')];
+    const decay = require('../bin/vanta-confidence-decay');
+    const now = Date.parse('2026-05-02T00:00:00Z');
+    const days100 = new Date(now - 100 * 24 * 60 * 60 * 1000).toISOString();
+    const today = new Date(now).toISOString();
+    const fresh = { source: 'invariant', score: -100, date: today };
+    const stale = { source: 'invariant', score: -100, date: days100 };
+    decay.applyDecay(fresh, now);
+    decay.applyDecay(stale, now);
+    // Fresh negative must remain MORE negative (lower) than stale negative
+    // — pre-fix, stale -100 * 0.05 = -5 and -5 > -100, so stale outranked.
+    assert.ok(fresh.score < stale.score,
+      `fresh negative must rank lower (more negative) than stale; got fresh=${fresh.score} stale=${stale.score}`);
+  });
+
+  test('P3 fix: kill-switch session.resumed marker overrides global off', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-int-ks-resumed-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      const oldGlobal = process.env.VANTA_EXECUTOR;
+      process.env.VANTA_EXECUTOR = 'off';
+      const runtime = path.join(tmp, 'runtime');
+      fs.mkdirSync(runtime, { recursive: true });
+      fs.writeFileSync(path.join(runtime, 'sess-resumed-1.resumed'), 'manual\n');
+      delete require.cache[require.resolve('../bin/vanta-kill-switch')];
+      const ks = require('../bin/vanta-kill-switch');
+      const c = ks.check({ sessionId: 'sess-resumed-1', cwd: tmp });
+      assert.equal(c.off, false, 'session.resumed must override global off');
+      assert.equal(c.scope, 'session');
+      assert.equal(c.reason, 'session-resumed');
+      if (oldGlobal === undefined) delete process.env.VANTA_EXECUTOR;
+      else process.env.VANTA_EXECUTOR = oldGlobal;
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+      delete require.cache[require.resolve('../bin/vanta-kill-switch')];
+    }
+  });
+
+  test('P3 fix: hooks/prompt-rewriter no longer injects "Following Vanta rewrite" magic phrase', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'hooks', 'prompt-rewriter.js'), 'utf8');
+    // Tolerate the historical-context comment ("dropped the magic phrase").
+    // The actual surface creep was the user-visible additionalContext line:
+    // "If you follow the chain, announce ..." — assert that's gone.
+    assert.doesNotMatch(src, /If you follow the chain,\s*announce/,
+      'user-visible magic-phrase line must be removed — was surface creep flagged in council R1');
   });
 });
 

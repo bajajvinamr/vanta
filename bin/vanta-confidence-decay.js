@@ -50,10 +50,27 @@ function decayMultiplier({ source, ts, now = Date.now() } = {}) {
 
 // Apply decay to a result entry in-place. Returns the modified entry
 // for chaining.
+//
+// R1 P3 (Gemini): naive multiplication inverts ordering for negative
+// scores. -100 (fresh) * 0.05 = -5; -5 > -100, so a stale negative
+// outranks a fresh negative penalty. v3.6.20 fix: decay decreases the
+// magnitude regardless of sign — for negative scores, multiply by 1/m
+// (the opposite direction) so they DRIFT TOWARD ZERO with age, the same
+// way positives do.
 function applyDecay(result, now = Date.now()) {
   if (typeof result !== 'object' || result === null) return result;
   const m = decayMultiplier({ source: result.source, ts: result.date || result.ts, now });
-  result.score = (result.score || 0) * m;
+  const raw = result.score || 0;
+  if (raw < 0) {
+    // Negative score: divide by m so magnitude shrinks toward 0 with age.
+    // m ≤ 1, so 1/m ≥ 1 → multiplied score is closer to 0 (less negative).
+    // Keep the floor: never amplify back past the original (avoid 1/0.05 = 20x).
+    // Cap shrinkage at 95% magnitude reduction to mirror the positive floor.
+    const shrink = Math.max(m, 0.05);
+    result.score = raw * shrink;  // raw is negative; raw*shrink is less negative
+  } else {
+    result.score = raw * m;
+  }
   result.decay_multiplier = Math.round(m * 1000) / 1000;
   return result;
 }

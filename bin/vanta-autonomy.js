@@ -214,9 +214,37 @@ function _checkPromotion(currentLevel) {
   };
 }
 
+// Demotion cooldown — once a project demotes, the same 7d regret window
+// will continue to read above-threshold for up to 7 days. Without a
+// cooldown the demotion would cascade L3 → L2 → L1 → L0 in rapid
+// succession on every tick (R1 P2 — Gemini).
+const DEMOTION_COOLDOWN_MS = 24 * 60 * 60 * 1000;  // 24h between demotions
+
+// Returns the timestamp of the most recent autonomy-demote action for
+// this repo (or 0 if none). Used to enforce DEMOTION_COOLDOWN_MS.
+function _lastDemoteMs(repoRoot) {
+  const entries = al.read({ action: 'autonomy-demote' });
+  let last = 0;
+  for (const e of entries) {
+    if (e.subject !== repoRoot) continue;
+    const ms = Date.parse(e.ts);
+    if (ms > last) last = ms;
+  }
+  return last;
+}
+
 // Returns { demote_to, why } or null. Always demotes by exactly one level.
-function _checkDemotion(currentLevel) {
+function _checkDemotion(currentLevel, repoRoot) {
   if (currentLevel === 'L0') return null;  // floor
+  // Cooldown: refuse to demote again within DEMOTION_COOLDOWN_MS of the
+  // most recent demote. The 7d regret window decays naturally; rapid
+  // re-demotion on the same incident is what we're guarding against.
+  if (repoRoot) {
+    const lastMs = _lastDemoteMs(repoRoot);
+    if (lastMs && Date.now() - lastMs < DEMOTION_COOLDOWN_MS) {
+      return null;
+    }
+  }
   // Read recent (24h) undo rate + 7d regret rate.
   const tm24 = _trustOverWindow({ days: 1 });
   const rd7  = _regretOverWindow({ days: 7 });
@@ -265,7 +293,7 @@ function tick(cwd) {
   if (eff.locked) return { level: eff.level, changed: false, reason: 'override-locked' };
 
   // Demotion has priority over promotion (safety bias).
-  const demote = _checkDemotion(eff.level);
+  const demote = _checkDemotion(eff.level, eff.detected.root);
   if (demote) {
     writeConfig(eff.detected.root, { level: demote.demote_to });
     al.record({
