@@ -8,10 +8,18 @@
 //
 // This module gates writes by confidence score:
 //
-//   ≥ 0.8  → auto       (write to vinamr-invariants.md with audit comment)
-//   0.5–0.8 → staging   (vinamr-invariants.staging.md — user reviews)
-//   < 0.5  → discard    (logged to hook.log for postmortem)
+//   ≥ 0.65 → auto       (R7 P1 fix — writes to STAGING ONLY, never global
+//                        invariants directly; the vanta-sync skill enforces
+//                        manual review before promotion. Earlier wrote
+//                        directly to vinamr-invariants.md, which was a
+//                        persistent prompt-injection vector.)
+//   0.40–0.65 → staging (always staging — same path now)
+//   < 0.40 → discard    (logged to hook.log for postmortem)
 //   any near-dup ≥ 0.8 → update-in-place (don't add a 4th rephrasing)
+//
+// R10 P3 — docstring drift fix. The old comment claimed thresholds of
+// ≥0.8 for auto and 0.5 for staging, but the code uses ≥0.65 / ≥0.40
+// (see ROUTE_THRESHOLDS below at the actual decision site).
 //
 // Pure functions only — no I/O at module top level. CLI mode reads the
 // existing invariants file only when explicitly invoked.

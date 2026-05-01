@@ -19,7 +19,13 @@
 # What it does NOT touch:
 #   - User data: ~/.vanta/ (sync-queue, episodes, code-knowledge, query-log)
 #   - User invariants: ~/.claude/rules/vinamr-invariants.md
-#   - User CLAUDE.md (we don't strip @-imports — manual cleanup required)
+#
+# Codex+Gemini council R10 P2 — earlier uninstall left the @-import line
+# in CLAUDE.md verbatim. Users uninstalling typically also delete the
+# repo, leaving Claude Code with a dangling reference that errored on
+# every session start. Now: strip the using-vanta @-import + the "# Vanta
+# session protocol" header line that setup.sh added above it. Other
+# CLAUDE.md content (user instructions, other @-imports) is preserved.
 #
 # Why preserve user data: an uninstall might be temporary (debugging a hook,
 # upgrading to a new version). Wiping ~/.vanta would lose months of decisions,
@@ -140,6 +146,23 @@ for skill in vanta-run vanta-council vanta-sync vanta-patterns; do
     echo "  ✓ removed $skill"
   fi
 done
+echo ""
+
+# ── Strip CLAUDE.md @-import (R10 P2) ───────────────────────────────────────
+CLAUDE_MD="$HOME/.claude/CLAUDE.md"
+if [ -f "$CLAUDE_MD" ]; then
+  echo "Stripping using-vanta @-import from CLAUDE.md..."
+  # Remove lines matching the @-import pattern AND the immediately preceding
+  # "# Vanta session protocol" header that setup.sh added above it.
+  awk '
+    /^# Vanta session protocol$/ { saved=$0; skip_next=1; next }
+    skip_next && /skills\/using-vanta\/SKILL\.md/ { skip_next=0; next }
+    skip_next { print saved; saved=""; skip_next=0 }
+    /skills\/using-vanta\/SKILL\.md/ { next }  # any stragglers
+    { print }
+  ' "$CLAUDE_MD" > "$CLAUDE_MD.tmp" && mv "$CLAUDE_MD.tmp" "$CLAUDE_MD"
+  echo "  ✓ CLAUDE.md @-import stripped"
+fi
 echo ""
 
 # ── Remove shared bins ──────────────────────────────────────────────────────

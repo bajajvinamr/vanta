@@ -43,7 +43,8 @@
       "file": "tool-observer.js",
       "runtime": "node",
       "timeout": 3,
-      "purpose": "Always-on: shape-only telemetry to interactions.jsonl, no inject no block. R5 P2 — registered BEFORE git-guardrails so blocked Bash commands still get telemetry.",
+      "prepend": true,
+      "purpose": "Always-on: shape-only telemetry to interactions.jsonl, no inject no block. R5 P2 — registered BEFORE git-guardrails so blocked Bash commands still get telemetry. R10 P1 — `prepend: true` puts it at FRONT of settings.json so other plugins' blocking hooks can't shadow telemetry.",
       "added": "2026-05-01"
     },
     {
@@ -92,7 +93,8 @@
       "file": "tool-observer.js",
       "runtime": "node",
       "timeout": 3,
-      "purpose": "Always-on: post-side telemetry — captures success/fail bit"
+      "prepend": true,
+      "purpose": "Always-on: post-side telemetry — captures success/fail bit. R10 P1 — `prepend: true` so other plugins' PostToolUse hooks can't shadow telemetry."
     }
   ]
 }

@@ -143,9 +143,12 @@ function readQueues() {
     let interactions24h = null;
     if (q.special === 'interactions') {
       // Cheap pass: count events in last 24h, count failures, top 3 tools.
-      // No fold — interactions.jsonl is shape-only and rotated at 5MB.
+      // R10 P2 / R8 P1 — read across rotated `.bak.<ts>` siblings.
+      // Earlier impl only read the live file; right after a rotation,
+      // counts plummeted to whatever had been written since the rename.
       try {
-        const raw = fs.readFileSync(q.file, 'utf8');
+        const { readMergedJsonl } = require('./vanta-jsonl');
+        const raw = readMergedJsonl(q.file);
         const cutoff = Date.now() - 24 * 60 * 60_000;
         let total = 0, failures = 0;
         const byTool = new Map();
