@@ -20,7 +20,7 @@
 # Schema version is bumped when match-engine semantics change. Entries
 # may be added without a version bump.
 
-version: 1
+version: 2
 
 floor:
   # ─── Database / migrations ─────────────────────────────────────────────────

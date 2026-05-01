@@ -4757,3 +4757,116 @@ describe('hooks/prompt-rewriter — inline marker on trust-ready (v3.7.4)', () =
   });
 });
 
+// ─── v3.7.5 — project scoping + auto-execution gate ─────────────────────────
+
+describe('vanta-trust-metrics — project scoping + min sample (v3.7.5)', () => {
+  const tm = require('../bin/vanta-trust-metrics');
+
+  test('readyForInline requires min sample even when rates are good', () => {
+    const goodMetrics = {
+      undo_within_2m: { rate: 0, n: 3 },         // 3 actions, perfect record
+      manual_interrupt: { rate: 0, n: 0 },
+      chain_success: { rate: 1.0, n: 0 },
+      spanDays: 30,
+    };
+    assert.equal(tm.readyForInline(goodMetrics), false,
+      '3 actions must NOT earn inline regardless of rate');
+  });
+
+  test('readyForInline passes with sample at default threshold (50)', () => {
+    const goodMetrics = {
+      undo_within_2m: { rate: 0, n: 50 },
+      manual_interrupt: { rate: 0, n: 50 },
+      chain_success: { rate: 0.9, n: 50 },
+      spanDays: 30,
+    };
+    assert.equal(tm.readyForInline(goodMetrics), true);
+  });
+
+  test('readyForInline accepts custom min_sample for tests', () => {
+    const m = {
+      undo_within_2m: { rate: 0, n: 5 },
+      manual_interrupt: { rate: 0, n: 5 },
+      chain_success: { rate: 1.0, n: 5 },
+      spanDays: 14,
+    };
+    assert.equal(tm.readyForInline(m, { min_sample: 3 }), true);
+  });
+
+  test('compute accepts project filter (smoke)', () => {
+    // No-op smoke — real action-log empty in tests, just verify no crash.
+    const m = tm.compute({ days: 30, project: 'no-such-project-xyz' });
+    assert.equal(m.project, 'no-such-project-xyz');
+    assert.equal(typeof m.spanDays, 'number');
+  });
+});
+
+describe('vanta-executor — two-eyes compound enforcement (v3.7.5)', () => {
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+
+  test('escalation + huge-effort → T3 + peer="both" + two_eyes=true', () => {
+    const fePath = require.resolve('../bin/vanta-failure-escalation');
+    const exPath = require.resolve('../bin/vanta-executor');
+    const orig = require.cache[fePath];
+    require.cache[fePath] = {
+      id: fePath, filename: fePath, loaded: true,
+      exports: {
+        escalate: () => ({ count: 4, bump: 1, force_tier: null, why: 'stubbed' }),
+        applyEscalation: (t) => 'T2',
+      },
+    };
+    delete require.cache[exPath];
+    const stubbed = require('../bin/vanta-executor');
+    try {
+      const big = 'x\n'.repeat(900);
+      const d = stubbed.decide({
+        prompt: 'fix this', file_path: 'src/a.ts', diff: big, session_id: 'two-eyes-test',
+      });
+      assert.equal(d.tier, 'T3');
+      assert.equal(d.two_eyes, true);
+      assert.ok(d.peer);
+      assert.equal(d.peer.peer, 'both');
+    } finally {
+      if (orig) require.cache[fePath] = orig; else delete require.cache[fePath];
+      delete require.cache[exPath];
+    }
+  });
+
+  test('single signal does NOT trigger two-eyes', () => {
+    delete require.cache[require.resolve('../bin/vanta-executor')];
+    const ex = require('../bin/vanta-executor');
+    const big = 'x\n'.repeat(900);
+    const d = ex.decide({ prompt: 'fix this', file_path: 'src/a.ts', diff: big });
+    // Effort alone fires; no escalation, no uncertainty
+    assert.equal(d.two_eyes, false);
+  });
+
+  test('Decision shape includes two_eyes field by default', () => {
+    delete require.cache[require.resolve('../bin/vanta-executor')];
+    const ex = require('../bin/vanta-executor');
+    const d = ex.decide({ prompt: 'hello' });
+    assert.equal(typeof d.two_eyes, 'boolean');
+    assert.equal(d.two_eyes, false);
+  });
+});
+
+describe('setup.sh — safety-floor policy versioning (v3.7.5)', () => {
+  test('repo safety-floor declares version field', () => {
+    const yaml = fs.readFileSync(path.join(__dirname, '..', 'policy', 'safety-floor.yaml'), 'utf8');
+    const m = yaml.match(/^version:\s*(\d+)/m);
+    assert.ok(m, 'safety-floor.yaml must declare a top-level version');
+    assert.ok(parseInt(m[1], 10) >= 2, 'version must be >= 2 (bumped at v3.7.5)');
+  });
+
+  test('setup.sh references VANTA_FORCE_FLOOR_UPGRADE env var', () => {
+    const sh = fs.readFileSync(path.join(__dirname, '..', 'setup.sh'), 'utf8');
+    assert.match(sh, /VANTA_FORCE_FLOOR_UPGRADE/);
+  });
+
+  test('setup.sh bin list includes vanta-executor and vanta-failure-escalation', () => {
+    const sh = fs.readFileSync(path.join(__dirname, '..', 'setup.sh'), 'utf8');
+    assert.match(sh, /vanta-executor\.js/);
+    assert.match(sh, /vanta-failure-escalation\.js/);
+  });
+});
+

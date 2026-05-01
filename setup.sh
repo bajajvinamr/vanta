@@ -57,12 +57,34 @@ echo ""
 # v3.6.13 — deterministic always-ask layer. Floor file is deployed to
 # ~/.vanta/policy/ so user-edits survive across upgrades. Repo copy is
 # the read-only baseline if the deployed copy is missing.
+#
+# v3.7.5 — version-aware upgrade. The repo copy carries `version: N` at
+# the top of the YAML. When the repo version is HIGHER than the deployed
+# copy, surface a one-line diff hint and prompt the user (defaults to
+# "no" — preserve user edits). When equal or lower, leave deployed copy
+# untouched.
 mkdir -p "$HOME/.vanta/policy"
 if [ ! -f "$HOME/.vanta/policy/safety-floor.yaml" ]; then
   cp "$REPO_DIR/policy/safety-floor.yaml" "$HOME/.vanta/policy/safety-floor.yaml"
   echo "  ✓ safety-floor.yaml deployed to ~/.vanta/policy/"
 else
-  echo "  ✓ safety-floor.yaml present (preserved user edits)"
+  REPO_VER=$(grep -E '^version:' "$REPO_DIR/policy/safety-floor.yaml" | head -1 | awk '{print $2}')
+  DEPLOY_VER=$(grep -E '^version:' "$HOME/.vanta/policy/safety-floor.yaml" | head -1 | awk '{print $2}')
+  if [ -n "$REPO_VER" ] && [ -n "$DEPLOY_VER" ] && [ "$REPO_VER" -gt "$DEPLOY_VER" ]; then
+    REPO_RULES=$(grep -c '^  - id:' "$REPO_DIR/policy/safety-floor.yaml")
+    DEPLOY_RULES=$(grep -c '^  - id:' "$HOME/.vanta/policy/safety-floor.yaml")
+    echo "  ⚠ safety-floor.yaml: repo v$REPO_VER ($REPO_RULES rules) > deployed v$DEPLOY_VER ($DEPLOY_RULES rules)"
+    echo "    To upgrade (preserves your edits via .bak): VANTA_FORCE_FLOOR_UPGRADE=1 ./setup.sh"
+    if [ "$VANTA_FORCE_FLOOR_UPGRADE" = "1" ]; then
+      cp "$HOME/.vanta/policy/safety-floor.yaml" "$HOME/.vanta/policy/safety-floor.yaml.bak.$(date +%s)"
+      cp "$REPO_DIR/policy/safety-floor.yaml" "$HOME/.vanta/policy/safety-floor.yaml"
+      echo "  ✓ safety-floor.yaml upgraded v$DEPLOY_VER → v$REPO_VER (backup saved)"
+    else
+      echo "  ✓ safety-floor.yaml present (deployed v$DEPLOY_VER preserved)"
+    fi
+  else
+    echo "  ✓ safety-floor.yaml present (preserved user edits)"
+  fi
 fi
 if [ ! -f "$HOME/.vanta/policy/peer-routing.yaml" ]; then
   cp "$REPO_DIR/policy/peer-routing.yaml" "$HOME/.vanta/policy/peer-routing.yaml"
@@ -75,7 +97,7 @@ echo ""
 # ── Bin (knowledge resolver and other shared scripts) ───────────────────────
 echo "Installing shared bins..."
 mkdir -p "$BIN_DIR"
-for binfile in vanta-projects.js vanta-log.js vanta-resolve.js vanta-brief.js vanta-index-code.js vanta-status.js vanta-prune.js vanta-council-health.js vanta-council-feedback.js vanta-extract-score.js vanta-council-run.js vanta-runtime-state.js vanta-prompt-brief.js vanta-interaction-log.js vanta-jsonl.js vanta-safety-floor.js vanta-kill-switch.js vanta-action-log.js vanta-trust-metrics.js vanta-rewriter.js vanta-peer-router.js vanta-risk-classifier.js vanta-undo.js vanta-regret-detector.js vanta-autonomy.js vanta-memory-promote.js vanta-confidence-decay.js; do
+for binfile in vanta-projects.js vanta-log.js vanta-resolve.js vanta-brief.js vanta-index-code.js vanta-status.js vanta-prune.js vanta-council-health.js vanta-council-feedback.js vanta-extract-score.js vanta-council-run.js vanta-runtime-state.js vanta-prompt-brief.js vanta-interaction-log.js vanta-jsonl.js vanta-safety-floor.js vanta-kill-switch.js vanta-action-log.js vanta-trust-metrics.js vanta-rewriter.js vanta-peer-router.js vanta-risk-classifier.js vanta-undo.js vanta-regret-detector.js vanta-autonomy.js vanta-memory-promote.js vanta-confidence-decay.js vanta-executor.js vanta-failure-escalation.js; do
   src="$REPO_DIR/bin/$binfile"
   if [ -f "$src" ]; then
     cp "$src" "$BIN_DIR/$binfile"

@@ -391,6 +391,23 @@ function decide(input = {}) {
     escalatedTier = _bumpTier(escalatedTier, uncertainty.bump);
   }
 
+  // 4c-bis. Two-eyes compound enforcement (v3.7.5) — when 2+ high-risk
+  //         signals fire simultaneously (failure-escalation +
+  //         huge-effort, semantic-product + uncertainty, etc.) the
+  //         single-tier bump isn't enough. Force T3 AND require both
+  //         peers (codex + gemini) for the council pass, instead of
+  //         the single peer the risk-classifier picked.
+  const compoundSignals = [
+    escalation && (escalation.bump > 0 || escalation.force_tier),
+    effort && (effort.level === 'huge' || effort.level === 'high'),
+    uncertainty && uncertainty.bump,
+  ].filter(Boolean).length;
+  let twoEyes = false;
+  if (compoundSignals >= 2) {
+    escalatedTier = 'T3';
+    twoEyes = true;
+  }
+
   // 4d. Trust→inline mode signal. The Decision carries `inline_ready:
   //     bool` so consumers (prompt-rewriter hook) can opt to flip from
   //     shadow to inline once trust thresholds clear (14d span, low
@@ -401,7 +418,9 @@ function decide(input = {}) {
   const tm = trustMetrics();
   if (tm && tm.compute) {
     try {
-      const m = tm.compute({ days: 30 });
+      // v3.7.5 — project-scoped trust. Slug from cwd basename.
+      const project = ctx.cwd ? path.basename(ctx.cwd) : null;
+      const m = tm.compute({ days: 30, project });
       inline_ready = !!m.ready_for_inline;
     } catch (_) { inline_ready = false; }
   }
@@ -450,10 +469,11 @@ function decide(input = {}) {
     rewritten: routing.rewritten,
     score: cls.score,
     risk: cls.risk,
-    peer: cls.peer,
+    peer: twoEyes ? { peer: 'both', why: 'two-eyes compound enforcement' } : cls.peer,
     escalation: escalation && (escalation.bump > 0 || escalation.force_tier) ? escalation : null,
     effort:     effort      || null,
     uncertainty: uncertainty || null,
+    two_eyes:   twoEyes,
     inline_ready,
     confidence,
   });
@@ -478,6 +498,7 @@ function _make(ctx, ts, decision_id, d) {
     escalation:  d.escalation || null,
     effort:      d.effort || null,
     uncertainty: d.uncertainty || null,
+    two_eyes:    d.two_eyes === true,
     inline_ready: d.inline_ready === true,
     budget_ms:   BUDGET_MS[d.tier] || BUDGET_MS.T0,
     why:         d.why || '',

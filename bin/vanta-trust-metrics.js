@@ -115,8 +115,8 @@ function _interruptRate({ sinceMs }) {
 // chain_success_rate: a "chain" is N consecutive auto-actions in the
 // same session. A chain "succeeds" if no interrupt or undo lands within
 // the chain or 2min after its last action.
-function _chainSuccess({ sinceMs }) {
-  const entries = read({ sinceMs }).filter(e => e.session_id);
+function _chainSuccess({ sinceMs, project }) {
+  const entries = read({ sinceMs, project }).filter(e => e.session_id);
   if (entries.length === 0) return { rate: 0, n: 0, succeeded: 0 };
   // Group by session.
   const bySession = new Map();
@@ -154,37 +154,48 @@ function _chainSuccess({ sinceMs }) {
 }
 
 // Composite verdict: are we ready to flip rewriter shadow→inline?
-function readyForInline(metrics) {
+//
+// v3.7.5 — adds min_sample requirement. A 14-day span with 3 auto
+// actions doesn't earn inline. Default min sample = 50 actions.
+const DEFAULT_MIN_SAMPLE = 50;
+function readyForInline(metrics, opts = {}) {
+  const minSample = opts.min_sample != null ? opts.min_sample : DEFAULT_MIN_SAMPLE;
+  const totalAuto = metrics.undo_within_2m && metrics.undo_within_2m.n || 0;
   return (
     metrics.undo_within_2m.rate < 0.02 &&
     metrics.manual_interrupt.rate < 0.05 &&
     metrics.chain_success.rate > 0.70 &&
-    metrics.spanDays >= 14
+    metrics.spanDays >= 14 &&
+    totalAuto >= minSample
   );
 }
 
-function compute({ sinceMs, days } = {}) {
+// v3.7.5 — accepts `project` filter so trust is per-project, not global.
+// A user with high trust in project-A doesn't auto-promote actions in a
+// brand-new project-B. Reads action-log filtered by `project` slug.
+function compute({ sinceMs, days, project, min_sample } = {}) {
   if (!sinceMs && days) sinceMs = Date.now() - days * ONE_DAY_MS;
-  const entries = read({ sinceMs });
+  const entries = read({ sinceMs, project });
   const undoWithin2m = _undoWithin2m(entries);
   const manualInterrupt = _interruptRate({ sinceMs });
-  const chainSuccess = _chainSuccess({ sinceMs });
+  const chainSuccess = _chainSuccess({ sinceMs, project });
   const spanDays = entries.length > 0
     ? Math.max(1, Math.round((Date.now() - Date.parse(entries[0].ts)) / ONE_DAY_MS))
     : 0;
   const out = {
     sinceMs: sinceMs || null,
+    project: project || null,
     spanDays,
     actions: rollup({ sinceMs }),
     undo_within_2m: undoWithin2m,
     manual_interrupt: manualInterrupt,
     chain_success: chainSuccess,
   };
-  out.ready_for_inline = readyForInline(out);
+  out.ready_for_inline = readyForInline(out, { min_sample });
   return out;
 }
 
-module.exports = { compute, readyForInline };
+module.exports = { compute, readyForInline, DEFAULT_MIN_SAMPLE };
 
 // CLI: `vanta-trust-metrics [--days N|--since-h H]`
 if (require.main === module) {
