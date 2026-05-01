@@ -11,7 +11,7 @@
 //   - acquireLock:    pid-aware steal (Tier 5 — pure-time steal was unsafe
 //                     under slow --full runs)
 
-const { test, describe } = require('node:test');
+const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -4290,6 +4290,371 @@ describe('hooks/prompt-rewriter — executor-driven shadow injection (v3.7.2)', 
         /^\[Vanta\]\s+\/ship\s+·\s+ship/);
       assert.match(parsed.hookSpecificOutput.additionalContext, /^1\./m);
     } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+});
+
+// ─── v3.7.3 — critical safety fixes ─────────────────────────────────────────
+//
+// 1. Undo state-check  : refuse undo when artifact has moved on
+// 2. matchSymbol diff  : executor scans diff body for sensitive symbols
+// 3. Failure escalation: consecutive failures bump the next decision tier
+// 4. Semantic detector : strategic-framing prompts → T3 ASK + /council
+
+describe('vanta-executor — semantic product-decision detector (v3.7.3)', () => {
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  delete require.cache[require.resolve('../bin/vanta-safety-floor')];
+  delete require.cache[require.resolve('../bin/vanta-executor')];
+  require('../bin/vanta-safety-floor').reload();
+  const executor = require('../bin/vanta-executor');
+
+  test('"should we add subscription tiers?" → T3 ASK + /council', () => {
+    const d = executor.decide({ prompt: 'should we add subscription tiers?' });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.decision, 'ask');
+    assert.equal(d.skill_route, '/council');
+    assert.equal(d.floor.id, 'semantic-product-decision');
+  });
+
+  test('"can we rename the schema?" matches semantic detector', () => {
+    const d = executor.decide({ prompt: 'can we rename the schema?' });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.floor.id, 'semantic-product-decision');
+  });
+
+  test('"let me know if we should sunset the free plan" matches', () => {
+    const d = executor.decide({ prompt: 'let me know if we should sunset the free plan' });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.decision, 'ask');
+  });
+
+  test('benign lookups are NOT semantically promoted', () => {
+    const d = executor.decide({ prompt: 'what is the price?' });
+    assert.notEqual(d.tier, 'T3');
+  });
+
+  test('rewriter rule wins over semantic detector when prompt matches both', () => {
+    // "ship it" matches the ship rewriter rule. Semantic detector should
+    // not fire on a prompt that has no framer/target combo.
+    const d = executor.decide({ prompt: 'ship it' });
+    assert.equal(d.source, 'rewriter-rule');
+    assert.equal(d.intent, 'ship');
+  });
+});
+
+describe('vanta-executor — diff body wires matchSymbol (v3.7.3)', () => {
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  delete require.cache[require.resolve('../bin/vanta-safety-floor')];
+  delete require.cache[require.resolve('../bin/vanta-executor')];
+  require('../bin/vanta-safety-floor').reload();
+  const executor = require('../bin/vanta-executor');
+
+  test('diff containing deleteCustomer( → T3 ASK via customer-data-delete', () => {
+    const d = executor.decide({
+      prompt: '',
+      file_path: 'src/users.ts',
+      diff: 'function deleteCustomer(id) { db.purge(id); }',
+    });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.decision, 'ask');
+    assert.equal(d.floor.id, 'customer-data-delete');
+  });
+
+  test('diff containing TIER_PRICE = → T3 ASK via pricing-constants', () => {
+    const d = executor.decide({
+      prompt: '',
+      file_path: 'src/billing.ts',
+      diff: 'export const TIER_PRICE = 999;',
+    });
+    assert.equal(d.tier, 'T3');
+    assert.equal(d.floor.id, 'pricing-constants');
+  });
+
+  test('benign diff is NOT flagged', () => {
+    const d = executor.decide({
+      prompt: 'fix typo',
+      file_path: 'README.md',
+      diff: 'export function add(a, b) { return a + b; }',
+    });
+    assert.notEqual(d.tier, 'T3');
+  });
+});
+
+describe('vanta-failure-escalation — consecutive failures bump tier (v3.7.3)', () => {
+  const fe = require('../bin/vanta-failure-escalation');
+
+  test('applyEscalation handles bump=1 from T1 to T2', () => {
+    assert.equal(fe.applyEscalation('T0', { bump: 1, force_tier: null }), 'T1');
+    assert.equal(fe.applyEscalation('T1', { bump: 1, force_tier: null }), 'T2');
+    assert.equal(fe.applyEscalation('T2', { bump: 1, force_tier: null }), 'T3');
+    assert.equal(fe.applyEscalation('T3', { bump: 1, force_tier: null }), 'T3');
+  });
+
+  test('applyEscalation force_tier overrides bump', () => {
+    assert.equal(fe.applyEscalation('T0', { bump: 0, force_tier: 'T3' }), 'T3');
+    assert.equal(fe.applyEscalation('T1', { bump: 1, force_tier: 'T3' }), 'T3');
+  });
+
+  test('escalate degrades cleanly when no action-log available', () => {
+    // Uses default action-log path; empty logs should yield zero failures.
+    const r = fe.escalate({ session_id: 'no-such-session-' + Date.now() });
+    assert.equal(typeof r.count, 'number');
+    assert.equal(r.bump, 0);
+    assert.equal(r.force_tier, null);
+  });
+
+  test('escalate counts test-failure / build-failure / undo / regret', () => {
+    // Stub action-log to return synthetic failures.
+    const alPath = require.resolve('../bin/vanta-action-log');
+    const original = require.cache[alPath];
+    require.cache[alPath] = {
+      id: alPath, filename: alPath, loaded: true,
+      exports: {
+        read: () => [
+          { action: 'test-failure', ts: new Date().toISOString() },
+          { action: 'build-failure', ts: new Date().toISOString() },
+          { action: 'undo', ts: new Date().toISOString() },
+          { action: 'rewrite', ts: new Date().toISOString() },  // not a failure
+        ],
+        record: () => {}, findLast: () => null, rollup: () => ({}),
+      },
+    };
+    delete require.cache[require.resolve('../bin/vanta-failure-escalation')];
+    const stubbed = require('../bin/vanta-failure-escalation');
+    try {
+      const r = stubbed.escalate({});
+      assert.equal(r.count, 3, 'three failure signals should be counted');
+      assert.equal(r.bump, 1, 'count >= 3 → bump=1');
+      assert.equal(r.force_tier, null);
+    } finally {
+      if (original) require.cache[alPath] = original; else delete require.cache[alPath];
+      delete require.cache[require.resolve('../bin/vanta-failure-escalation')];
+    }
+  });
+
+  test('5+ failure signals force T3', () => {
+    const alPath = require.resolve('../bin/vanta-action-log');
+    const original = require.cache[alPath];
+    require.cache[alPath] = {
+      id: alPath, filename: alPath, loaded: true,
+      exports: {
+        read: () => Array.from({ length: 6 }, () => ({
+          action: 'undo', ts: new Date().toISOString(),
+        })),
+        record: () => {}, findLast: () => null, rollup: () => ({}),
+      },
+    };
+    delete require.cache[require.resolve('../bin/vanta-failure-escalation')];
+    const stubbed = require('../bin/vanta-failure-escalation');
+    try {
+      const r = stubbed.escalate({});
+      assert.equal(r.force_tier, 'T3');
+    } finally {
+      if (original) require.cache[alPath] = original; else delete require.cache[alPath];
+      delete require.cache[require.resolve('../bin/vanta-failure-escalation')];
+    }
+  });
+
+  test('executor surfaces escalation in Decision.escalation when active', () => {
+    const alPath = require.resolve('../bin/vanta-action-log');
+    const exPath = require.resolve('../bin/vanta-executor');
+    const fePath = require.resolve('../bin/vanta-failure-escalation');
+    const origAl = require.cache[alPath];
+    require.cache[alPath] = {
+      id: alPath, filename: alPath, loaded: true,
+      exports: {
+        read: () => Array.from({ length: 4 }, () => ({
+          action: 'test-failure', ts: new Date().toISOString(),
+        })),
+        record: () => {}, findLast: () => null, rollup: () => ({}),
+      },
+    };
+    delete require.cache[fePath];
+    delete require.cache[exPath];
+    const stubbed = require('../bin/vanta-executor');
+    try {
+      // "fix this" alone would land at T1; with 4 failures it bumps to T2.
+      const d = stubbed.decide({ prompt: 'fix this', session_id: 'bumpme' });
+      assert.ok(d.escalation, 'escalation should be present');
+      assert.equal(d.escalation.bump, 1);
+      assert.equal(d.tier, 'T2', 'T1 + bump(1) should equal T2');
+    } finally {
+      if (origAl) require.cache[alPath] = origAl; else delete require.cache[alPath];
+      delete require.cache[fePath];
+      delete require.cache[exPath];
+    }
+  });
+});
+
+describe('vanta-undo — state-check refuses dirty undo (v3.7.3)', () => {
+  const { execSync } = require('child_process');
+  let tmpDir, repoDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-undo-state-'));
+    repoDir = path.join(tmpDir, 'repo');
+    fs.mkdirSync(repoDir);
+    execSync('git init -q', { cwd: repoDir });
+    execSync('git config user.email t@t.t', { cwd: repoDir });
+    execSync('git config user.name t', { cwd: repoDir });
+  });
+  afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
+
+  test('refuses file-write undo when current SHA differs from after_sha', () => {
+    const file = path.join(repoDir, 'a.txt');
+    fs.writeFileSync(file, 'original\n');
+    const beforeSha = execSync(`git hash-object "${file}"`, { cwd: repoDir }).toString().trim();
+    execSync(`git hash-object -w "${file}"`, { cwd: repoDir });
+    fs.writeFileSync(file, 'vanta-wrote\n');
+    const afterSha = execSync(`git hash-object "${file}"`, { cwd: repoDir }).toString().trim();
+    execSync(`git hash-object -w "${file}"`, { cwd: repoDir });
+    // User edits AFTER vanta wrote.
+    fs.writeFileSync(file, 'user-edited\n');
+
+    delete require.cache[require.resolve('../bin/vanta-undo')];
+    const undo = require('../bin/vanta-undo');
+    // Call the file-write reverser directly via the public undo path
+    // by feeding it a synthetic action-log entry.
+    const alPath = require.resolve('../bin/vanta-action-log');
+    const origAl = require.cache[alPath];
+    require.cache[alPath] = {
+      id: alPath, filename: alPath, loaded: true,
+      exports: {
+        findLast: () => ({
+          id: 'act-test1',
+          ts: new Date().toISOString(),
+          action: 'file-write',
+          subject: file,
+          undo_hint: { kind: 'file-write', payload: {
+            path: file,
+            before_sha: beforeSha,
+            after_sha: afterSha,
+          } },
+        }),
+        record: () => {},
+        read: () => [], rollup: () => ({}),
+      },
+    };
+    delete require.cache[require.resolve('../bin/vanta-undo')];
+    const undoFresh = require('../bin/vanta-undo');
+    try {
+      const r = undoFresh.undo({});
+      assert.equal(r.ok, false, 'must refuse — file has moved on');
+      assert.match(r.reason, /moved on|state-check/);
+    } finally {
+      if (origAl) require.cache[alPath] = origAl; else delete require.cache[alPath];
+    }
+  });
+
+  test('proceeds when current SHA matches after_sha', () => {
+    const file = path.join(repoDir, 'b.txt');
+    fs.writeFileSync(file, 'original\n');
+    const beforeSha = execSync(`git hash-object "${file}"`, { cwd: repoDir }).toString().trim();
+    execSync(`git hash-object -w "${file}"`, { cwd: repoDir });
+    fs.writeFileSync(file, 'vanta-wrote\n');
+    const afterSha = execSync(`git hash-object "${file}"`, { cwd: repoDir }).toString().trim();
+    execSync(`git hash-object -w "${file}"`, { cwd: repoDir });
+    // No user edit — file still matches after_sha.
+
+    const alPath = require.resolve('../bin/vanta-action-log');
+    const origAl = require.cache[alPath];
+    require.cache[alPath] = {
+      id: alPath, filename: alPath, loaded: true,
+      exports: {
+        findLast: () => ({
+          id: 'act-test2',
+          ts: new Date().toISOString(),
+          action: 'file-write',
+          subject: file,
+          undo_hint: { kind: 'file-write', payload: {
+            path: file,
+            before_sha: beforeSha,
+            after_sha: afterSha,
+          } },
+        }),
+        record: () => {},
+        read: () => [], rollup: () => ({}),
+      },
+    };
+    delete require.cache[require.resolve('../bin/vanta-undo')];
+    const undoFresh = require('../bin/vanta-undo');
+    try {
+      const r = undoFresh.undo({});
+      assert.equal(r.ok, true, 'must succeed when state matches');
+      assert.equal(fs.readFileSync(file, 'utf8'), 'original\n');
+    } finally {
+      if (origAl) require.cache[alPath] = origAl; else delete require.cache[alPath];
+    }
+  });
+
+  test('back-compat: missing after_sha skips state-check', () => {
+    const file = path.join(repoDir, 'c.txt');
+    fs.writeFileSync(file, 'original\n');
+    const beforeSha = execSync(`git hash-object "${file}"`, { cwd: repoDir }).toString().trim();
+    execSync(`git hash-object -w "${file}"`, { cwd: repoDir });
+    fs.writeFileSync(file, 'whatever\n');
+
+    const alPath = require.resolve('../bin/vanta-action-log');
+    const origAl = require.cache[alPath];
+    require.cache[alPath] = {
+      id: alPath, filename: alPath, loaded: true,
+      exports: {
+        findLast: () => ({
+          id: 'act-test3',
+          ts: new Date().toISOString(),
+          action: 'file-write',
+          subject: file,
+          // No after_sha — old log entry from before v3.7.3.
+          undo_hint: { kind: 'file-write', payload: { path: file, before_sha: beforeSha } },
+        }),
+        record: () => {},
+        read: () => [], rollup: () => ({}),
+      },
+    };
+    delete require.cache[require.resolve('../bin/vanta-undo')];
+    const undoFresh = require('../bin/vanta-undo');
+    try {
+      const r = undoFresh.undo({});
+      assert.equal(r.ok, true, 'must succeed for legacy entries without after_sha');
+    } finally {
+      if (origAl) require.cache[alPath] = origAl; else delete require.cache[alPath];
+    }
+  });
+
+  test('file-delete refuses when file now exists (something else created it)', () => {
+    const file = path.join(repoDir, 'd.txt');
+    // Vanta deleted the file. Now something else creates it.
+    fs.writeFileSync(file, 'someone-else-wrote\n');
+
+    const alPath = require.resolve('../bin/vanta-action-log');
+    const origAl = require.cache[alPath];
+    require.cache[alPath] = {
+      id: alPath, filename: alPath, loaded: true,
+      exports: {
+        findLast: () => ({
+          id: 'act-test4',
+          ts: new Date().toISOString(),
+          action: 'file-delete',
+          subject: file,
+          undo_hint: { kind: 'file-delete', payload: {
+            path: file,
+            content_b64: Buffer.from('original\n').toString('base64'),
+          } },
+        }),
+        record: () => {},
+        read: () => [], rollup: () => ({}),
+      },
+    };
+    delete require.cache[require.resolve('../bin/vanta-undo')];
+    const undoFresh = require('../bin/vanta-undo');
+    try {
+      const r = undoFresh.undo({});
+      assert.equal(r.ok, false);
+      assert.match(r.reason, /now exists|--force/);
+      assert.equal(fs.readFileSync(file, 'utf8'), 'someone-else-wrote\n',
+        'state-check must NOT overwrite');
+    } finally {
+      if (origAl) require.cache[alPath] = origAl; else delete require.cache[alPath];
+    }
   });
 });
 

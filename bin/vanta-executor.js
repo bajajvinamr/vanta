@@ -26,7 +26,7 @@ const os = require('os');
 
 // Lazy-load helpers so hooks/tests can stub them and so a missing helper
 // degrades to a permissive default rather than crashing the executor.
-let _killSwitch, _safetyFloor, _rewriter, _riskClassifier, _peerRouter;
+let _killSwitch, _safetyFloor, _rewriter, _riskClassifier, _peerRouter, _escalation;
 
 function _resolve(name) {
   for (const p of [
@@ -38,11 +38,30 @@ function _resolve(name) {
   }
   return null;
 }
-function killSwitch()     { return _killSwitch     || (_killSwitch     = _resolve('vanta-kill-switch.js'));     }
-function safetyFloor()    { return _safetyFloor    || (_safetyFloor    = _resolve('vanta-safety-floor.js'));    }
-function rewriter()       { return _rewriter       || (_rewriter       = _resolve('vanta-rewriter.js'));        }
-function riskClassifier() { return _riskClassifier || (_riskClassifier = _resolve('vanta-risk-classifier.js')); }
-function peerRouter()     { return _peerRouter     || (_peerRouter     = _resolve('vanta-peer-router.js'));     }
+function killSwitch()       { return _killSwitch     || (_killSwitch     = _resolve('vanta-kill-switch.js'));     }
+function safetyFloor()      { return _safetyFloor    || (_safetyFloor    = _resolve('vanta-safety-floor.js'));    }
+function rewriter()         { return _rewriter       || (_rewriter       = _resolve('vanta-rewriter.js'));        }
+function riskClassifier()   { return _riskClassifier || (_riskClassifier = _resolve('vanta-risk-classifier.js')); }
+function peerRouter()       { return _peerRouter     || (_peerRouter     = _resolve('vanta-peer-router.js'));     }
+function failureEscalation(){ return _escalation    || (_escalation    = _resolve('vanta-failure-escalation.js'));}
+
+// v3.7.3 — semantic product-decision detector. Cheap regex over phrases
+// that read like "asking for a strategic call" combined with strategic
+// keywords. Catches things like "should we add subscription tiers?" or
+// "let's rename the API surface" that the existing prompt-* floor
+// entries miss because they require a specific verb anchor. Heuristic
+// only — no LLM call.
+const SEMANTIC_PRODUCT_FRAMERS = /\b(should|ought|do)\s+(we|i|you)\b|^\s*(let'?s|let\s+me|can\s+we|why\s+don'?t\s+we|what\s+if\s+we|maybe\s+we)\b/i;
+const SEMANTIC_PRODUCT_TARGETS = /\b(prices?|pricing|tiers?|plans?|features?|products?|launch(?:es|ing)?|deprecate|sunset|scope|renames?|renaming|brand(?:s|ing)?|positioning|strateg(?:y|ies)|gtm|api\s+contract|schemas?|business\s+models?|subscriptions?)\b/i;
+function _semanticProductDecision(prompt) {
+  if (!prompt) return null;
+  if (!SEMANTIC_PRODUCT_FRAMERS.test(prompt)) return null;
+  if (!SEMANTIC_PRODUCT_TARGETS.test(prompt)) return null;
+  return {
+    id: 'semantic-product-decision',
+    why: 'phrasing reads as a strategic call (framer + target)',
+  };
+}
 
 // ─── Tier latency budgets ────────────────────────────────────────────────────
 // Hooks consume budget_ms to cap downstream LLM/peer/council calls. The
@@ -241,6 +260,26 @@ function decide(input = {}) {
     }
   }
 
+  // 3a. Semantic product-decision detector — runs after the rewriter
+  //     so well-known patterns (taxonomy-rename, ship rule) win. Catches
+  //     framing-style strategic prompts that the regex floor misses.
+  if (routing.mode !== 'rule' && routing.mode !== 'llm') {
+    const sem = _semanticProductDecision(ctx.prompt);
+    if (sem) {
+      return _make(ctx, ts, decision_id, {
+        tier: 'T3',
+        decision: 'ask',
+        source: SOURCES.FLOOR,
+        why: `semantic-product:${sem.why}`,
+        floor: { id: sem.id, why: sem.why, kind: 'semantic' },
+        skill_route: '/council',
+        score: { reversibility: 2, blast_radius: 3, product_authority: true },
+        risk: 8,
+        confidence: 'medium',
+      });
+    }
+  }
+
   // 4. Risk classifier — independent score over prompt+file+command.
   const rc = riskClassifier();
   let cls;
@@ -267,13 +306,29 @@ function decide(input = {}) {
     };
   }
 
+  // 4a. Failure escalation — bump tier when the session is stuck. The
+  //     escalation module reads the action-log for consecutive failure
+  //     signals (test-failure, build-failure, undo, regret) and emits
+  //     a bump or a force-T3 verdict. Cheap (<10ms on a typical log).
+  let escalation = null;
+  const fe = failureEscalation();
+  if (fe && fe.escalate) {
+    try {
+      escalation = fe.escalate({ session_id: ctx.session_id });
+    } catch (_) { escalation = null; }
+  }
+  let escalatedTier = cls.tier;
+  if (escalation && (escalation.bump > 0 || escalation.force_tier)) {
+    escalatedTier = fe.applyEscalation(cls.tier, escalation);
+  }
+
   // 5. Compose final decision.
-  //   - tier wins from classifier (it's the single source of risk truth)
+  //   - tier wins from classifier, optionally bumped by failure escalation
   //   - decision combines rewriter routing + tier:
   //       T3                        → ask  (matches risk-classifier semantics)
   //       T0/T1/T2 + rewriter rule  → rewrite  (terse 4-line shadow)
   //       T0/T1/T2 + passthrough    → auto / passthrough (no shadow)
-  const tier = cls.tier;
+  const tier = escalatedTier;
   let decision;
   if (tier === 'T3') {
     decision = 'ask';
@@ -287,6 +342,9 @@ function decide(input = {}) {
     cls.why,
     routing.rule_id ? `rule:${routing.rule_id}` : null,
     routing.mode === 'passthrough' && routing.intent ? `passthrough:${routing.intent}` : null,
+    escalation && (escalation.bump > 0 || escalation.force_tier)
+      ? `escalation:${escalation.why}`
+      : null,
   ].filter(Boolean).join(' · ');
 
   return _make(ctx, ts, decision_id, {
@@ -301,6 +359,7 @@ function decide(input = {}) {
     score: cls.score,
     risk: cls.risk,
     peer: cls.peer,
+    escalation: escalation && (escalation.bump > 0 || escalation.force_tier) ? escalation : null,
     confidence: 'high',
   });
 }
@@ -321,6 +380,7 @@ function _make(ctx, ts, decision_id, d) {
     floor:       d.floor || null,
     kill_switch: d.kill_switch || null,
     peer:        d.peer || null,
+    escalation:  d.escalation || null,
     budget_ms:   BUDGET_MS[d.tier] || BUDGET_MS.T0,
     why:         d.why || '',
     confidence:  d.confidence || 'high',

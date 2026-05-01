@@ -69,6 +69,28 @@ function extractFilePath(data) {
   return String(data.tool_input?.file_path || data.tool_input?.path || '');
 }
 
+// v3.7.3 — extract a "diff body" from the tool_input so the executor's
+// safety-floor matchSymbol can scan for sensitive symbols (deleteCustomer,
+// gdprDelete, pricing constants, etc.) about to land in the file.
+//
+// Claude Code Write passes `content`. Edit/MultiEdit pass `old_string` +
+// `new_string` (or an `edits[]` array). We concatenate everything we
+// can see — matchSymbol uses regex on the body, so prefix doesn't matter.
+function extractDiffBody(data) {
+  const ti = data.tool_input || {};
+  const parts = [];
+  if (typeof ti.content === 'string')    parts.push(ti.content);
+  if (typeof ti.new_string === 'string') parts.push(ti.new_string);
+  if (typeof ti.old_string === 'string') parts.push(ti.old_string);
+  if (Array.isArray(ti.edits)) {
+    for (const ed of ti.edits) {
+      if (ed && typeof ed.new_string === 'string') parts.push(ed.new_string);
+      if (ed && typeof ed.old_string === 'string') parts.push(ed.old_string);
+    }
+  }
+  return parts.join('\n');
+}
+
 function safeReadFile(p) {
   try { return fs.readFileSync(p, 'utf8'); } catch (_) { return null; }
 }
@@ -234,6 +256,9 @@ process.stdin.on('end', () => {
         const verdict = ex.decide({
           prompt: `editing ${trigger.reason} ${filePath}`,
           file_path: filePath,
+          // v3.7.3: pass diff body so matchSymbol fires on sensitive
+          // symbols (e.g. `deleteCustomer(`, pricing constants).
+          diff: extractDiffBody(data),
           session_id: data.session_id,
           cwd,
         });

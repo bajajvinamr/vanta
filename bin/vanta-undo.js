@@ -47,10 +47,41 @@ const NOT_REVERSIBLE = new Set([
 
 // ─── Per-kind reversers ─────────────────────────────────────────────────────
 
-function _undoFileWrite(payload) {
+function _undoFileWrite(payload, opts = {}) {
   if (!payload || !payload.path) return { ok: false, reason: 'missing payload.path' };
   if (!payload.before_sha) {
     return { ok: false, reason: 'no before_sha — cannot reconstruct prior content' };
+  }
+  // v3.7.3 STATE-CHECK: verify the file is still in the state Vanta
+  // wrote. If the user manually edited after Vanta's write, undoing
+  // back to before_sha would silently throw away the user's changes.
+  // Refuse unless --force.
+  //
+  // back-compat: payload.after_sha is optional. Old action-log entries
+  // recorded before this check don't have after_sha, so we skip the
+  // check rather than fail-closed (which would break existing undo).
+  if (payload.after_sha && !opts.force) {
+    try {
+      const dir = path.dirname(payload.path);
+      const currentSha = execSync(`git hash-object "${payload.path}"`, {
+        cwd: dir, stdio: ['pipe', 'pipe', 'ignore'],
+      }).toString().trim();
+      if (currentSha !== payload.after_sha) {
+        return {
+          ok: false,
+          reason:
+            `refused — file ${payload.path} has moved on since Vanta wrote it ` +
+            `(current ${currentSha.slice(0, 8)} != recorded after_sha ${payload.after_sha.slice(0, 8)}). ` +
+            `User may have edited after the Vanta write. Use --force to override.`,
+        };
+      }
+    } catch (err) {
+      // hash-object can fail if file no longer exists; that's a state
+      // change too. Refuse without --force.
+      if (!opts.force) {
+        return { ok: false, reason: `state-check failed (${err.message}); pass --force to override` };
+      }
+    }
   }
   // We require the file to be a git-tracked file with the before_sha
   // present in `git cat-file`. Otherwise we don't know what to restore.
@@ -66,9 +97,21 @@ function _undoFileWrite(payload) {
   }
 }
 
-function _undoFileDelete(payload) {
+function _undoFileDelete(payload, opts = {}) {
   if (!payload || !payload.path || !payload.content_b64) {
     return { ok: false, reason: 'missing payload.path or content_b64' };
+  }
+  // v3.7.3 STATE-CHECK: file was deleted, so it should NOT exist now.
+  // If a new file with that path was created by the user (or another
+  // process), restoring would silently overwrite it. Refuse unless --force.
+  if (fs.existsSync(payload.path) && !opts.force) {
+    return {
+      ok: false,
+      reason:
+        `refused — ${payload.path} now exists (was deleted by Vanta, but ` +
+        `something else has since created a new file at this path). ` +
+        `Use --force to overwrite.`,
+    };
   }
   try {
     fs.mkdirSync(path.dirname(payload.path), { recursive: true });
@@ -177,7 +220,7 @@ function findTarget({ action, subject, before } = {}) {
   });
 }
 
-function undo({ action, subject } = {}) {
+function undo({ action, subject, force } = {}) {
   const target = findTarget({ action, subject });
   if (!target) {
     return { ok: false, reason: 'no recent reversible action found' };
@@ -190,7 +233,9 @@ function undo({ action, subject } = {}) {
       target,
     };
   }
-  const result = reverser(target.undo_hint.payload || {});
+  // v3.7.3: pass force flag through to reversers that support it
+  // (file-write + file-delete state-checks).
+  const result = reverser(target.undo_hint.payload || {}, { force: !!force });
   // Record the undo attempt regardless of outcome — trust-metrics
   // counts undo events whether they succeed or not (success is gravy).
   // R1 P2 (Codex): target the undo by stable id, not by ts+subject. Subject
@@ -229,6 +274,7 @@ if (require.main === module) {
     return i >= 0 ? args[i + 1] : undefined;
   };
   const dry = args.includes('--dry');
+  const force = args.includes('--force');
   const action = find('--action');
   const subject = find('--subject');
 
@@ -242,7 +288,7 @@ if (require.main === module) {
     process.exit(0);
   }
 
-  const out = undo({ action, subject });
+  const out = undo({ action, subject, force });
   process.stdout.write(JSON.stringify(out, null, 2) + '\n');
   process.exit(out.ok ? 0 : 1);
 }
