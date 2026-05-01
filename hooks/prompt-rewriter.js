@@ -76,17 +76,23 @@ process.stdin.on('end', () => {
   // entries from this hook count toward project-scoped trust metrics.
   // Without this, `vanta-trust-metrics.compute({project})` filters out
   // every rewrite event and inline_ready never earns a project signal.
-  let project = null;
+  //
+  // R2 fix — `canonProject` expects a SLUG (basename), not a full path.
+  // Passing the full path lowercases it and falls through to the
+  // identity branch, returning `/users/vinamr/projects/vanta` instead
+  // of `vanta`. The action-log row then never matches a
+  // `compute({project: 'vanta'})` query and the v3.7.5 scoping fix
+  // remains effectively dead. Always basename first, canonProject second.
+  const slug = path.basename(cwd);
+  let project = slug;
   try {
     const projectsPath = _resolveBin('vanta-projects.js');
     if (projectsPath) {
       const { canonProject } = require(projectsPath);
-      project = canonProject ? canonProject(cwd) : path.basename(cwd);
-    } else {
-      project = path.basename(cwd);
+      project = (canonProject ? canonProject(slug) : slug) || slug;
     }
   } catch (_) {
-    project = path.basename(cwd);
+    project = slug;
   }
 
   // Resolve executor bin and call it directly (in-process).
