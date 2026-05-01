@@ -74,10 +74,18 @@ Apply the route:
 
 | `route` | What you do |
 |---|---|
-| `auto` (score ≥ 0.65) | Use the **Edit tool** to append under the appropriate `## Section` header in `~/.claude/rules/vinamr-invariants.md`, **prepended with an audit comment** (see below) |
-| `staging` (0.40–0.65) | Use the **Edit tool** to append to `~/.claude/rules/vinamr-invariants.staging.md` (also with audit comment). Tell the user to review later via `vanta-extract-score list-staging` |
-| `update-in-place` (near-dup ≥ 0.8) | Read the existing matched entry from `dup` field. Either skip (already covered) or use the **Edit tool** to refine the existing line — never append a 4th rephrasing |
+| `auto` (score ≥ 0.65) | **Gemini council R7 P1 fix — auto-write to global invariants is disabled.** Score-0.65+ extractions still go to `~/.claude/rules/vinamr-invariants.staging.md` with the audit comment. Surface a one-line summary back to the user: "Vanta-Sync staged N high-confidence invariant(s) — review via `vanta-extract-score list-staging` before promoting to global." Promotion to `vinamr-invariants.md` requires explicit user OK. |
+| `staging` (0.40–0.65) | Use the **Edit tool** to append to `~/.claude/rules/vinamr-invariants.staging.md` (with audit comment). Tell the user to review later via `vanta-extract-score list-staging` |
+| `update-in-place` (near-dup ≥ 0.8) | Read the existing matched entry from `dup` field. Either skip (already covered) or use the **Edit tool** to refine the existing line — never append a 4th rephrasing. **Refining an existing global entry IS allowed** — duplicate-recognition is the human review proxy. |
 | `discard` (< 0.40 or skill-doc reject) | Skip silently. Log to `~/.vanta/hook.log` if VANTA_DEBUG is set |
+
+**Why no auto-promotion:** Vanta surfaces invariants verbatim into the LLM's
+context (additionalContext on UserPromptSubmit, constraint pack on Write|Edit).
+A malicious file read in a session can be scored ≥0.65 by including backticks
++ tech tokens. Auto-promotion makes Vanta a persistent prompt-injection vector
+across all future sessions. Staging gates this behind human review. The
+`update-in-place` case is exempt because a hit on an existing invariant is
+itself a human-review proxy — the original entry was already approved.
 
 **Audit comment** — every auto/staging write MUST be prefixed with:
 ```

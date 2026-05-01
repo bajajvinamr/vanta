@@ -353,11 +353,21 @@ function readGotchas(cwd, topic) {
 // This is the CORRECT semantics: code-knowledge is structurally project-tagged
 // at index time. A query with no project context can't meaningfully match
 // project-scoped truth — better to return nothing than scan everything.
-function readCodeKnowledge(topic, activeProject, max = 20) {
+function readCodeKnowledge(topic, activeProject, max = 20, cwd = null) {
   if (!activeProject) return [];  // Tier 4: refuse multi-shard scan
   const dir = path.join(os.homedir(), '.vanta', 'knowledge');
   const active = canonProject(activeProject);
   if (!active) return [];
+
+  // Codex council R7 P2 fix — same-slug-different-cwd cross-leak.
+  // Two unrelated projects ("/Users/x/work/api" and "/Users/x/personal/api")
+  // collapse to the same canonical slug "api". Both shards survive the slug
+  // filter; entries from BOTH end up in the result. Indexer stores
+  // `projectRoot` per entry (path.resolve(cwd) at index time) — resolver
+  // now uses it to drop entries whose projectRoot doesn't match this call's
+  // active cwd. Legacy entries without projectRoot pass through unchanged
+  // for back-compat.
+  const activeRoot = cwd ? path.resolve(cwd) : null;
 
   // Cleanup #4: alias-shard merge. The same logical project can have multiple
   // shard files when an alias slug existed before its keyword regex was added
@@ -376,7 +386,7 @@ function readCodeKnowledge(topic, activeProject, max = 20) {
     const fileSlug = f.slice(0, -'.jsonl'.length);
     if (canonProject(fileSlug) !== active) continue;
     const shardFile = path.join(dir, f);
-    const entries = _readCodeKnowledgeFromFile(shardFile, topic, max, active)
+    const entries = _readCodeKnowledgeFromFile(shardFile, topic, max, active, activeRoot)
       .filter(r => canonProject(r.project) === active);
     for (const e of entries) out.push(e);
     if (out.length >= max * 3) break;  // overshoot for ranking, capped
@@ -387,19 +397,23 @@ function readCodeKnowledge(topic, activeProject, max = 20) {
   // hasn't run. Read it once, scoped to the active project.
   const legacy = path.join(os.homedir(), '.vanta', 'code-knowledge.jsonl');
   if (fs.existsSync(legacy)) {
-    return _readCodeKnowledgeFromFile(legacy, topic, max, active)
+    return _readCodeKnowledgeFromFile(legacy, topic, max, active, activeRoot)
       .filter(r => canonProject(r.project) === active);
   }
   return [];
 }
 
-function _readCodeKnowledgeFromFile(file, topic, max, fallbackSlug) {
+function _readCodeKnowledgeFromFile(file, topic, max, fallbackSlug, activeRoot = null) {
   const content = readSafe(file);
   if (!content) return [];
   const out = [];
   for (const line of content.split('\n')) {
     if (!line.trim()) continue;
     let e; try { e = JSON.parse(line); } catch { continue; }
+    // R7 P2 — projectRoot scope filter. Drop entries indexed from a
+    // different cwd that just happened to canonicalize to the same slug.
+    // Entries without projectRoot (legacy / pre-Tier-5) pass through.
+    if (activeRoot && e.projectRoot && e.projectRoot !== activeRoot) continue;
     const haystack = [e.snippet, e.context, e.category, e.why].filter(Boolean).join(' ');
     if (topicMatch(haystack, topic) === 0) continue;
     let project = e.project;
@@ -746,7 +760,7 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = f
     ...readInvariants(topic, cwd),
     ...readDecisions(project, topic),
     ...readGotchas(cwd, topic),
-    ...readCodeKnowledge(topic, project),
+    ...readCodeKnowledge(topic, project, 20, cwd),
     ...readEpisodes(topic),
     ...readMemory(topic),
   ];

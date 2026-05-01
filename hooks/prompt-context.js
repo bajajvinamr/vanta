@@ -53,8 +53,24 @@ function vlog() {
   return _vlog;
 }
 
+// Codex council R7 P2 fix — share slug computation across hooks.
+let _projectsModule = null;
+function projectsModule() {
+  if (_projectsModule !== null) return _projectsModule;
+  for (const p of [
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-projects.js'),
+    path.join(os.homedir(), 'Projects', 'vanta', 'bin', 'vanta-projects.js'),
+  ]) { try { _projectsModule = require(p); break; } catch {} }
+  return _projectsModule;
+}
 function getProjectSlug(cwd) {
-  // Same heuristic council-advisory uses — basename of cwd.
+  const m = projectsModule();
+  if (m && m.slugFromCwd) {
+    const slug = m.slugFromCwd(cwd || process.cwd());
+    if (slug) return slug;
+  }
+  // Fall back to basename only as last resort. May collide across projects
+  // with the same name; resolver project-filter will keep impact bounded.
   return path.basename(String(cwd || process.cwd()));
 }
 

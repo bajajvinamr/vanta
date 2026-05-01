@@ -97,23 +97,51 @@ function detectOutcome(text) {
   return 'in-progress';
 }
 
+// Codex R7 P3 fix — earlier impl cleared the timeout BEFORE reading the
+// transcript, then ran fs.readFileSync + several regex scans on a file
+// that can be MB. On long sessions this could exceed Claude Code's ~10s
+// Stop-hook budget and the hook would be force-killed mid-write,
+// stranding sync-queue/episode entries. Now: keep the deadline alive
+// through the entire hook lifetime AND cap the transcript bytes
+// processed so even a 100MB transcript doesn't push us past budget.
+const TRANSCRIPT_BYTES_CAP = 8 * 1024 * 1024;  // 8MB — typical session is <2MB
 let input = '';
-const timeout = setTimeout(() => process.exit(0), 10000);
+const timeout = setTimeout(() => process.exit(0), 9500);  // 0.5s margin under 10s
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { input += chunk; });
 process.stdin.on('end', () => {
-  clearTimeout(timeout);
+  // Note: timeout still armed; cleared only at process.exit at end.
   try {
     const data = JSON.parse(input);
     const { session_id, transcript_path, cwd } = data;
 
-    if (!transcript_path || !fs.existsSync(transcript_path)) process.exit(0);
+    if (!transcript_path || !fs.existsSync(transcript_path)) {
+      clearTimeout(timeout); process.exit(0);
+    }
 
-    const transcript = fs.readFileSync(transcript_path, 'utf8');
+    // Read up to the cap from the END of the transcript (most recent
+    // content is most relevant for decision-marker + tool-use detection).
+    let transcript;
+    try {
+      const st = fs.statSync(transcript_path);
+      if (st.size > TRANSCRIPT_BYTES_CAP) {
+        const fd = fs.openSync(transcript_path, 'r');
+        const buf = Buffer.alloc(TRANSCRIPT_BYTES_CAP);
+        fs.readSync(fd, buf, 0, TRANSCRIPT_BYTES_CAP, st.size - TRANSCRIPT_BYTES_CAP);
+        fs.closeSync(fd);
+        transcript = buf.toString('utf8');
+      } else {
+        transcript = fs.readFileSync(transcript_path, 'utf8');
+      }
+    } catch {
+      clearTimeout(timeout); process.exit(0);
+    }
     const toolCallCount = (transcript.match(/"type"\s*:\s*"tool_use"/g) || []).length;
     const hasDecisionMarker = DECISION_MARKERS.test(transcript);
 
-    if (toolCallCount <= TOOL_CALL_THRESHOLD && !hasDecisionMarker) process.exit(0);
+    if (toolCallCount <= TOOL_CALL_THRESHOLD && !hasDecisionMarker) {
+      clearTimeout(timeout); process.exit(0);
+    }
 
     fs.mkdirSync(_vantaDir(), { recursive: true });
 
@@ -125,7 +153,24 @@ process.stdin.on('end', () => {
       }).toString().trim();
     } catch (_) {}
 
-    const slug = path.basename(cwd || process.cwd());
+    // R7 P2 fix — robust slug. Use shared resolver from vanta-projects;
+    // basename(cwd) collided across projects with the same directory name.
+    let slug = path.basename(cwd || process.cwd());
+    try {
+      const projects = require(path.join(os.homedir(), '.claude', 'bin', 'vanta-projects.js'));
+      if (projects.slugFromCwd) {
+        const better = projects.slugFromCwd(cwd || process.cwd());
+        if (better) slug = better;
+      }
+    } catch {
+      try {
+        const projects = require(path.join(os.homedir(), 'Projects', 'vanta', 'bin', 'vanta-projects.js'));
+        if (projects.slugFromCwd) {
+          const better = projects.slugFromCwd(cwd || process.cwd());
+          if (better) slug = better;
+        }
+      } catch { /* fall back to basename */ }
+    }
     const ts = new Date().toISOString();
 
     const sid = session_id || 'unknown';

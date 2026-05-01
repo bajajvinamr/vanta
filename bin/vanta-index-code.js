@@ -300,8 +300,38 @@ function shardSlug(inferred) {
 }
 
 // ─── Walkers ────────────────────────────────────────────────────────────────
+//
+// Codex council R7 P3 — symlink handling. `withFileTypes: true` returns
+// Dirent objects whose `isDirectory()` / `isFile()` reflect the link itself,
+// not its target. The previous walkers silently dropped every symlinked
+// directory and file. Common cases that broke: pnpm node_modules layouts,
+// monorepos with symlinked shared dirs, devs who symlink CLAUDE.md across
+// related projects.
+//
+// Fix: when entry is a symlink, statSync to follow it. Use realpath to
+// detect cycles (don't recurse into a dir we already visited) and to scope
+// the resolved target to projectRoot — symlinks pointing outside the tree
+// are skipped (defense against malicious repos symlinking to ~/.ssh etc).
+function _resolveEntry(p, projectRoot, visited) {
+  // Returns { type: 'file' | 'dir' | null, real: <realpath> } or null on skip.
+  let real;
+  try { real = fs.realpathSync(p); } catch { return null; }
+  // Scope check: resolved path must stay inside projectRoot. Reject otherwise.
+  // path.relative returning '..'-prefixed means outside root.
+  const rel = path.relative(projectRoot, real);
+  if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return null;
+  if (visited.has(real)) return null;
+  let st;
+  try { st = fs.statSync(real); } catch { return null; }
+  if (st.isDirectory()) { visited.add(real); return { type: 'dir',  real, st }; }
+  if (st.isFile())      {                    return { type: 'file', real, st }; }
+  return null;
+}
+
 function* walkSource(root) {
-  const stack = [root];
+  const projectRoot = path.resolve(root);
+  const visited = new Set([projectRoot]);
+  const stack = [projectRoot];
   let yielded = 0;
   while (stack.length && yielded < MAX_FILES_PER_RUN) {
     const dir = stack.pop();
@@ -310,10 +340,18 @@ function* walkSource(root) {
     for (const e of entries) {
       if (e.name.startsWith('.')) continue;
       const p = path.join(dir, e.name);
-      if (e.isDirectory()) {
+      let isDir = e.isDirectory();
+      let isFile = e.isFile();
+      if (e.isSymbolicLink()) {
+        const r = _resolveEntry(p, projectRoot, visited);
+        if (!r) continue;
+        isDir  = r.type === 'dir';
+        isFile = r.type === 'file';
+      }
+      if (isDir) {
         if (SKIP_DIRS.has(e.name)) continue;
         stack.push(p);
-      } else if (e.isFile()) {
+      } else if (isFile) {
         const ext = path.extname(e.name);
         if (!SOURCE_EXTS.has(ext)) continue;
         const st = statSafe(p);
@@ -327,7 +365,9 @@ function* walkSource(root) {
 }
 
 function* walkClaudeMd(root) {
-  const stack = [root];
+  const projectRoot = path.resolve(root);
+  const visited = new Set([projectRoot]);
+  const stack = [projectRoot];
   while (stack.length) {
     const dir = stack.pop();
     let entries;
@@ -335,10 +375,18 @@ function* walkClaudeMd(root) {
     for (const e of entries) {
       if (e.name.startsWith('.')) continue;
       const p = path.join(dir, e.name);
-      if (e.isDirectory()) {
+      let isDir = e.isDirectory();
+      let isFile = e.isFile();
+      if (e.isSymbolicLink()) {
+        const r = _resolveEntry(p, projectRoot, visited);
+        if (!r) continue;
+        isDir  = r.type === 'dir';
+        isFile = r.type === 'file';
+      }
+      if (isDir) {
         if (SKIP_DIRS.has(e.name)) continue;
         stack.push(p);
-      } else if (e.isFile() && e.name === 'CLAUDE.md') {
+      } else if (isFile && e.name === 'CLAUDE.md') {
         yield p;
       }
     }
