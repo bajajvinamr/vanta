@@ -2365,3 +2365,302 @@ describe('vanta-sync skill writer uses torn-line guard (R12 P1)', () => {
   });
 });
 
+// ─── v3.6.13 — Day 1 foundation: safety-floor / kill-switch / action-log / trust-metrics ─
+
+describe('vanta-safety-floor — deterministic always-ask layer (v3.6.13)', () => {
+  const floor = require('../bin/vanta-safety-floor');
+  // Force load from repo policy/ so tests are hermetic regardless of $HOME state.
+  delete require.cache[require.resolve('../bin/vanta-safety-floor')];
+  const sf = require('../bin/vanta-safety-floor');
+  sf.reload();
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  sf.reload();
+
+  test('matchCommand: blocks force-push to main', () => {
+    const r = sf.matchCommand('git push --force origin main');
+    assert.ok(r && r.ask, 'force-push to main must match');
+    assert.equal(r.id, 'git-force-push-main');
+  });
+
+  test('matchCommand: blocks prisma migrate deploy', () => {
+    const r = sf.matchCommand('prisma migrate deploy');
+    assert.ok(r && r.ask, 'prisma migrate deploy must match');
+    assert.equal(r.id, 'db-migrate-deploy');
+  });
+
+  test('matchCommand: blocks rm -rf with absolute path', () => {
+    const r = sf.matchCommand('rm -rf /tmp/foo');
+    assert.ok(r && r.ask, 'rm -rf /... must match');
+    assert.equal(r.id, 'rm-rf-absolute');
+  });
+
+  test('matchCommand: strips env-var prefix before matching', () => {
+    const r = sf.matchCommand('FOO=1 BAR=2 git push --force origin main');
+    assert.ok(r && r.ask, 'env-prefixed force-push must still match');
+  });
+
+  test('matchCommand: strips sudo prefix', () => {
+    const r = sf.matchCommand('sudo rm -rf /var/log');
+    assert.ok(r && r.ask, 'sudo rm -rf must still match');
+  });
+
+  test('matchCommand: passes safe commands', () => {
+    assert.equal(sf.matchCommand('ls -la'), null);
+    assert.equal(sf.matchCommand('git status'), null);
+    assert.equal(sf.matchCommand('npm test'), null);
+  });
+
+  test('matchFile: blocks .env writes', () => {
+    const r = sf.matchFile('apps/web/.env.local');
+    assert.ok(r && r.ask, '.env.local must match');
+    assert.equal(r.id, 'env-file-write');
+  });
+
+  test('matchFile: blocks .pem / .key writes', () => {
+    assert.ok(sf.matchFile('keys/server.pem'));
+    assert.ok(sf.matchFile('config/jwt.key'));
+  });
+
+  test('matchFile: passes normal source files', () => {
+    assert.equal(sf.matchFile('src/index.ts'), null);
+    assert.equal(sf.matchFile('README.md'), null);
+  });
+
+  test('matchPrompt: blocks pivot/business-strategy prompts', () => {
+    const r = sf.matchPrompt('should we pivot to a different pricing model?');
+    assert.ok(r && r.ask, 'pivot prompt must match');
+  });
+
+  test('matchPrompt: passes routine engineering prompts', () => {
+    assert.equal(sf.matchPrompt('fix the bug in auth.ts'), null);
+    assert.equal(sf.matchPrompt('write tests for this function'), null);
+  });
+
+  test('matchSymbol: blocks pricing-constant edits', () => {
+    const diff = '+  TIER_PRICE = 1999\n+  MONTHLY_PRICE: 49\n';
+    const r = sf.matchSymbol(diff);
+    assert.ok(r && r.ask, 'pricing constant must match');
+  });
+
+  test('matchSymbol: blocks DROP TABLE in additions', () => {
+    const diff = '+ DROP TABLE users;\n';
+    const r = sf.matchSymbol(diff);
+    assert.ok(r && r.ask);
+  });
+
+  test('listEntries returns all loaded floor entries', () => {
+    const list = sf.listEntries();
+    assert.ok(list.length >= 20, `expected ≥20 floor entries, got ${list.length}`);
+    const ids = new Set(list.map(e => e.id));
+    assert.ok(ids.has('git-force-push-main'));
+    assert.ok(ids.has('env-file-write'));
+    assert.ok(ids.has('pricing-constants'));
+  });
+
+  void floor; // appease unused-import warning if any
+});
+
+describe('vanta-kill-switch — three-scope shutdown (v3.6.13)', () => {
+  const ks = require('../bin/vanta-kill-switch');
+
+  test('check: returns off=false when no scope is active', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-ks-'));
+    try {
+      delete process.env.VANTA_EXECUTOR;
+      const c = ks.check({ sessionId: 'fresh-session', cwd: tmp });
+      assert.equal(c.off, false);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('global scope: VANTA_EXECUTOR=off triggers off=true', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-ks-glob-'));
+    try {
+      process.env.VANTA_EXECUTOR = 'off';
+      const c = ks.check({ sessionId: 's1', cwd: tmp });
+      assert.equal(c.off, true);
+      assert.equal(c.scope, 'global');
+    } finally {
+      delete process.env.VANTA_EXECUTOR;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('repo scope: <repo>/.vanta/paused triggers off=true (overrides global)', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-ks-repo-'));
+    try {
+      // Make tmp look like a git repo.
+      fs.mkdirSync(path.join(tmp, '.git'), { recursive: true });
+      fs.mkdirSync(path.join(tmp, '.vanta'), { recursive: true });
+      fs.writeFileSync(path.join(tmp, '.vanta', 'paused'), 'sandbox repo\n');
+      const c = ks.check({ sessionId: 's1', cwd: tmp });
+      assert.equal(c.off, true);
+      assert.equal(c.scope, 'repo');
+      assert.match(c.reason, /sandbox repo/);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('session scope: highest priority — beats repo and global', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-ks-sess-'));
+    try {
+      fs.mkdirSync(path.join(tmp, '.git'), { recursive: true });
+      fs.mkdirSync(path.join(tmp, '.vanta'), { recursive: true });
+      fs.writeFileSync(path.join(tmp, '.vanta', 'paused'), 'repo paused\n');
+      process.env.VANTA_EXECUTOR = 'off';
+      // Now also pause the session.
+      const runtimeDir = path.join(tmp, 'vanta-home', '.vanta', 'runtime');
+      process.env.VANTA_DIR_OVERRIDE = path.join(tmp, 'vanta-home', '.vanta');
+      ks.pauseSession('test-sid', 'session beats all');
+      const c = ks.check({ sessionId: 'test-sid', cwd: tmp });
+      assert.equal(c.off, true);
+      assert.equal(c.scope, 'session');
+      // Cleanup.
+      ks.resumeSession('test-sid');
+      delete process.env.VANTA_DIR_OVERRIDE;
+      delete process.env.VANTA_EXECUTOR;
+      void runtimeDir;
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('pauseRepo / resumeRepo round-trip', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-ks-rt-'));
+    try {
+      fs.mkdirSync(path.join(tmp, '.git'), { recursive: true });
+      ks.pauseRepo(tmp, 'cli pause');
+      assert.equal(fs.existsSync(path.join(tmp, '.vanta', 'paused')), true);
+      const c1 = ks.check({ cwd: tmp });
+      assert.equal(c1.off, true);
+      ks.resumeRepo(tmp);
+      assert.equal(fs.existsSync(path.join(tmp, '.vanta', 'paused')), false);
+      const c2 = ks.check({ cwd: tmp });
+      assert.equal(c2.off, false);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+});
+
+describe('vanta-action-log — append-only ledger (v3.6.13)', () => {
+  const al = require('../bin/vanta-action-log');
+
+  test('record + read round-trip with VANTA_DIR_OVERRIDE', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-al-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      al.record({ session_id: 's1', project: 'pi', action: 'auto-edit',
+        why: 'matched safe pattern', subject: 'foo.ts', tier: 'T1' });
+      al.record({ session_id: 's1', project: 'pi', action: 'undo',
+        why: 'user said stop', subject: 'foo.ts' });
+      const entries = al.read({ session_id: 's1' });
+      assert.equal(entries.length, 2);
+      assert.equal(entries[0].action, 'auto-edit');
+      assert.equal(entries[1].action, 'undo');
+      assert.ok(entries[0].ts && entries[0].ts.length > 10);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('read filters by project and action', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-al-filter-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      al.record({ project: 'pi',  action: 'auto-edit', why: 'a' });
+      al.record({ project: 'pi',  action: 'council-fire', why: 'b' });
+      al.record({ project: 'foo', action: 'auto-edit', why: 'c' });
+      assert.equal(al.read({ project: 'pi' }).length, 2);
+      assert.equal(al.read({ action: 'auto-edit' }).length, 2);
+      assert.equal(al.read({ project: 'pi', action: 'council-fire' }).length, 1);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('rollup aggregates by action type', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-al-rollup-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      al.record({ action: 'auto-edit', why: '', tier: 'T1', decision: 'auto' });
+      al.record({ action: 'auto-edit', why: '', tier: 'T1', decision: 'auto' });
+      al.record({ action: 'auto-edit', why: '', tier: 'T2', decision: 'ask' });
+      const r = al.rollup({});
+      assert.equal(r.total, 3);
+      assert.equal(r.actions['auto-edit'], 3);
+      assert.equal(r.tiers.T1, 2);
+      assert.equal(r.decisions.auto, 2);
+      assert.equal(r.decisions.ask, 1);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('findLast returns most recent matching entry', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-al-last-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      al.record({ action: 'auto-edit', why: 'first', subject: 'a.ts' });
+      al.record({ action: 'auto-edit', why: 'second', subject: 'b.ts' });
+      al.record({ action: 'council-fire', why: 'third' });
+      const last = al.findLast(e => e.action === 'auto-edit');
+      assert.equal(last.subject, 'b.ts');
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('vanta-trust-metrics — composite trust signal (v3.6.13)', () => {
+  const al = require('../bin/vanta-action-log');
+  const tm = require('../bin/vanta-trust-metrics');
+
+  test('compute returns zeroed metrics on empty ledger', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-tm-empty-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      const m = tm.compute({});
+      assert.equal(m.actions.total, 0);
+      assert.equal(m.undo_within_2m.rate, 0);
+      assert.equal(m.ready_for_inline, false);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('undo_within_2m: detects regretted auto-action', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-tm-undo-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      al.record({ session_id: 's1', action: 'auto-edit', subject: 'foo.ts',
+        decision: 'auto', why: 'safe' });
+      // Undo 30s later (within 2 min window).
+      al.record({ session_id: 's1', action: 'undo', subject: 'foo.ts',
+        decision: 'auto', why: 'reverted by user' });
+      const m = tm.compute({});
+      assert.equal(m.undo_within_2m.regretted, 1);
+      assert.equal(m.undo_within_2m.n, 1);
+      assert.equal(m.undo_within_2m.rate, 1.0);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('ready_for_inline requires composite thresholds met', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-tm-ready-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      // Single auto-action with no undo, no interrupt → metrics look great
+      // but spanDays=0 so still not ready.
+      al.record({ session_id: 's1', action: 'auto-edit', subject: 'foo.ts', decision: 'auto', why: '' });
+      const m = tm.compute({});
+      assert.equal(m.ready_for_inline, false,
+        'spanDays<14 must veto ready_for_inline even with perfect metrics');
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
