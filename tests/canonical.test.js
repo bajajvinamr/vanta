@@ -3292,3 +3292,157 @@ describe('vanta-autonomy — project-context detection (v3.6.17)', () => {
   });
 });
 
+// ─── v3.6.18 — Day 12: memory promotion + confidence decay ───────────────────
+
+describe('vanta-confidence-decay — age-based score decay (v3.6.18)', () => {
+  const decay = require('../bin/vanta-confidence-decay');
+
+  test('multiplier=1 for fresh entries', () => {
+    const ts = new Date(Date.now() - 60_000).toISOString();
+    assert.ok(decay.decayMultiplier({ source: 'invariant', ts }) > 0.99);
+  });
+
+  test('decisions decay faster than invariants (90d vs 365d half-life)', () => {
+    const ageDays = 90;
+    const ts = new Date(Date.now() - ageDays * 86_400_000).toISOString();
+    const decision = decay.decayMultiplier({ source: 'decision', ts });
+    const invariant = decay.decayMultiplier({ source: 'invariant', ts });
+    assert.ok(invariant > decision, `invariant (${invariant}) must decay slower than decision (${decision})`);
+    assert.ok(Math.abs(decision - 0.5) < 0.05, `decision at half-life should be ~0.5, got ${decision}`);
+  });
+
+  test('code source has no decay', () => {
+    const ts = new Date(Date.now() - 365 * 86_400_000).toISOString();
+    assert.equal(decay.decayMultiplier({ source: 'code', ts }), 1);
+  });
+
+  test('decay floors at 0.05 (very old entries still surface)', () => {
+    const ts = new Date('2020-01-01').toISOString();
+    const m = decay.decayMultiplier({ source: 'decision', ts });
+    assert.ok(m >= 0.05, `floor 0.05, got ${m}`);
+  });
+
+  test('applyDecay mutates score and adds decay_multiplier field', () => {
+    const ts = new Date(Date.now() - 90 * 86_400_000).toISOString();
+    const r = { source: 'decision', date: ts, score: 1.0 };
+    decay.applyDecay(r);
+    assert.ok(r.score < 1.0);
+    assert.ok(r.decay_multiplier > 0 && r.decay_multiplier < 1);
+  });
+
+  test('violatesVersionBound: prisma@4 mismatches active prisma=5', () => {
+    assert.equal(decay.violatesVersionBound({ version_bound: 'prisma@4' }, { prisma: '5' }), true);
+    assert.equal(decay.violatesVersionBound({ version_bound: 'prisma@4' }, { prisma: '4' }), false);
+  });
+
+  test('violatesVersionBound: missing active version → no violation', () => {
+    assert.equal(decay.violatesVersionBound({ version_bound: 'prisma@4' }, {}), false);
+  });
+});
+
+describe('vanta-memory-promote — staged invariant surfacing (v3.6.18)', () => {
+  const memProm = require('../bin/vanta-memory-promote');
+
+  // Each test uses fresh staging file pointed at tmpdir.
+  function setupStaging(content) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-mp-'));
+    const stagingFile = path.join(tmp, 'staging.md');
+    const globalFile = path.join(tmp, 'global.md');
+    fs.writeFileSync(stagingFile, content);
+    fs.writeFileSync(globalFile, '');
+    process.env.VANTA_STAGING_FILE = stagingFile;
+    process.env.VANTA_INVARIANTS_FILE = globalFile;
+    process.env.VANTA_DIR_OVERRIDE = tmp;
+    return { tmp, stagingFile, globalFile };
+  }
+  function cleanup(tmp) {
+    delete process.env.VANTA_STAGING_FILE;
+    delete process.env.VANTA_INVARIANTS_FILE;
+    delete process.env.VANTA_DIR_OVERRIDE;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  test('parses staged candidates with section, text, conf', () => {
+    const { tmp } = setupStaging(
+      '## Prisma\n\n' +
+      '- migrate deploy not migrate dev for prod  <!-- conf=0.92 ts=2026-04-30T00:00:00Z -->\n' +
+      '- generate must run in correct package  <!-- conf=0.65 ts=2026-04-30T00:00:00Z -->\n'
+    );
+    try {
+      const all = memProm.loadStaged();
+      assert.equal(all.length, 2);
+      assert.equal(all[0].section, 'Prisma');
+      assert.equal(all[0].confidence, 0.92);
+      assert.match(all[0].text, /migrate deploy/);
+    } finally { cleanup(tmp); }
+  });
+
+  test('nextCandidate returns highest-confidence above threshold', () => {
+    const { tmp } = setupStaging(
+      '## Foo\n\n' +
+      '- low conf  <!-- conf=0.50 -->\n' +
+      '- high conf  <!-- conf=0.92 -->\n' +
+      '- medium  <!-- conf=0.70 -->\n'
+    );
+    try {
+      const c = memProm.nextCandidate({ minConfidence: 0.85 });
+      assert.ok(c, 'must return a candidate');
+      assert.equal(c.confidence, 0.92);
+      assert.match(c.text, /high conf/);
+    } finally { cleanup(tmp); }
+  });
+
+  test('nextCandidate returns null when nothing meets threshold', () => {
+    const { tmp } = setupStaging('## Foo\n\n- meh  <!-- conf=0.50 -->\n');
+    try {
+      assert.equal(memProm.nextCandidate({ minConfidence: 0.85 }), null);
+    } finally { cleanup(tmp); }
+  });
+
+  test('accept moves bullet to global file and removes from staging', () => {
+    const { tmp, stagingFile, globalFile } = setupStaging(
+      '## Prisma\n\n- migrate deploy for prod  <!-- conf=0.92 -->\n'
+    );
+    try {
+      const c = memProm.nextCandidate({ minConfidence: 0.85 });
+      const r = memProm.accept(c.id);
+      assert.equal(r.ok, true);
+      // Global file has the entry under its section.
+      const global = fs.readFileSync(globalFile, 'utf8');
+      assert.match(global, /## Prisma/);
+      assert.match(global, /migrate deploy for prod/);
+      // Staging file no longer has the bullet.
+      const staging = fs.readFileSync(stagingFile, 'utf8');
+      assert.equal(/migrate deploy for prod/.test(staging), false);
+    } finally { cleanup(tmp); }
+  });
+
+  test('reject removes from staging + records to rejects log', () => {
+    const { tmp, stagingFile } = setupStaging(
+      '## Foo\n\n- bogus thing  <!-- conf=0.92 -->\n'
+    );
+    try {
+      const c = memProm.nextCandidate({ minConfidence: 0.85 });
+      const r = memProm.reject(c.id);
+      assert.equal(r.ok, true);
+      // Staging cleared.
+      assert.equal(/bogus thing/.test(fs.readFileSync(stagingFile, 'utf8')), false);
+      // Rejects log captures the id.
+      const rejects = memProm.loadRejects();
+      assert.ok(rejects.has(c.id));
+    } finally { cleanup(tmp); }
+  });
+
+  test('rejected candidates are excluded from nextCandidate', () => {
+    const { tmp } = setupStaging(
+      '## Foo\n\n- entry one  <!-- conf=0.92 -->\n- entry two  <!-- conf=0.91 -->\n'
+    );
+    try {
+      const first = memProm.nextCandidate({ minConfidence: 0.85 });
+      memProm.reject(first.id);
+      const second = memProm.nextCandidate({ minConfidence: 0.85 });
+      assert.notEqual(second.id, first.id, 'next candidate must skip rejected');
+    } finally { cleanup(tmp); }
+  });
+});
+
