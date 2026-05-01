@@ -1932,14 +1932,17 @@ describe('vanta-status — surfaces R7-R10 sentinels (R11 P1)', () => {
   });
 });
 
-describe('session-start — routes brief stderr to hook.log (R11 P1)', () => {
+describe('session-start — routes brief stderr to hook.log (R11 P1 / R12 P2)', () => {
   test('does not swallow vanta-brief.js stderr to /dev/null', () => {
     const src = fs.readFileSync(
       path.join(__dirname, '..', 'hooks', 'session-start'), 'utf8');
-    // The brief invocation line must NOT use `2>/dev/null`. It must
-    // append stderr to $HOOK_LOG so failures surface via vanta-status.
-    assert.match(src, /node\s+"\$BRIEF_BIN".*2>>"\$HOOK_LOG"/,
-      'brief invocation must append stderr to $HOOK_LOG');
+    // R12 P2 — stderr now wrapped through python to emit the structured
+    // `ISO | ERROR | session-start.brief | <msg>` shape vanta-status reads.
+    // Test for HOOK_LOG presence + structured prefix, not the raw redirect.
+    assert.match(src, /HOOK_LOG/,
+      'brief invocation must reference $HOOK_LOG');
+    assert.match(src, /session-start\.brief/,
+      'stderr wrapper must tag entries with the structured source name');
     // Old shape must NOT be present.
     assert.equal(/node\s+"\$BRIEF_BIN".*2>\/dev\/null/.test(src), false,
       '2>/dev/null swallow was replaced (R11 P1) — silent brief crashes');
@@ -1963,6 +1966,74 @@ describe('vanta-resolve — query-log analyze across .bak.<ts> (R11 P1)', () => 
     // _logQuery must use timestamped suffix.
     assert.match(src, /\$\{file\}\.bak\.\$\{ts\}/,
       'query-log rotation must use timestamped .bak.<ts>');
+  });
+});
+
+// ─── R12 lockdown — bak retention + composition (R12 P1/P2) ──────────────────
+
+describe('vanta-runtime-state — reapStaleBaks retention (R12 P1)', () => {
+  const rs = require('../bin/vanta-runtime-state');
+
+  test('reapStaleBaks keeps the K most recent bak siblings', () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r12-bak-'));
+    try {
+      // Create 15 fake bak files for two journals.
+      for (let i = 1; i <= 15; i++) {
+        fs.writeFileSync(path.join(tmpdir, `sync-queue.jsonl.bak.${100 + i}`), `e${i}\n`);
+        fs.writeFileSync(path.join(tmpdir, `episodes.jsonl.bak.${200 + i}`),  `e${i}\n`);
+      }
+      const removed = rs.reapStaleBaks([tmpdir], ['sync-queue.jsonl', 'episodes.jsonl'], 10);
+      assert.equal(removed, 10, 'must remove 5 oldest from each of 2 journals');
+      // Check that the OLDEST baks are gone and NEWEST 10 remain per journal.
+      const remaining = fs.readdirSync(tmpdir);
+      const sqLeft = remaining.filter(n => n.startsWith('sync-queue.jsonl.bak.')).sort();
+      const epLeft = remaining.filter(n => n.startsWith('episodes.jsonl.bak.')).sort();
+      assert.equal(sqLeft.length, 10);
+      assert.equal(epLeft.length, 10);
+      // Oldest remaining must be index 6 (1-5 deleted, 6-15 kept).
+      assert.match(sqLeft[0], /\.bak\.106$/, 'oldest 5 sync-queue baks should have been removed');
+      assert.match(epLeft[0], /\.bak\.206$/, 'oldest 5 episodes baks should have been removed');
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  test('reapStaleBaks no-op when bak count <= keep', () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-r12-bak-noop-'));
+    try {
+      for (let i = 1; i <= 5; i++) {
+        fs.writeFileSync(path.join(tmpdir, `sync-queue.jsonl.bak.${i}`), '');
+      }
+      const removed = rs.reapStaleBaks([tmpdir], ['sync-queue.jsonl'], 10);
+      assert.equal(removed, 0, 'no removal when count under keep');
+      assert.equal(fs.readdirSync(tmpdir).length, 5);
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('vanta-status renders disk footprint with bak count (R12 P2)', () => {
+  test('renderText size string includes "+<n> bak" suffix when baks exist', () => {
+    // Static-source: render block must format bytesTotal + bakCount when
+    // bakCount > 0. Verify the conditional + format string are wired.
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'bin', 'vanta-status.js'), 'utf8');
+    assert.match(src, /q\.bakCount\s*>\s*0/,
+      'render must branch on bakCount > 0');
+    assert.match(src, /bak \(\$\{bytesHuman\(q\.bytesTotal\)\}\)/,
+      'render must format the bak summary suffix');
+  });
+});
+
+describe('vanta-sync skill writer uses torn-line guard (R12 P1)', () => {
+  test('synced-marker append uses leading-newline guard', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'skills', 'vanta-sync', 'SKILL.md'), 'utf8');
+    // Must use the leading-newline pattern in the synced marker write.
+    assert.match(src,
+      /fs\.appendFileSync\(queue,\s*'\\n'\s*\+\s*JSON\.stringify\(/,
+      'synced marker write must prefix \\n (R12 P1 torn-line guard)');
   });
 });
 

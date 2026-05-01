@@ -337,6 +337,40 @@ function reapStaleTmp(dirs, ageHours = 1) {
   return removed;
 }
 
+// R12 P1 — Gemini council finding. R8 P1 made rotation rename-only,
+// producing `.bak.<ts>` siblings across sync-queue/episodes/interactions/
+// query-log/runtime journals. Nothing ever deleted them. Across a year of
+// daily use, every 5MB rotation leaves a permanent 5MB bak file → unbounded
+// disk growth.
+//
+// Retention policy: per (dir, base), keep the K most recent baks. Older
+// ones are unlinked. K=10 by default = 50MB cap per journal type at 5MB
+// rotation, which gives users ~weeks of history (typical session loads
+// ~10KB into sync-queue/episodes per day, so 50MB ≈ 5000 days; the cap
+// is for runaway pathological cases, not normal use).
+//
+// Called by the Stop hook's once-a-day reap pass alongside reapStale.
+function reapStaleBaks(dirs, baseNames, keep = 10) {
+  let removed = 0;
+  for (const dir of dirs) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      const all = fs.readdirSync(dir);
+      for (const base of baseNames) {
+        const prefix = base + '.bak.';
+        const baks = all.filter(n => n.startsWith(prefix)).sort();
+        // Drop oldest excess — sort is ASCII order which is age order for
+        // `Date.now()`.`process.pid` suffixes.
+        if (baks.length <= keep) continue;
+        for (let i = 0; i < baks.length - keep; i++) {
+          try { fs.unlinkSync(path.join(dir, baks[i])); removed++; } catch {}
+        }
+      }
+    } catch {}
+  }
+  return removed;
+}
+
 // ─── CLI ───────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
@@ -370,7 +404,8 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
-  getState, shouldInject, markInjected, bump, setPhase, resetSession, reapStale, reapStaleTmp,
+  getState, shouldInject, markInjected, bump, setPhase, resetSession,
+  reapStale, reapStaleTmp, reapStaleBaks,
   COOLDOWNS,
   // Internal — exported for tests:
   _foldJournal, _compact, _fileFor, _clearFoldCache,

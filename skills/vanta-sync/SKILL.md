@@ -165,7 +165,10 @@ const ts=new Date().toISOString();
 let marked=0;
 for(const [sid,e] of latest){
   if(e.synced===false && e.cwd===targetCwd){
-    fs.appendFileSync(queue, JSON.stringify({...e,synced:true,marked_synced_at:ts})+'\n');
+    // R12 P1 — torn-line guard. Aligns with R9 P1 across all JSONL writers.
+    // If auto-sync's previous append was truncated mid-write, this marker
+    // would fuse to the torn line and corrupt both records on read.
+    fs.appendFileSync(queue, '\n' + JSON.stringify({...e,synced:true,marked_synced_at:ts}) + '\n');
     marked++;
   }
 }

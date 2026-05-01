@@ -302,10 +302,40 @@ process.stdin.on('end', () => {
             path.join(os.homedir(), '.vanta', 'knowledge'),
           ]);
         }
+        // R12 P1 — Gemini council finding. R8 P1 rotation produced
+        // unbounded `.bak.<ts>` siblings; nothing ever deleted them.
+        // Keep the 10 most recent per journal; drop older ones.
+        if (rs.reapStaleBaks) {
+          rs.reapStaleBaks([_vantaDir()], [
+            'sync-queue.jsonl',
+            'episodes.jsonl',
+            'interactions.jsonl',
+            'query-log.jsonl',
+          ], 10);
+        }
         try { fs.writeFileSync(reapMarker, ''); } catch {}
       }
     } catch (e) {
+      // R12 P2 — Gemini council finding. If require()'ing vanta-runtime-state
+      // fails (bin not deployed), this catch swallows the error and the
+      // R11 .bin-missing sentinel never gets touched from the Stop side —
+      // breaking composition with prompt-context's R8 P2 sentinel logic.
+      // Now: also touch the sentinel when the require fails, so vanta-status
+      // surfaces "always-on layer disabled" regardless of which hook
+      // discovered it first.
       vlog().error('auto-sync.reap', e.message || String(e));
+      try {
+        const sentinel = path.join(_vantaDir(), '.bin-missing');
+        let shouldTouch = true;
+        try {
+          const st = fs.statSync(sentinel);
+          if (Date.now() - st.mtimeMs < 60 * 60_000) shouldTouch = false;
+        } catch {}
+        if (shouldTouch) {
+          fs.writeFileSync(sentinel,
+            `${new Date().toISOString()} auto-sync: bins missing (${e.message || String(e)})\n`);
+        }
+      } catch {}
     }
   } catch (err) {
     // Never block a session from ending — but log so silent breakage is visible.

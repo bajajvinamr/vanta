@@ -63,17 +63,27 @@ fi
 # Run brief with implicit Node timeout (the script is fast — no stale data
 # blocks session start). On any error, emit empty additionalContext.
 #
-# Gemini council R11 P1 — earlier impl swallowed stderr via `2>/dev/null`,
-# so a crashing vanta-brief.js (malformed jsonl, broken JSON parsing,
-# any runtime error) silently produced empty briefs forever. The user
-# would just stop seeing briefs and have no diagnostic trail. Now: route
-# stderr to hook.log so failures become visible to vanta-status. The
-# fallback `|| true` still preserves the never-block-session-start guarantee.
+# R11 P1 / R12 P2 — Codex council finding (R12). The R11 fix piped raw
+# Node stderr to hook.log, but vanta-status only parses structured
+# `ISO | LEVEL | source | message` lines. Raw stderr stayed invisible
+# in the status surface. Now: pipe stderr through a wrapper that emits
+# the structured format so brief failures are first-class signals
+# vanta-status can count and surface.
 HOOK_LOG="$HOME/.vanta/hook.log"
 mkdir -p "$(dirname "$HOOK_LOG")" 2>/dev/null || true
 brief_lines=""
 if [ -d "$cwd" ]; then
-  brief_lines=$(node "$BRIEF_BIN" --cwd "$cwd" 2>>"$HOOK_LOG" || true)
+  # Wrap each stderr line in the structured `ISO | ERROR | source | msg`
+  # shape vanta-status's hook-log reader expects. Python is portable
+  # across Linux + stock macOS (gawk's strftime is not).
+  brief_lines=$(node "$BRIEF_BIN" --cwd "$cwd" 2> >(python3 -u -c '
+import sys, datetime
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line: continue
+    ts = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    print(f"{ts} | ERROR | session-start.brief | {line}", flush=True)
+' >>"$HOOK_LOG") || true)
 fi
 
 if [ -z "$brief_lines" ]; then
