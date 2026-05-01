@@ -2664,3 +2664,219 @@ describe('vanta-trust-metrics — composite trust signal (v3.6.13)', () => {
   });
 });
 
+// ─── v3.6.14 — Days 2-3: prompt rewriter shadow mode ─────────────────────────
+
+describe('vanta-rewriter — pass-through gate (v3.6.14)', () => {
+  // Force fresh module load — kill-switch / safety-floor caches matter.
+  delete require.cache[require.resolve('../bin/vanta-rewriter')];
+  delete require.cache[require.resolve('../bin/vanta-safety-floor')];
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  delete process.env.VANTA_EXECUTOR;
+  const rw = require('../bin/vanta-rewriter');
+
+  test('passes through lookup prompts unchanged', () => {
+    const r = rw.rewrite('what is in this file?');
+    assert.equal(r.mode, 'passthrough');
+    assert.equal(r.intent, 'lookup');
+  });
+
+  test('passes through show/list prompts', () => {
+    assert.equal(rw.rewrite('show me the last commit').mode, 'passthrough');
+    assert.equal(rw.rewrite('list the open PRs').mode, 'passthrough');
+    assert.equal(rw.rewrite('explain how this works').mode, 'passthrough');
+  });
+
+  test('passes through confirmations', () => {
+    for (const p of ['yes', 'no', 'y', 'okay', 'sure', 'skip']) {
+      assert.equal(rw.rewrite(p).mode, 'passthrough', `"${p}" must passthrough`);
+    }
+  });
+
+  test('passes through slash commands', () => {
+    assert.equal(rw.rewrite('/ship').mode, 'passthrough');
+    assert.equal(rw.rewrite('/review the diff').mode, 'passthrough');
+  });
+
+  test('passes through already-structured numbered prompts', () => {
+    const r = rw.rewrite('1. read the file\n2. summarize it');
+    assert.equal(r.mode, 'passthrough');
+    assert.equal(r.intent, 'already-structured');
+  });
+
+  test('passes through short non-action prompts', () => {
+    assert.equal(rw.rewrite('huh').mode, 'passthrough');
+    assert.equal(rw.rewrite('cool').mode, 'passthrough');
+  });
+});
+
+describe('vanta-rewriter — rule-based intent matching (v3.6.14)', () => {
+  delete require.cache[require.resolve('../bin/vanta-rewriter')];
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  delete process.env.VANTA_EXECUTOR;
+  const rw = require('../bin/vanta-rewriter');
+
+  test('"fix the bug" routes to fix-bug rule with engineer chain', () => {
+    const r = rw.rewrite('fix the bug in auth.ts');
+    assert.equal(r.mode, 'rule');
+    assert.equal(r.intent, 'fix-bug');
+    assert.equal(r.rule_id, 'fix-broken');
+    assert.match(r.rewritten, /Suggested chain:/);
+    assert.match(r.rewritten, /failing test/i);
+    assert.match(r.rewritten, /git log/i);
+  });
+
+  test('"it didn\'t work" routes to diagnose-recent rule', () => {
+    const r = rw.rewrite("it didn't work");
+    assert.equal(r.mode, 'rule');
+    assert.equal(r.intent, 'diagnose-recent');
+    assert.match(r.rewritten, /hypotheses/i);
+  });
+
+  test('"ship this" routes to ship rule with safety guardrails', () => {
+    const r = rw.rewrite('ship this');
+    assert.equal(r.mode, 'rule');
+    assert.equal(r.intent, 'ship');
+    assert.match(r.rewritten, /test suite/i);
+    assert.match(r.rewritten, /typecheck/i);
+    assert.match(r.rewritten, /Do NOT push to main/i);
+  });
+
+  test('"review the diff" routes to review rule', () => {
+    const r = rw.rewrite('review the diff');
+    assert.equal(r.mode, 'rule');
+    assert.equal(r.intent, 'review');
+    assert.match(r.rewritten, /git diff/);
+  });
+
+  test('"write tests for this" routes to tdd rule', () => {
+    const r = rw.rewrite('write tests for this function');
+    assert.equal(r.mode, 'rule');
+    assert.equal(r.intent, 'tdd');
+    assert.match(r.rewritten, /failing tests for each case \(red\)/i);
+  });
+
+  test('"make it faster" routes to optimize rule with measure-first', () => {
+    const r = rw.rewrite('make it faster');
+    assert.equal(r.mode, 'rule');
+    assert.equal(r.intent, 'optimize');
+    assert.match(r.rewritten, /Measure first/i);
+  });
+
+  test('"refactor this" routes to refactor rule', () => {
+    const r = rw.rewrite('refactor this module');
+    assert.equal(r.mode, 'rule');
+    assert.equal(r.intent, 'refactor');
+    assert.match(r.rewritten, /Confirm tests cover/i);
+  });
+
+  test('"add a feature" routes to feature rule', () => {
+    const r = rw.rewrite('add a new endpoint for billing');
+    assert.equal(r.mode, 'rule');
+    assert.equal(r.intent, 'feature');
+  });
+
+  test('unmatched multi-word non-action prompt passes through', () => {
+    const r = rw.rewrite('hmm interesting question about the data');
+    assert.equal(r.mode, 'passthrough');
+  });
+});
+
+describe('vanta-rewriter — safety integrations (v3.6.14)', () => {
+  delete require.cache[require.resolve('../bin/vanta-rewriter')];
+  delete require.cache[require.resolve('../bin/vanta-safety-floor')];
+  process.env.VANTA_SAFETY_FLOOR = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
+  delete process.env.VANTA_EXECUTOR;
+  const rw = require('../bin/vanta-rewriter');
+
+  test('floor-matched prompts pass through unrewritten with floor reason', () => {
+    // "should we pivot pricing model?" matches prompt-pivot-decision floor entry.
+    const r = rw.rewrite('should we pivot the pricing model?');
+    assert.equal(r.mode, 'passthrough');
+    assert.match(r.why, /safety-floor:prompt-pivot-decision/);
+    assert.ok(r.floor_match);
+  });
+
+  test('kill-switch global=off forces passthrough on action verbs', () => {
+    process.env.VANTA_EXECUTOR = 'off';
+    delete require.cache[require.resolve('../bin/vanta-kill-switch')];
+    delete require.cache[require.resolve('../bin/vanta-rewriter')];
+    const rw2 = require('../bin/vanta-rewriter');
+    try {
+      const r = rw2.rewrite('fix the bug in auth.ts');
+      assert.equal(r.mode, 'passthrough');
+      assert.match(r.why, /kill-switch:global/);
+    } finally {
+      delete process.env.VANTA_EXECUTOR;
+      delete require.cache[require.resolve('../bin/vanta-kill-switch')];
+      delete require.cache[require.resolve('../bin/vanta-rewriter')];
+    }
+  });
+});
+
+describe('hooks/prompt-rewriter.js — UserPromptSubmit injection (v3.6.14)', () => {
+  const { execFileSync } = require('node:child_process');
+  const HOOK = path.join(__dirname, '..', 'hooks', 'prompt-rewriter.js');
+
+  function spawnHook({ prompt, vantaDir }) {
+    return execFileSync(process.execPath, [HOOK], {
+      input: JSON.stringify({
+        prompt,
+        session_id: 'rw-test-1',
+        cwd: vantaDir,
+        hook_event_name: 'UserPromptSubmit',
+      }),
+      env: {
+        ...process.env,
+        VANTA_DIR_OVERRIDE: vantaDir,
+        HOME: path.join(vantaDir, 'home'),
+        VANTA_SAFETY_FLOOR: path.join(__dirname, '..', 'policy', 'safety-floor.yaml'),
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 5000,
+    }).toString();
+  }
+
+  test('injects shadow context for action verbs and logs rewrite action', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rw-hook-'));
+    try {
+      const out = spawnHook({ prompt: 'fix the bug in auth.ts', vantaDir: tmp });
+      const parsed = JSON.parse(out);
+      assert.equal(parsed.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
+      assert.match(parsed.hookSpecificOutput.additionalContext,
+        /Vanta rewriter \(shadow mode\)/);
+      assert.match(parsed.hookSpecificOutput.additionalContext,
+        /Suggested chain:/);
+      // Hook ran with VANTA_DIR_OVERRIDE=tmp so action-log lives in tmp.
+      // Read it directly from disk (the in-process module instance is
+      // pointed at HOME=...).
+      const actionsFile = path.join(tmp, 'actions.jsonl');
+      assert.ok(fs.existsSync(actionsFile), 'action-log file must be created in tmp');
+      const lines = fs.readFileSync(actionsFile, 'utf8').split('\n').filter(Boolean);
+      const entries = lines.map(l => JSON.parse(l));
+      const r = entries.find(e => e.action === 'rewrite');
+      assert.ok(r, 'rewrite action must be logged');
+      assert.equal(r.tier, 'T0');
+      assert.equal(r.session_id, 'rw-test-1');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('injects empty additionalContext for passthrough prompts', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rw-pt-'));
+    try {
+      const out = spawnHook({ prompt: 'what is in this file?', vantaDir: tmp });
+      const parsed = JSON.parse(out);
+      assert.equal(parsed.hookSpecificOutput.additionalContext, '',
+        'passthrough must inject nothing');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('empty prompt does not crash + injects nothing', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rw-empty-'));
+    try {
+      const out = spawnHook({ prompt: '', vantaDir: tmp });
+      const parsed = JSON.parse(out);
+      assert.equal(parsed.hookSpecificOutput.additionalContext, '');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+});
+

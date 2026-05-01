@@ -43,7 +43,7 @@ echo ""
 echo "Installing hooks..."
 mkdir -p "$HOOKS_DIR"
 
-for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js code-index-watch.js git-guardrails.js prompt-context.js tool-observer.js session-start; do
+for hook in council-advisory.js test-failure-advisor.js stack-file-nudge.js auto-sync.js plan-watcher.js code-index-watch.js git-guardrails.js prompt-context.js prompt-rewriter.js tool-observer.js session-start; do
   src="$REPO_DIR/hooks/$hook"
   if [ -f "$src" ]; then
     cp "$src" "$HOOKS_DIR/$hook"
@@ -69,7 +69,7 @@ echo ""
 # ── Bin (knowledge resolver and other shared scripts) ───────────────────────
 echo "Installing shared bins..."
 mkdir -p "$BIN_DIR"
-for binfile in vanta-projects.js vanta-log.js vanta-resolve.js vanta-brief.js vanta-index-code.js vanta-status.js vanta-prune.js vanta-council-health.js vanta-council-feedback.js vanta-extract-score.js vanta-council-run.js vanta-runtime-state.js vanta-prompt-brief.js vanta-interaction-log.js vanta-jsonl.js vanta-safety-floor.js vanta-kill-switch.js vanta-action-log.js vanta-trust-metrics.js; do
+for binfile in vanta-projects.js vanta-log.js vanta-resolve.js vanta-brief.js vanta-index-code.js vanta-status.js vanta-prune.js vanta-council-health.js vanta-council-feedback.js vanta-extract-score.js vanta-council-run.js vanta-runtime-state.js vanta-prompt-brief.js vanta-interaction-log.js vanta-jsonl.js vanta-safety-floor.js vanta-kill-switch.js vanta-action-log.js vanta-trust-metrics.js vanta-rewriter.js; do
   src="$REPO_DIR/bin/$binfile"
   if [ -f "$src" ]; then
     cp "$src" "$BIN_DIR/$binfile"
