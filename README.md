@@ -361,8 +361,14 @@ If you need cross-machine state, snapshot to S3/Dropbox nightly. Don't share the
 | v3.5 | 9.97/10 | Tier 6: `vanta-council-health` pre-flight + cascading fallback, `vanta-council-feedback` per-model accuracy, cross-source contradiction detector, `vanta-extract-score` 3-stage gating, `git-guardrails.js` two-tier policy, 52+ tests |
 | v3.6 | 9.98/10 | Always-on observability (`tool-observer.js`, `prompt-context.js`), 3-axis risk classifier, safety-floor + kill-switch, action-log JSONL ledger with stable ids and `.bak.<ts>` rotation, trust-metrics composite |
 | v3.7.1 | 9.99/10 | **Prompt loop hard gate.** 12 rewriter rules with `skill_route`, terse 4-line shadow injection, 15-prompt smoke gate at 15/15, taxonomy-rename → `/council` ASK, safety-floor product-decision → `/council` surface |
+| v3.7.2 | — | **Central executor.** `bin/vanta-executor.js` — single `decide()` authority composing kill-switch + safety-floor + rewriter + risk-classifier into a canonical Decision shape. Hooks now call `executor.decide()` instead of helpers directly. NEW `prompt-bulk-delete` floor entry catches "delete all users" before the heuristic. |
+| v3.7.3 | — | **Critical safety fixes.** Undo state-check refuses dirty undo (current SHA must match recorded `after_sha`); matchSymbol wired through council-advisory diff body; `vanta-failure-escalation.js` — 3+ session failures bump tier, 5+ force T3; semantic product-decision detector (regex over framers + targets, no LLM call). |
+| v3.7.4 | — | **Open loops wired.** `Decision.inline_ready` (trust→mode signal); `Decision.effort` (huge ≥800 lines forces T2, high ≥200 lines or ≥5 files bumps 1); `Decision.uncertainty` (borderline classifier output bumps 1, drops confidence to medium). |
+| v3.7.5 | — | **Per-project scoping.** `trust-metrics.compute({project, days, min_sample})`; `readyForInline` requires 50+ actions; two-eyes compound enforcement (2+ signals → T3 + peer=both); setup.sh policy versioning + bin list fix (executor + failure-escalation were missing from fresh installs). |
+| v3.7.6 | — | **Hygiene.** `docs/FAILURE-MODES.md`; manifest consistency tests (caught real drift — phase-gate.js was unregistered); contradiction-detection regression locks ES256/HS256, Pixi v7/v8; setup.sh idempotency tests. |
+| v3.8.0 | 10/10 | **Validation.** v3.7 sprint complete — 334/334 tests, 15/15 smoke, INTERNAL MACHINERY discipline held across all 6 micro-releases (zero new user-visible commands; three-command surface unchanged). See [`RELEASE-v3.8.md`](RELEASE-v3.8.md). |
 
-See [`docs/EXPLAINER.md`](docs/EXPLAINER.md) for the full design rationale.
+See [`docs/EXPLAINER.md`](docs/EXPLAINER.md) for the full design rationale and [`RELEASE-v3.8.md`](RELEASE-v3.8.md) for the v3.7 → v3.8 release notes.
 
 ---
 
