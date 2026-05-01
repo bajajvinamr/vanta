@@ -26,7 +26,7 @@ const os = require('os');
 
 // Lazy-load helpers so hooks/tests can stub them and so a missing helper
 // degrades to a permissive default rather than crashing the executor.
-let _killSwitch, _safetyFloor, _rewriter, _riskClassifier, _peerRouter, _escalation, _trust;
+let _killSwitch, _safetyFloor, _rewriter, _riskClassifier, _peerRouter, _escalation, _trust, _projects;
 
 function _resolve(name) {
   for (const p of [
@@ -45,6 +45,23 @@ function riskClassifier()   { return _riskClassifier || (_riskClassifier = _reso
 function peerRouter()       { return _peerRouter     || (_peerRouter     = _resolve('vanta-peer-router.js'));     }
 function failureEscalation(){ return _escalation    || (_escalation    = _resolve('vanta-failure-escalation.js'));}
 function trustMetrics()     { return _trust         || (_trust         = _resolve('vanta-trust-metrics.js'));    }
+function projects()         { return _projects      || (_projects      = _resolve('vanta-projects.js'));        }
+
+// R2 council fix — share one canonical project-slug derivation between
+// executor and hooks. `canonProject` expects a SLUG (basename), not a
+// full path: feeding `/Users/vinamr/Projects/vanta` returns the path
+// itself lowercased, which never matches the slug used by action-log
+// rows. Always basename first, canonProject second, identity fallback.
+// Mirrored in hooks/prompt-rewriter.js — keep in sync.
+function _canonProjectFromCwd(cwd) {
+  if (!cwd) return null;
+  const slug = path.basename(cwd);
+  const p = projects();
+  if (p && typeof p.canonProject === 'function') {
+    return p.canonProject(slug) || slug;
+  }
+  return slug;
+}
 
 // v3.7.4 — effort signal. A "big" change is risk-elevating regardless
 // of file path or prompt. Two cheap inputs: diff-body size and
@@ -81,6 +98,27 @@ function _uncertaintySignal(cls, routingMode) {
     return { bump: 1, why: `borderline-risk (rev=${r}, blast=${b}); no rule match` };
   }
   return null;
+}
+
+// R2 council fix — trust-metrics cache. `tm.compute()` reads the entire
+// `~/.vanta/interactions.jsonl` (and any rotated `.bak` siblings) into
+// memory and JSON-parses each line; on a heavy user this is tens of MBs
+// of work re-done on every UserPromptSubmit. The metrics shift on the
+// scale of hours, not milliseconds — a 60s TTL per (project) keeps the
+// hot path predictable. The cache lives at module scope so the same
+// node-process executor reuses the entry across decide() calls.
+const _TRUST_TTL_MS = 60_000;
+const _trustCache = new Map(); // key = project || '__null__' → {ts, m}
+function _cachedTrust(tm, project) {
+  if (!tm || typeof tm.compute !== 'function') return null;
+  const key = project || '__null__';
+  const now = Date.now();
+  const hit = _trustCache.get(key);
+  if (hit && (now - hit.ts) < _TRUST_TTL_MS) return hit.m;
+  let m = null;
+  try { m = tm.compute({ days: 30, project }); } catch (_) { m = null; }
+  _trustCache.set(key, { ts: now, m });
+  return m;
 }
 
 // Apply tier bumps in priority order. Higher priority signals dominate.
@@ -423,10 +461,13 @@ function decide(input = {}) {
   const tm = trustMetrics();
   if (tm && tm.compute) {
     try {
-      // v3.7.5 — project-scoped trust. Slug from cwd basename.
-      const project = ctx.cwd ? path.basename(ctx.cwd) : null;
-      const m = tm.compute({ days: 30, project });
-      inline_ready = !!m.ready_for_inline;
+      // v3.7.5 — project-scoped trust. R2 fix: derive slug via the same
+      // canonical helper hooks use, so the project key matches what
+      // prompt-rewriter wrote into action-log. Cached for 60s — see
+      // _cachedTrust comment for why.
+      const project = _canonProjectFromCwd(ctx.cwd);
+      const m = _cachedTrust(tm, project);
+      inline_ready = !!(m && m.ready_for_inline);
     } catch (_) { inline_ready = false; }
   }
 
