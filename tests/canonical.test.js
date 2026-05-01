@@ -3014,3 +3014,174 @@ describe('vanta-risk-classifier — hybrid floor + 3-axis (v3.6.15)', () => {
   });
 });
 
+// ─── v3.6.16 — Day 10: vanta-undo + cross-session regret detector ────────────
+
+describe('vanta-undo — reverse most recent reversible action (v3.6.16)', () => {
+  const al2 = require('../bin/vanta-action-log');
+  const undo = require('../bin/vanta-undo');
+
+  test('refuses to undo when no reversible action exists', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-undo-empty-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      const r = undo.undo({});
+      assert.equal(r.ok, false);
+      assert.match(r.reason, /no recent reversible/);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('skips non-reversible action types (rewrite, risk-classify)', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-undo-skip-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      al2.record({ session_id: 's1', action: 'rewrite', subject: 'p',
+        decision: 'auto', why: 'shadow', undo_hint: { kind: 'rewriter-shadow' } });
+      al2.record({ session_id: 's1', action: 'risk-classify', subject: 'src/foo.ts',
+        decision: 'auto', why: 'metadata' });
+      const r = undo.undo({});
+      assert.equal(r.ok, false, 'rewrite + risk-classify must not be undone');
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('autonomy-promote is reversible when payload includes prior_level', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-undo-auton-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      // Pretend a recent autonomy-promote happened.
+      al2.record({
+        session_id: 's-undo-test',
+        action: 'autonomy-promote',
+        subject: tmp,
+        decision: 'auto',
+        why: 'earned upgrade L1 → L2',
+        undo_hint: {
+          kind: 'autonomy-promote',
+          payload: { repo: tmp, prior_level: 'L1', new_level: 'L2' },
+        },
+      });
+      const r = undo.undo({});
+      assert.equal(r.ok, true, `expected undo ok, got: ${JSON.stringify(r)}`);
+      const cfg = path.join(tmp, '.vanta', 'config.yaml');
+      assert.ok(fs.existsSync(cfg));
+      assert.match(fs.readFileSync(cfg, 'utf8'), /level:\s*L1/);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('memory-promote returns partial-undo with manual edit hint', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-undo-mem-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      al2.record({
+        session_id: 's1',
+        action: 'memory-promote',
+        subject: 'staged invariant: foo bar',
+        decision: 'auto',
+        why: 'high-conf staged promotion',
+        undo_hint: {
+          kind: 'memory-promote',
+          payload: { entry_id: 'inv-001', prior_text: 'old text snippet' },
+        },
+      });
+      const r = undo.undo({});
+      assert.equal(r.ok, false);
+      assert.match(r.reason, /partially-reversible/);
+      assert.match(r.reason, /old text snippet/);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('undo is itself recorded as a new action-log entry', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-undo-record-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      al2.record({
+        session_id: 's1', action: 'autonomy-promote', subject: tmp,
+        decision: 'auto', why: 'test',
+        undo_hint: { kind: 'autonomy-promote', payload: { repo: tmp, prior_level: 'L0' } },
+      });
+      undo.undo({});
+      const undoEntries = al2.read({ action: 'undo' });
+      assert.ok(undoEntries.length >= 1, 'undo event must be logged');
+      assert.equal(undoEntries[0].undo_hint.kind, 'undo');
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('vanta-regret-detector — silent regret across sessions (v3.6.16)', () => {
+  const rd = require('../bin/vanta-regret-detector');
+  const al2 = require('../bin/vanta-action-log');
+
+  test('returns empty signals when no Vanta-touched files in window', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rd-empty-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      const sigs = rd.detect({ days: 7 });
+      assert.deepEqual(sigs, []);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('regretRate returns zeros on empty ledger', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rd-rate-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      const r = rd.regretRate({ days: 7 });
+      assert.equal(r.rate, 0);
+      assert.equal(r.n, 0);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('detects regret-shaped commit message in git log', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-rd-msg-'));
+    try {
+      process.env.VANTA_DIR_OVERRIDE = tmp;
+      // Build a tiny git repo with a regret-shaped commit.
+      const { execSync } = require('node:child_process');
+      const repo = path.join(tmp, 'repo');
+      fs.mkdirSync(repo);
+      execSync('git init -q && git config user.email t@t && git config user.name t', { cwd: repo });
+      const file = path.join(repo, 'foo.ts');
+      fs.writeFileSync(file, 'console.log("v1")\n');
+      execSync('git add . && git commit -q -m "v1"', { cwd: repo });
+      // Simulate a Vanta auto-edit.
+      const vantaTs = new Date(Date.now() - 60_000).toISOString();  // 1 min ago
+      al2.record({
+        session_id: 's1', action: 'auto-edit', subject: file,
+        decision: 'auto', why: 'auto-fix',
+        ts: vantaTs,
+      });
+      // User commits a reverting change with a regret-shaped message.
+      fs.writeFileSync(file, 'console.log("v0 — reverted")\n');
+      execSync('git add . && git commit -q -m "revert: actually that was wrong"', { cwd: repo });
+      const sigs = rd.detect({ days: 7 });
+      assert.ok(sigs.length >= 1, 'expected at least 1 regret signal');
+      const sig = sigs.find(s => s.file === file);
+      assert.ok(sig, 'regret signal for the touched file must be present');
+      assert.ok(['message', 'silent', 'both'].includes(sig.kind),
+        `expected kind to be one of message/silent/both, got ${sig.kind}`);
+    } finally {
+      delete process.env.VANTA_DIR_OVERRIDE;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
