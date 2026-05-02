@@ -264,21 +264,33 @@ allowed when Vanta produced verification evidence; otherwise, default
 to `[Vanta likely done]`.**
 
 ```typescript
-type VerificationEvidence =
+// Behavioral proof — exercises the actual behavior the user asked
+// Vanta to deliver. At least one of these is REQUIRED for [Vanta done].
+type BehavioralEvidence =
   | { kind: "test_run";   command: string; exit_code: 0; output_snippet: string; ts: string }
+  | { kind: "ci_status";  url: string; status: "passed"; ts: string }
+  | { kind: "smoke";      script: string; pass_count: number; total: number; ts: string }
+  | { kind: "manual_verify"; what_user_confirmed: string; ts: string };  // user said "yes that works"
+
+// Supplemental proof — proves something happened (change exists, code
+// compiles, types check) but does NOT prove behavior correctness. May
+// accompany behavioral evidence; CANNOT stand alone for [Vanta done].
+type SupplementalEvidence =
   | { kind: "build";      command: string; exit_code: 0; ts: string }
   | { kind: "typecheck";  command: string; exit_code: 0; ts: string }
   | { kind: "lint";       command: string; exit_code: 0; ts: string }
-  | { kind: "ci_status";  url: string; status: "passed"; ts: string }
-  | { kind: "diff_hash";  before_sha: string; after_sha: string; ts: string }
-  | { kind: "smoke";      script: string; pass_count: number; total: number; ts: string };
+  | { kind: "diff_hash";  before_sha: string; after_sha: string; ts: string };
+
+type VerificationEvidence = BehavioralEvidence | SupplementalEvidence;
 ```
 
-Hard rules:
+Hard rules (council R2 P1, Codex):
 
-- `[Vanta done]` → action-object MUST carry ≥1 `VerificationEvidence`
-  entry whose evidence is **intent-linked** (the test/build/check
-  exercises the behavior the user asked Vanta to fix or ship)
+- `[Vanta done]` → action-object MUST carry ≥1 `BehavioralEvidence`
+  entry whose evidence is **intent-linked** (the test/CI/smoke/user-verify
+  exercises the behavior the user asked Vanta to fix or ship). A
+  build-passes or types-check is NOT enough; those prove the change
+  compiled, not that it works.
 - `[Vanta likely done]` → evidence may exist, but at least one expected
   evidence is missing or red (e.g. unit tests pass, E2E missing/red)
 - `[Vanta blocked]` → no evidence required; user owns the decision
@@ -642,20 +654,41 @@ on any action with `reversible: false`.
 - "exit safe mode"
 - "you can act normally"
 
-**Persistence:** safe mode is repo-scoped and persistent. Stored at
-`~/.vanta/repos/<slug>/policy.json`:
+**Persistence:** safe mode is repo-scoped and persistent, but stored
+as a **top-level override flag that MASKS underlying preferences, not
+overwrites them** (council R2 P2, Gemini fix). Without this, exiting
+safe mode would lose whether `ambient` was "suggest" or "auto" before
+engagement, and the user's prior privacy-policy choices.
+
+Stored at `~/.vanta/repos/<slug>/policy.json`:
 
 ```json
 {
-  "ambient": "off",
-  "council": "off",
-  "memory_promotion": "off",
-  "inline_preview": "off",
-  "irreversible_actions": "always-ask",
-  "safe_mode_engaged_at": "2026-05-09T14:22:00Z",
-  "safe_mode_reason": "user-initiated"
+  "ambient": "auto",
+  "council": "send-when-high-risk",
+  "memory_promotion": "auto-project-staged-global",
+  "inline_preview": "preview",
+  "monthly_cost_ceiling_usd": 25.00,
+
+  "safe_mode": {
+    "active": true,
+    "engaged_at": "2026-05-09T14:22:00Z",
+    "reason": "user-initiated"
+  }
 }
 ```
+
+When `safe_mode.active` is `true`, the executor reads the top-level
+preferences but applies safe-mode masks:
+- `ambient` is forced to `"off"` regardless of stored value
+- `council` is forced to `"off"`
+- `memory_promotion` is forced to `"off"`
+- `inline_preview` is forced to `"off"`
+- All `reversible: false` actions require ASK
+
+Exiting safe mode (`active: false`) restores the underlying values
+exactly as the user set them. The user's preferences are never
+clobbered.
 
 **UX in safe mode:**
 
@@ -1094,35 +1127,77 @@ Per-repo policy at `~/.vanta/repos/<slug>/policy.json`. Set ONCE on
 first council fire (see Decision Boundaries above). Subsequent fires
 silently respect the policy. Only ask when ceiling is exceeded.
 
-### Working-tree lock (council R1 P1, Gemini)
+### Working-tree lock (council R1 P1, Gemini; R2 P2 Codex extended)
 
 Pre-flight check: if the user has uncommitted edits AND Vanta is about
-to perform a destructive or irreversible action (file_edit on a file
-the user is touching, command with side_effects_known: true that
-modifies tracked files, memory_promotion that writes to a file the
-user has open), Vanta MUST surface the conflict before acting.
+to perform a destructive or irreversible action, Vanta MUST surface the
+conflict before acting.
+
+R2 fix: split into TWO locks because `git status` only covers tracked
+files in the current repo. Edits to `~/.claude/rules/`,
+`~/.codex/AGENTS.md`, project CLAUDE.md outside a git repo, or
+unsaved-in-editor buffers would otherwise slip through.
+
+#### Lock 1 — Repo working-tree lock (git-based)
 
 ```typescript
-function checkWorkingTreeLock(target_path: string): {
+function checkRepoLock(target_path: string): {
   blocked: boolean;
   reason: "uncommitted-changes" | "tracked-untracked" | "ok";
   user_modified_files: string[];
 };
 ```
 
-The check runs `git status --porcelain` (free, local) and refuses to
-write to any file in the modified set without surfacing:
+Runs `git status --porcelain` for the repo containing `target_path`.
+Refuses to write to any file in the modified set:
 
 ```
 [Vanta] You have uncommitted changes in src/auth/session.ts. I was
 about to edit that file too. Pick:
 A) I'll wait — commit or stash first, then say "go ahead"
-B) Override — apply my edit anyway (will conflict if our changes overlap)
+B) Override — apply my edit anyway (will conflict if changes overlap)
 C) Cancel my action
 ```
 
+#### Lock 2 — External-file lock (content hash + mtime)
+
+For files outside a git repo (e.g. `~/.claude/rules/vinamr-invariants.md`,
+`~/.codex/AGENTS.md`, plain config files in non-repo dirs), Vanta caches
+the file's mtime + SHA at the start of any planned write. Before the
+write actually fires, Vanta re-reads the file and compares:
+
+```typescript
+function checkExternalFileLock(target_path: string, expected: {
+  mtime_ns: number;
+  sha256: string;
+}): {
+  blocked: boolean;
+  reason: "external-modification" | "ok";
+  current_mtime_ns?: number;
+  current_sha256?: string;
+};
+```
+
+If mtime or SHA changed between plan and write, something else (the
+user, another process, an editor saving) modified the file. Vanta
+refuses to overwrite without consent:
+
+```
+[Vanta] ~/.claude/rules/vinamr-invariants.md was modified between when
+I read it and now (mtime changed). Something else touched it — your
+editor, another process, or a sync tool. I'll re-read first; you don't
+want me overwriting whatever just landed.
+A) Re-read and apply my change on top
+B) Show me what changed externally first
+C) Cancel my action
+```
+
+The cache lives only for the duration of the action's
+`pending → applied` lifecycle; no on-disk persistence.
+
 The lock applies to ALL Vanta-initiated file_edits regardless of
-confidence; it is never overridden silently.
+confidence and to BOTH repo files and external files; it is never
+overridden silently.
 
 ### Acceptance
 
