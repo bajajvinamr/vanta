@@ -1,0 +1,300 @@
+#!/usr/bin/env node
+// vanta-action — central definition for the v3.9.0 reversibility model.
+//
+// This is the single source of truth for the VantaAction schema. Every
+// reversal-aware Vanta surface (stop intent, undo intent, re-route,
+// crash recovery) reads and writes through this module so the schema
+// stays consistent.
+//
+// Storage: extends the existing ~/.vanta/actions.jsonl ledger
+// (vanta-action-log.js) with optional v3.9.0 fields. Old entries
+// without these fields are interpreted as
+// `{ lifecycle: 'applied', reversible: false, inverse: null }` —
+// safe default that no existing call site relied on, so the migration
+// is implicit. New writes carry the full schema.
+//
+// Surface Impact Discipline (CLAUDE.md): INTERNAL MACHINERY. Adds no
+// commands, no skills. Adds one new module + extends an existing
+// JSONL with optional fields. The user only sees behavior changes
+// once v3.9.0 stop/undo/re-route handlers consume this.
+
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+
+// ─── Type definitions (JSDoc; no TypeScript runtime) ─────────────────
+//
+// LifecycleState: pending | applied | rolled_back | rollback_failed
+//
+// ConfidenceState: done | likely-done | blocked | risky
+//
+// ActionInverse (discriminated union, kind-tagged):
+//   FileEditInverse        — { kind, target_path, before_sha, after_sha, patch }
+//   MemoryPromotionInverse — { kind, target_file, inserted_text, insertion_anchor, staging_path? }
+//   CommandInverse         — { kind, process_id?, cleanup_commands?, side_effects_known }
+//   PromptRewriteInverse   — { kind, original_prompt }
+//   CouncilCallInverse     — { kind, request_id, cancelled_locally, remote_status, estimated_cost_usd?, actual_cost_usd? }
+//
+// VantaAction (the persisted record):
+//   { id, kind, lifecycle, reversible, inverse?, affected_files?,
+//     detected_intent?, current_route?, confidence_state?,
+//     verification_evidence?, project, session, ts, why? }
+
+const LIFECYCLE_STATES = Object.freeze(['pending', 'applied', 'rolled_back', 'rollback_failed']);
+const CONFIDENCE_STATES = Object.freeze(['done', 'likely-done', 'blocked', 'risky']);
+const ACTION_KINDS = Object.freeze([
+  'prompt_rewrite', 'route_decision', 'file_edit',
+  'command', 'memory_promotion', 'council_call',
+]);
+const INVERSE_KINDS = Object.freeze([
+  'file_edit', 'memory_promotion', 'command',
+  'prompt_rewrite', 'council_call',
+]);
+
+function _vantaDir() {
+  return process.env.VANTA_DIR_OVERRIDE || path.join(os.homedir(), '.vanta');
+}
+function _actionsFile() { return path.join(_vantaDir(), 'actions.jsonl'); }
+
+let _jsonl;
+function jsonl() {
+  if (_jsonl) return _jsonl;
+  for (const p of [
+    path.join(__dirname, 'vanta-jsonl.js'),
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-jsonl.js'),
+  ]) {
+    try { _jsonl = require(p); return _jsonl; } catch (_) { /* try next */ }
+  }
+  throw new Error('vanta-jsonl.js not resolvable');
+}
+
+// Generate a fresh action id. 12 hex chars = 2.8e14 collision space —
+// matches vanta-action-log.js. Prefix `va-` so VantaAction ids are
+// distinguishable from action-log's `act-` ids.
+function newActionId() {
+  return 'va-' + crypto.randomBytes(6).toString('hex');
+}
+
+// Schema validation. Throws on hard contract violations (unknown kind,
+// invalid lifecycle, inverse-kind mismatch); returns the validated
+// action otherwise. Pure — no I/O.
+function validateAction(a) {
+  if (!a || typeof a !== 'object') {
+    throw new Error('action: must be object');
+  }
+  if (!ACTION_KINDS.includes(a.kind)) {
+    throw new Error(`action.kind: invalid (got "${a.kind}", want one of ${ACTION_KINDS.join('|')})`);
+  }
+  if (!LIFECYCLE_STATES.includes(a.lifecycle)) {
+    throw new Error(`action.lifecycle: invalid (got "${a.lifecycle}", want one of ${LIFECYCLE_STATES.join('|')})`);
+  }
+  if (typeof a.reversible !== 'boolean') {
+    throw new Error('action.reversible: must be boolean');
+  }
+  if (a.confidence_state != null && !CONFIDENCE_STATES.includes(a.confidence_state)) {
+    throw new Error(`action.confidence_state: invalid (got "${a.confidence_state}")`);
+  }
+  if (a.inverse) {
+    if (!INVERSE_KINDS.includes(a.inverse.kind)) {
+      throw new Error(`action.inverse.kind: invalid (got "${a.inverse.kind}")`);
+    }
+    _validateInverseShape(a.inverse);
+  }
+  if (!a.id || typeof a.id !== 'string') throw new Error('action.id: required string');
+  if (!a.ts || typeof a.ts !== 'string') throw new Error('action.ts: required ISO-8601');
+  return a;
+}
+
+// Per-kind inverse shape check. Forces every reversible action to
+// carry the exact information needed to safely roll back — the
+// council R1 finding that rejected the prior `inverse: object` shape.
+function _validateInverseShape(inv) {
+  switch (inv.kind) {
+    case 'file_edit':
+      if (typeof inv.target_path !== 'string') throw new Error('FileEditInverse.target_path required');
+      if (typeof inv.before_sha !== 'string')  throw new Error('FileEditInverse.before_sha required');
+      if (typeof inv.after_sha !== 'string')   throw new Error('FileEditInverse.after_sha required');
+      if (typeof inv.patch !== 'string')       throw new Error('FileEditInverse.patch required');
+      break;
+    case 'memory_promotion':
+      if (typeof inv.target_file !== 'string')      throw new Error('MemoryPromotionInverse.target_file required');
+      if (typeof inv.inserted_text !== 'string')    throw new Error('MemoryPromotionInverse.inserted_text required');
+      if (typeof inv.insertion_anchor !== 'string') throw new Error('MemoryPromotionInverse.insertion_anchor required');
+      break;
+    case 'command':
+      if (typeof inv.side_effects_known !== 'boolean') throw new Error('CommandInverse.side_effects_known required');
+      // process_id and cleanup_commands are both optional — but if
+      // side_effects_known is true, at least one of them must be set
+      // to give the undo handler something to do.
+      if (inv.side_effects_known && inv.process_id == null && (!Array.isArray(inv.cleanup_commands) || inv.cleanup_commands.length === 0)) {
+        throw new Error('CommandInverse: side_effects_known=true requires process_id OR non-empty cleanup_commands');
+      }
+      break;
+    case 'prompt_rewrite':
+      if (typeof inv.original_prompt !== 'string') throw new Error('PromptRewriteInverse.original_prompt required');
+      break;
+    case 'council_call':
+      if (typeof inv.request_id !== 'string')        throw new Error('CouncilCallInverse.request_id required');
+      if (typeof inv.cancelled_locally !== 'boolean') throw new Error('CouncilCallInverse.cancelled_locally required');
+      if (typeof inv.remote_status !== 'string' || !['unknown', 'completed', 'aborted'].includes(inv.remote_status)) {
+        throw new Error('CouncilCallInverse.remote_status: invalid');
+      }
+      break;
+  }
+}
+
+// Construct a fresh VantaAction. Sets id + ts + defaults. Caller
+// passes the kind and inverse (and optionally other fields). The
+// returned action is in `pending` lifecycle by default.
+function createAction({
+  kind,
+  inverse,
+  reversible,
+  affected_files,
+  detected_intent,
+  current_route,
+  confidence_state,
+  verification_evidence,
+  project,
+  session,
+  why,
+}) {
+  const a = {
+    id: newActionId(),
+    kind,
+    lifecycle: 'pending',
+    reversible: reversible == null ? !!inverse : !!reversible,
+    inverse: inverse || null,
+    affected_files: Array.isArray(affected_files) ? affected_files.slice() : null,
+    detected_intent: detected_intent || null,
+    current_route: current_route || null,
+    confidence_state: confidence_state || null,
+    verification_evidence: Array.isArray(verification_evidence) ? verification_evidence.slice() : null,
+    project: project || null,
+    session: session || null,
+    ts: new Date().toISOString(),
+    why: why || null,
+  };
+  return validateAction(a);
+}
+
+// Persist an action (or an updated lifecycle for an existing action).
+// Append-only — every state change writes a new line; the latest line
+// for a given id wins. Reader logic dedupes on read by id.
+//
+// Why append-only? mtime-style mutation on a single file is fragile
+// across crashes; the existing action-log + sync-queue pattern uses
+// append-on-state-change which is crash-safe. Storage cost is bounded
+// by rotation (action-log already rotates at 5MB).
+function persistAction(action) {
+  const validated = validateAction(action);
+  fs.mkdirSync(_vantaDir(), { recursive: true });
+  jsonl().appendJsonlLine(_actionsFile(), validated);
+  return validated;
+}
+
+// Read all actions across the live file + .bak.<ts> siblings, dedupe
+// by id (latest line wins), and apply optional filters.
+//
+// Note: readMergedJsonl returns the concatenated raw STRING, not
+// parsed entries. We parse line-by-line with torn-line tolerance
+// (matching the soak-report reader pattern).
+function readActions({ project = null, lifecycle = null, kind = null, since = null } = {}) {
+  const file = _actionsFile();
+  if (!fs.existsSync(file) && !_anyBakFor(file)) return [];
+  const raw = jsonl().readMergedJsonl(file);
+  const byId = new Map();
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let e;
+    try { e = JSON.parse(t); } catch { continue; /* torn — skip */ }
+    if (!e || !e.id) continue;
+    const prior = byId.get(e.id);
+    if (!prior || (e.ts || '') > (prior.ts || '')) byId.set(e.id, e);
+  }
+  let out = [...byId.values()];
+  // Migrate the v3.8.x and pre-v3.8.x action-log shape: entries
+  // without `kind` are not VantaAction entries (they're the old
+  // record-by-action-verb shape). Skip them — they're owned by
+  // vanta-action-log's reader, not this module.
+  out = out.filter(e => ACTION_KINDS.includes(e.kind));
+  if (project)   out = out.filter(e => e.project === project);
+  if (lifecycle) out = out.filter(e => e.lifecycle === lifecycle);
+  if (kind)      out = out.filter(e => e.kind === kind);
+  if (since)     out = out.filter(e => (e.ts || '') >= since);
+  out.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  return out;
+}
+
+function _anyBakFor(file) {
+  try {
+    const dir = path.dirname(file);
+    const base = path.basename(file);
+    return fs.readdirSync(dir).some(f => f.startsWith(base + '.bak.'));
+  } catch (_) { return false; }
+}
+
+// Find the most recent reversible actions for a project — used by
+// the undo intent handler to disambiguate when the user says "undo
+// that" with multiple candidates.
+function findRecentReversible({ project, limit = 5, since = null } = {}) {
+  return readActions({ project, since })
+    .filter(e => e.reversible && e.lifecycle === 'applied')
+    .slice(0, limit);
+}
+
+// Update a known action's lifecycle. Writes a new line with the new
+// state; the reader's id-dedupe will surface the latest.
+function updateLifecycle(actionId, nextState, { reason } = {}) {
+  if (!LIFECYCLE_STATES.includes(nextState)) {
+    throw new Error(`updateLifecycle: invalid state "${nextState}"`);
+  }
+  // Read the most recent version of this action.
+  const all = readActions();
+  const cur = all.find(e => e.id === actionId);
+  if (!cur) {
+    throw new Error(`updateLifecycle: action "${actionId}" not found`);
+  }
+  // Lifecycle transitions are append-only; we don't gate them here
+  // (that's the handler's job). pending → applied → rolled_back is
+  // expected; pending → rollback_failed is also valid (action that
+  // never applied cleanly).
+  const next = {
+    ...cur,
+    lifecycle: nextState,
+    ts: new Date().toISOString(),
+    why: reason || cur.why,
+  };
+  return persistAction(next);
+}
+
+// Find by id, returning the most recent state.
+function findById(actionId) {
+  const all = readActions();
+  return all.find(e => e.id === actionId) || null;
+}
+
+module.exports = {
+  // Constants
+  LIFECYCLE_STATES,
+  CONFIDENCE_STATES,
+  ACTION_KINDS,
+  INVERSE_KINDS,
+  // Builders
+  createAction,
+  newActionId,
+  // Validation
+  validateAction,
+  // Persistence
+  persistAction,
+  readActions,
+  findById,
+  findRecentReversible,
+  updateLifecycle,
+  // Internal seams (test-only)
+  _actionsFile,
+  _validateInverseShape,
+};
