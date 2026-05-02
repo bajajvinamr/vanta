@@ -52,6 +52,8 @@ When opening a PR or commit that adds capability, name the classification explic
 - **Gemini council requires trust**: Gemini CLI exits 55 in headless mode without `GEMINI_CLI_TRUST_WORKSPACE=true`. When Gemini fails, proceed as PARTIAL COUNCIL (Codex only) — run R2 with Codex reacting to its own R1 findings for false-positive check.
 - **Codex optional params break**: `approvalPolicy`/`sandbox` in `Ask-Codex` cause exit 2 arg-parse failure. Always omit optional params unless explicitly needed.
 - **sync-queue consumers must clear**: The Stop hook writes `synced: false`. vanta-sync must mark `synced: true` after processing or alerts repeat every session indefinitely.
+- **`slugFromCwd()` is the only canonical cwd→slug resolver** (`bin/vanta-projects.js`). Every consumer (executor, hooks, future planners) must delegate to it. Re-implementing `basename + canonProject` in caller code fragments project-scoped trust per subdir because monorepo basenames don't equal the workspace root, and `canonProject(full_path)` falls through to a lowercased path. Both `bin/vanta-executor.js _canonProjectFromCwd()` and `hooks/prompt-rewriter.js` route through `slugFromCwd()` — keep them in sync. Verified via R3 council, v3.8.0.
+- **Council convergence cap is R2 protocol but R3+ pays off when R1 fixes are partial**. The v3.7→v3.8 sprint ran R1+R2+R3, each surfacing new P2s the prior round missed. Hard-stop on any unresolved both-confirmed P2 finding before tagging a release — single-model P3/P4 findings can be deferred to the next minor with notes in the tag annotation.
 
 ---
 @./skills/using-vanta/SKILL.md
