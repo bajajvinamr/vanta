@@ -255,6 +255,54 @@ whole point.
 | `[Vanta blocked]` | Cannot finish without a decision the user owns. | "Stopped before changing pricing logic. Need your call: should `tier` rename to `plan_level` across the schema?" |
 | `[Vanta risky]` | Tests pass but the change touches a high-risk surface (auth, payments, migrations) that needs second review. | "Tests pass on the auth refactor, but this changes session storage. Next: get Codex + Gemini second opinion before merging." |
 
+### `[Vanta done]` requires verification evidence (council R1 P1, both-flagged)
+
+The prior version's `[Vanta done]` was a claim, not a proof. A user
+reading "verified with 3 tests" has no way to check that those 3 tests
+actually exist, ran, and passed. New rule: **`[Vanta done]` is only
+allowed when Vanta produced verification evidence; otherwise, default
+to `[Vanta likely done]`.**
+
+```typescript
+type VerificationEvidence =
+  | { kind: "test_run";   command: string; exit_code: 0; output_snippet: string; ts: string }
+  | { kind: "build";      command: string; exit_code: 0; ts: string }
+  | { kind: "typecheck";  command: string; exit_code: 0; ts: string }
+  | { kind: "lint";       command: string; exit_code: 0; ts: string }
+  | { kind: "ci_status";  url: string; status: "passed"; ts: string }
+  | { kind: "diff_hash";  before_sha: string; after_sha: string; ts: string }
+  | { kind: "smoke";      script: string; pass_count: number; total: number; ts: string };
+```
+
+Hard rules:
+
+- `[Vanta done]` → action-object MUST carry ≥1 `VerificationEvidence`
+  entry whose evidence is **intent-linked** (the test/build/check
+  exercises the behavior the user asked Vanta to fix or ship)
+- `[Vanta likely done]` → evidence may exist, but at least one expected
+  evidence is missing or red (e.g. unit tests pass, E2E missing/red)
+- `[Vanta blocked]` → no evidence required; user owns the decision
+- `[Vanta risky]` → evidence may exist, but the change surface needs
+  external review before claiming `done`
+
+The user-facing message includes the proof:
+
+```
+[Vanta done] Fixed auth redirect, verified with `npm test -- auth.spec`
+(3/3 passing, exit 0). Next: merge PR #12.
+```
+
+vs.
+
+```
+[Vanta likely done] Fixed the routing bug. Unit tests pass
+(`npm test -- routing.spec`, 4/4). E2E suite is still red but
+unrelated — investigate E2E #7 separately.
+```
+
+If the user asks "was it actually verified?", Vanta dumps the relevant
+`VerificationEvidence` entries from the action-log.
+
 These states are first-class in the action-object model (v3.9.0); every
 session-end action-object carries a `confidence_state` field, which is
 used by the brief (v3.9.5) and by the burn-in measurement (v3.9.8).
@@ -369,7 +417,75 @@ crash-recovery and cancellation-state tracking.
 
 ### Build the action-object model first
 
+> **Council R1 P1 (both-flagged):** the prior schema's `inverse: object`
+> was too vague to safely undo `file_edit`, `memory_promotion`, or
+> partial commands. Reversal needs typed per-kind fields, not a freeform
+> object. Below is the strengthened schema.
+
 ```typescript
+type LifecycleState =
+  | "pending"          // queued, not yet applied
+  | "applied"          // executed successfully
+  | "rolled_back"      // user reversed it; inverse applied cleanly
+  | "rollback_failed"; // user tried to reverse but inverse failed; needs manual
+
+type ConfidenceState = "done" | "likely-done" | "blocked" | "risky";
+
+// Per-kind reversal fields. The discriminated union forces every
+// action-kind to declare the exact information needed to safely roll
+// back. A bare `object` would let callers ship undo-by-best-effort,
+// which is what the council R1 finding rejected.
+
+type FileEditInverse = {
+  kind: "file_edit";
+  target_path: string;
+  before_sha: string;        // SHA of file content BEFORE the edit
+  after_sha: string;         // SHA of file content AFTER the edit
+  patch: string;             // unified diff for the change
+  // Apply order: verify current content matches after_sha, then revert
+  // to before_sha via reverse-patch. If current SHA != after_sha, the
+  // file was edited externally; rollback is `rollback_failed` and
+  // user is told what diverged.
+};
+
+type MemoryPromotionInverse = {
+  kind: "memory_promotion";
+  target_file: string;       // e.g. ~/.claude/rules/vinamr-invariants.md
+  inserted_text: string;     // exact bytes inserted (for line-removal)
+  insertion_anchor: string;  // surrounding context line for safe match
+  staging_path?: string;     // if promoted from staging, original path
+};
+
+type CommandInverse = {
+  kind: "command";
+  process_id?: number;       // for kill-by-pid
+  cleanup_commands?: string[];  // e.g. ["rm /tmp/foo", "git restore X"]
+  side_effects_known: boolean;
+  // If side_effects_known is false, the command CANNOT be auto-undone;
+  // user is shown a manual cleanup checklist instead.
+};
+
+type PromptRewriteInverse = {
+  kind: "prompt_rewrite";
+  original_prompt: string;   // re-issue this if user undoes
+};
+
+type CouncilCallInverse = {
+  kind: "council_call";
+  request_id: string;
+  cancelled_locally: boolean;
+  remote_status: "unknown" | "completed" | "aborted";
+  estimated_cost_usd?: number;
+  actual_cost_usd?: number;  // filled by reconciliation on next session
+};
+
+type ActionInverse =
+  | FileEditInverse
+  | MemoryPromotionInverse
+  | CommandInverse
+  | PromptRewriteInverse
+  | CouncilCallInverse;
+
 interface VantaAction {
   id: string;
   kind:
@@ -379,18 +495,15 @@ interface VantaAction {
     | "command"
     | "memory_promotion"
     | "council_call";
-  reversible: boolean;
-  inverse?: object;            // operation to undo this action
+  lifecycle: LifecycleState;          // R1 fix
+  reversible: boolean;                 // false → action cannot be undone
+                                       // (e.g. side-effects-unknown command)
+  inverse?: ActionInverse;             // typed by kind — see union above
   affected_files?: string[];
-  original_prompt?: string;
-  rewritten_prompt?: string;
-  detected_intent?: string;    // for re-route reclassification
-  current_route?: string;      // for re-route halt
-  confidence_state?:           // for "Done means done"
-    | "done"
-    | "likely-done"
-    | "blocked"
-    | "risky";
+  detected_intent?: string;            // for re-route reclassification
+  current_route?: string;              // for re-route halt
+  confidence_state?: ConfidenceState;  // for "Done means done"
+  verification_evidence?: VerificationEvidence[];  // R1 fix; see below
   project: string;
   session: string;
   ts: string;
@@ -505,6 +618,67 @@ B) Re-run the council
 C) Skip / abandon
 ```
 
+### Safe mode (council R1 P3, both-flagged dangling reference)
+
+The prior version of v3.9.5 referenced "paused/safe mode" without
+defining it. Defining it as a first-class conversational toggle:
+
+**What safe mode is:** the user can put any repo into a posture where
+Vanta acts conservatively. Routing is explicit-only (no ambient), no
+council calls, no memory promotion, no inline preview, no auto-acting
+on any action with `reversible: false`.
+
+**Inputs that activate safe mode:**
+
+- "be careful"
+- "safe mode"
+- "don't auto"
+- "I'm going to be working alongside you"
+- "stop suggesting things"
+
+**Inputs that exit safe mode:**
+
+- "back to normal"
+- "exit safe mode"
+- "you can act normally"
+
+**Persistence:** safe mode is repo-scoped and persistent. Stored at
+`~/.vanta/repos/<slug>/policy.json`:
+
+```json
+{
+  "ambient": "off",
+  "council": "off",
+  "memory_promotion": "off",
+  "inline_preview": "off",
+  "irreversible_actions": "always-ask",
+  "safe_mode_engaged_at": "2026-05-09T14:22:00Z",
+  "safe_mode_reason": "user-initiated"
+}
+```
+
+**UX in safe mode:**
+
+```
+[Vanta] Safe mode is on for this repo. I'll only respond to /vanta
+explicitly, won't fire council calls or promote memory, and will ask
+before any action that can't be cleanly undone. Say "back to normal"
+when you're ready.
+```
+
+**Auto-engage triggers (suggested, not automatic):** if the burn-in
+telemetry shows a recent `[Vanta risky]` ending OR a recent rollback
+that succeeded, Vanta suggests safe mode in the session brief — does
+NOT engage it without consent.
+
+**Acceptance:**
+- 5 synthetic safe-mode prompts engage the mode and persist across
+  sessions (confirm via session-start brief showing "safe mode is on")
+- 5 exit-mode prompts cleanly disengage
+- During safe mode: every council/ambient/memory-promotion/inline path
+  is gated; trying to invoke any of them surfaces "safe mode is on —
+  exit safe mode first?"
+
 ### Hard rule
 
 **No real inline replacement (`rewriter.inline = "auto"`) until the
@@ -533,13 +707,69 @@ and ≥3 sessions.** This is preserved from the prior roadmap.
 
 Vanta turns vague prompts into the right outcome. Two surfaces:
 
-- **Explicit mode**: `/vanta fix this`
-- **Ambient mode**: just `fix this` (no prefix) — UserPromptSubmit hook
-  intercepts weak action prompts and routes them
+- **Explicit mode**: `/vanta fix this` — confidence floor `0.55`,
+  catch-all on low confidence (intent is clearly invocational)
+- **Ambient mode**: just `fix this` (no prefix) — confidence floor
+  `0.85` (much higher — intent is uncertain), silent pass-through on
+  misses, NEVER hijacks a normal conversation
 
 The promise is not "remember one command." It's:
 
 > "Even if you type badly, Vanta catches the intent."
+
+### Ambient mode safety (council R1 P1, both-flagged)
+
+Both reviewers flagged the same risk: ambient mode misfires can hijack
+a normal Claude conversation. "Fix this margarita recipe" should NOT
+launch `/investigate`. Three guardrails:
+
+**1. Higher confidence floor for ambient**
+
+| Mode | Confidence floor | Top-1 vs top-2 margin |
+|---|---|---|
+| Explicit (`/vanta`) | 0.55 | 0.10 |
+| Ambient (no prefix) | **0.85** | **0.20** |
+
+Ambient is intentionally hard to trigger. The cost of a misfire (Vanta
+hijacks a conversation) is much higher than the cost of a miss (user
+falls back to typing `/vanta`).
+
+**2. Silent pass-through on miss, never Clarify**
+
+Ambient miss does NOT route to the catch-all "Clarify" intent — that
+would still hijack the conversation. Instead, ambient just lets the
+prompt flow to Claude normally. Vanta is silent.
+
+If the user wanted Vanta and got Claude, they can re-issue with
+`/vanta` explicitly.
+
+**3. Per-repo ambient policy**
+
+Stored at `~/.vanta/repos/<slug>/policy.json`:
+
+```json
+{
+  "ambient": "auto"   // "off" | "suggest" | "auto"
+}
+```
+
+| Setting | Behavior |
+|---|---|
+| `"off"` | Ambient mode disabled. Only explicit `/vanta` triggers routing. |
+| `"suggest"` | High-confidence ambient match shows `[Vanta] Looks like you want to diagnose. Use /vanta or just say 'go ahead'`. Vanta does NOT act. |
+| `"auto"` | High-confidence ambient match acts directly. Default for new repos AFTER user has used Vanta in the repo for ≥7 days. |
+
+A new repo defaults to `"suggest"` for the first 7 days of use, then
+auto-promotes to `"auto"` if no manual override. User can flip via
+conversational toggle (no JSON edit):
+
+```
+[Vanta] Want me to act on plain-English prompts in this repo, or always
+require /vanta first?
+A) Act on plain English when I'm confident (default after a week)
+B) Suggest only — never act without /vanta
+C) Off — only respond to /vanta
+```
 
 ### Supported intents (outcome-labeled)
 
@@ -585,6 +815,34 @@ Vanta: [Vanta] I need to know what "X did" looked like before I touch
 
 Hard rule: **never ask the user to classify work that Vanta can clarify
 by reading context.**
+
+### Local inspect vs remote inspect (council R1 P2, both-flagged)
+
+"Inspect first when safe" was ambiguous in the prior version: the user
+might assume "inspect" is free, but a Codex-backed audit on a 500-line
+diff costs real money. Splitting:
+
+| Inspect kind | What it does | Cost | Behavior |
+|---|---|---|---|
+| **Local inspect** | `grep`, `git diff`, `git status`, reading files, running local tests, parsing AST locally | $0 | Silent. No consent needed. |
+| **Remote inspect** | Codex audit, Gemini architecture pass, any LLM call | varies | Goes through the money matrix (see Decision Boundaries) AND the per-repo privacy policy. Treated as a council call, not a free read. |
+
+Concrete rule: **catch-all "inspect first" must be local-only.** If the
+local inspection is insufficient and Vanta would need to fire a paid
+remote inspect to clarify, that crosses a boundary — Vanta asks the
+user first:
+
+```
+User:  this looks weird
+Vanta: [Vanta] I checked the recent diff and failing tests locally,
+       but the failure pattern isn't obvious. Want me to ask Codex
+       for a closer look (~$0.18) or describe what feels off in your
+       own words?
+```
+
+The user-facing word "inspect" means LOCAL inspect by default. If
+Vanta wants to fire a remote inspect, it says "ask Codex" or "ask
+Gemini" — never "inspect more."
 
 ### Catch-all entry conditions
 
@@ -765,16 +1023,70 @@ Every action passes through this gate before any side-effect.
 ```typescript
 function checkCost({
   estimated_usd: number,
-  session_running_total_usd: number
+  session_running_total_usd: number,
+  month_running_total_usd: number,    // R1 fix
+  monthly_ceiling_usd: number,        // R1 fix
 }): {
   proceed: boolean;
   mention: boolean;
   ask: boolean;
+  reason: "session-budget" | "monthly-ceiling" | "per-call" | "ok";
 };
 ```
 
 Per-call: <$0.05 silent, $0.05–$0.50 mention, >$0.50 ask. Session: <$1
 silent, $1–$5 mention at end, >$5 ask to continue.
+
+### Monthly cost ceiling (council R1 P1, Gemini)
+
+Session-level warnings don't prevent aggregate billing surprises. A
+non-engineer founder running 30 short sessions a month at $4/each
+hits $120/mo without ever crossing the $5 session warning. Add a hard
+monthly ceiling per repo:
+
+```json
+{
+  "monthly_cost_ceiling_usd": 25.00,
+  "month_running_total_usd": 18.40,
+  "ceiling_reset_day": 1
+}
+```
+
+Default ceiling: **$25/month per repo** (chosen as a "real but not
+scary" default for solo-founder use; configurable conversationally).
+
+Setting the ceiling is conversational, not a JSON edit:
+
+```
+[Vanta] Set a monthly Vanta budget for this repo? Default is $25/mo
+across all council calls.
+A) Use the $25 default
+B) Set it higher — I'll do heavy review here
+C) Set it lower — keep it tight
+D) No ceiling
+```
+
+When the ceiling is approached or hit:
+
+```
+[Vanta] Heads up: this repo has used $22.40 of its $25 monthly budget.
+Want to raise the ceiling, switch to self-review for the rest of the
+month, or pause council calls?
+```
+
+When exceeded mid-call request:
+
+```
+[Vanta] Council call would push this repo over the $25 monthly budget.
+Options:
+A) Approve this one ($0.18) — I'll keep tracking
+B) Raise the ceiling
+C) Self-review only for the rest of the month
+```
+
+Monthly ceiling applies AT THE PER-CALL gate; once exceeded, every
+council call requires explicit override. Daily/monthly rollups
+visible via `vanta-status` CLI.
 
 ### Privacy policy enforcement
 
@@ -782,14 +1094,48 @@ Per-repo policy at `~/.vanta/repos/<slug>/policy.json`. Set ONCE on
 first council fire (see Decision Boundaries above). Subsequent fires
 silently respect the policy. Only ask when ceiling is exceeded.
 
+### Working-tree lock (council R1 P1, Gemini)
+
+Pre-flight check: if the user has uncommitted edits AND Vanta is about
+to perform a destructive or irreversible action (file_edit on a file
+the user is touching, command with side_effects_known: true that
+modifies tracked files, memory_promotion that writes to a file the
+user has open), Vanta MUST surface the conflict before acting.
+
+```typescript
+function checkWorkingTreeLock(target_path: string): {
+  blocked: boolean;
+  reason: "uncommitted-changes" | "tracked-untracked" | "ok";
+  user_modified_files: string[];
+};
+```
+
+The check runs `git status --porcelain` (free, local) and refuses to
+write to any file in the modified set without surfacing:
+
+```
+[Vanta] You have uncommitted changes in src/auth/session.ts. I was
+about to edit that file too. Pick:
+A) I'll wait — commit or stash first, then say "go ahead"
+B) Override — apply my edit anyway (will conflict if our changes overlap)
+C) Cancel my action
+```
+
+The lock applies to ALL Vanta-initiated file_edits regardless of
+confidence; it is never overridden silently.
+
 ### Acceptance
 
 - Every entry in the gray-area matrix has a unit test that asserts the
   correct ask/mention/silent classification
-- Money matrix unit-tested across the three thresholds
+- Money matrix unit-tested across the three thresholds (per-call) AND
+  the monthly ceiling
 - Privacy policy: 5 synthetic council fires after policy is set; ZERO
   consent prompts shown
 - 1 synthetic ceiling-exceeded fire; consent prompt appears
+- Monthly ceiling unit-tested at boundary, near-boundary, and exceeded
+- Working-tree lock blocks 5 synthetic edits to user-modified files;
+  override path produces conflict warning, not silent overwrite
 
 ---
 
@@ -964,14 +1310,28 @@ Vanta writes `~/.vanta/config.json` based on the answer.
 
 ---
 
-## v3.9.8 — Real-World UX Burn-In
+## v3.9.8 — Real-World UX Burn-In (qualitative milestone + extended soak)
 
 ### Goal
 
-Use Vanta in real work before adding more machinery.
+Use Vanta in real work before adding more machinery. **Two phases:**
 
-**Run Vanta across at least 10 real sessions** spanning at least 3
-projects (vanta itself, founderos, little-wins or pi-perception).
+1. **v3.9.8-α — Qualitative milestone:** 10 real sessions across 3
+   projects. Measures whether the operator loop *feels* right at all.
+   Tags v3.9.0 if absolute gates pass + "saved me thinking" signal is
+   positive in asked windows.
+2. **v3.9.8-β — Extended soak (council R1 P3, Gemini):** ≥50 real
+   sessions before flipping `rewriter.inline = "auto"` for any project.
+   10 sessions is qualitatively informative but statistically too thin
+   to claim "zero unasked destructive actions" with any confidence.
+   The 50-session soak runs continuously after the v3.9.0 tag.
+
+The v3.9.0 release ships after v3.9.8-α passes. v3.9.7 (selective
+inline preview) is enabled by default after v3.9.8-α. **Real inline
+replacement (`rewriter.inline = "auto"`) is only enabled after
+v3.9.8-β passes.**
+
+### Phase α — 10-session qualitative milestone
 
 ### What counts as a "real session"
 
@@ -1050,6 +1410,38 @@ of average metrics:
 
 A single failure on any absolute gate → hard-stop, find root cause, fix,
 restart the 10-session burn-in.
+
+### Phase β — 50-session extended soak (gates inline auto-mode)
+
+After v3.9.0 tags and v3.9.7 (selective preview) ships, the burn-in
+continues silently in real usage. Phase β requirements before
+`rewriter.inline = "auto"` is allowed on any project:
+
+**Event-count gates (per project that wants inline auto):**
+
+| Event | Minimum | Reason |
+|---|---|---|
+| Real sessions | ≥50 | Statistically meaningful sample |
+| Spans calendar days | ≥30 | Smooths over single-day anomalies |
+| Sessions ending `[Vanta done]` (with verification evidence) | ≥30 | Ensures "done" is actually being earned |
+| Manual stop / undo / re-route events | ≥10 | Proves reversibility was exercised, not theoretical |
+| Council fires | ≥5 | Proves second-opinion path works |
+| Action-object reversals applied successfully | ≥3 | Proves rollback works on real actions |
+
+**Ratio gates (carried forward from α):**
+
+- Manual command recall <20%
+- Routing accuracy >85%
+- Product-decision asks caught >95%
+- "Saved me thinking" yes/partial in ≥7 of asked windows
+
+**Absolute gates:** same as α — zero unasked destructive actions, zero
+confident wrong-routes that wrote files, zero unrecoverable crashes,
+zero irreversible bad memory promotions. ANY failure across the full
+50-session window is a hard-stop.
+
+Phase β is what makes the zero-tolerance claim statistically defensible.
+10 sessions is the trust handshake; 50 sessions is the contract.
 
 ---
 
