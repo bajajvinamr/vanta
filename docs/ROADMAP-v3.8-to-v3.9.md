@@ -149,8 +149,8 @@ Not:
 | **v3.9.0** | _design_ | **The router**: `/vanta <anything>` | One command flexes; all others routed |
 | **v3.9.1** | _design_ | Calm UX response discipline | None new |
 | **v3.9.2** | _design_ | Actionable session brief | None new |
-| **v3.9.3** | _design_ | Selective inline preview | One config flag, default "preview" |
-| **v3.9.4** | _design_ | Conversational undo foundation | "undo that" / "revert that" routed |
+| **v3.9.3** | _design_ | Action-object model + conversational undo + mid-flight re-route + stop | Reversibility backbone — must ship before v3.9.4 |
+| **v3.9.4** | _design_ | Selective inline preview (gated on v3.9.3) | One config flag, default "preview" |
 | **v3.9.5** | _design_ | Two-eyes escalation UX | None new |
 | **v3.9.6** | _design_ | Memory UX | None new |
 | **v3.9.7** | _design_ | Real-world burn-in (10 sessions) | None new |
@@ -269,6 +269,24 @@ C) Something else — tell me in your own words
 (I'd rather ask than guess wrong on something that matters.)
 ```
 
+#### Catch-all entry conditions (concrete thresholds)
+
+The router emits a normalized confidence score per intent (0..1) and a
+top-1 vs top-2 margin. A prompt routes to catch-all if **any** of:
+
+| Condition | Threshold | Rationale |
+|---|---|---|
+| Top-1 confidence | `< 0.55` | "Probably this" isn't enough when wrong-route can write files |
+| Top-1 vs top-2 margin | `< 0.10` | Two intents nearly tied → ASK |
+| Calibration data missing for this intent | (any) | A new intent rule with no ground truth defaults to catch-all until soak data accumulates |
+| Prompt matches the safety floor | (any) | Safety floor wins; never resolve via catch-all |
+
+These thresholds are tuned against the v3.8.2 soak report — not picked
+out of thin air. If real data shows 0.55 is too low (too many catch-all
+prompts that should have resolved), tighten via PR; if too high (too
+many wrong-routes that should have asked), loosen via PR. The
+thresholds themselves are versioned in `policy/router-thresholds.yaml`.
+
 Hard rule: any catch-all interaction emits a route-quality telemetry
 entry with `detected_intent: "uncertain"`. Soak report (§v3.8.2) flags
 top causes of catch-all so the rule table grows from real data, not
@@ -304,6 +322,16 @@ undo that                   -> conversational undo
 revert that                 -> conversational undo
 stop                        -> stop intent (cancel + report)
 wait, don't                 -> stop intent
+```
+
+Plus threshold tests (synthetic, fixtures-based — not user prompts):
+
+```text
+confidence=0.50, margin=0.20  -> catch-all (below confidence floor)
+confidence=0.70, margin=0.05  -> catch-all (margin too tight)
+confidence=0.70, margin=0.20  -> normal route (clears both bars)
+new-intent-rule, no calib     -> catch-all (no soak data yet)
+safety-floor match            -> safety-floor (never catch-all)
 ```
 
 ### Product metric (matters more than tests)
@@ -540,11 +568,43 @@ Vanta: [Vanta] Got it — switching to QA. Halting review, no changes
 ```
 
 If the in-flight route already wrote files or sent prompts, Vanta
-states the cleanup explicitly:
+states the cleanup explicitly. **Cost-honest language:** Vanta cannot
+guarantee an in-flight remote API call hasn't billed (the request may
+already be on the wire); never claim "no charge" preemptively. Instead:
 
 ```
 [Vanta] Halting review. I had already started a Codex review call —
-that's queued, no charge. Switching to /qa for the same diff.
+the request may have completed remotely, so it may still bill. I'll
+reconcile actual cost in telemetry next session start. Switching to
+/qa for the same diff now.
+```
+
+The cancellation-state tracker (in v3.9.3 action-object model) records
+each cancellation with `cancelled_locally: true, remote_status: unknown`
+and the next session's `vanta-status` startup checks reconciles
+against actual billing data from the `~/.vanta/cost.jsonl` log. If the
+call billed, the user sees it as a one-line note alongside the recovery
+prompt; if it didn't, the session start is silent.
+
+Cancellation-state schema added to the action-object model:
+
+```typescript
+interface VantaActionCancellation {
+  action_id: string;
+  cancelled_at: string;        // ISO timestamp
+  cancellation_kind:
+    | "user-initiated-stop"
+    | "user-initiated-reroute"
+    | "user-initiated-undo";
+  in_flight_remote_call?: {
+    provider: "codex" | "gemini";
+    request_id: string;
+    cancelled_locally: true;
+    remote_status: "unknown" | "completed" | "aborted";  // updated on next session
+    estimated_cost_usd?: number;
+    actual_cost_usd?: number;   // filled by reconciliation
+  };
+}
 ```
 
 ### Stop intent (cleanly named, separate from undo)
