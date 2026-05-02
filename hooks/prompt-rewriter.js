@@ -131,6 +131,32 @@ process.stdin.on('end', () => {
     return _empty();
   }
 
+  // v3.8.2 hidden observability — write a route-quality entry on every
+  // prompt that hit the executor. Two streams:
+  //   1. route-quality.jsonl — one entry per decide() call (the routing
+  //      snapshot); later_undo / user_followed_route fields backfilled
+  //      by undo + sync over the decision_id.
+  //   2. manual-recalls.jsonl — only if the prompt started with a
+  //      non-/vanta slash command (user bypassed routing).
+  // Best-effort, never blocks. Both writers are no-ops if their module
+  // is unavailable.
+  _logRouteQuality({
+    decision_id: decision.decision_id,
+    prompt,
+    detected_intent: decision.intent,
+    confidence: decision.confidence,
+    top1_top2_margin: decision.top1_top2_margin,
+    n_candidates: decision.n_candidates,
+    suggested_route: decision.skill_route,
+    tier: decision.tier,
+    decision: decision.decision,
+    source: decision.source,
+    project,
+    session_id: sessionId,
+    ts: decision.ts,
+  });
+  _logManualRecall({ prompt, project, session_id: sessionId });
+
   // ── 1. ASK at T3 (safety-floor or rewriter-ask) — surface a single
   //       "/<route> recommended · T3 ASK · <why>" hint. Never inject a
   //       chain — the user must confirm before Vanta does anything.
@@ -195,5 +221,22 @@ function _logAction(entry) {
   try {
     const al = require(_resolveBin('vanta-action-log.js'));
     al.record(entry);
+  } catch { /* never block hook on logging failure */ }
+}
+
+// v3.8.2 — best-effort route-quality and recall writers. Resolved
+// lazily (matching the action-log + projects pattern); a missing
+// module degrades the hook to "rewrite without telemetry" rather than
+// breaking shadow injection.
+function _logRouteQuality(entry) {
+  try {
+    const rq = require(_resolveBin('vanta-route-quality.js'));
+    rq.recordRoute(entry);
+  } catch { /* never block hook on logging failure */ }
+}
+function _logManualRecall(entry) {
+  try {
+    const rq = require(_resolveBin('vanta-route-quality.js'));
+    rq.recordRecall(entry);
   } catch { /* never block hook on logging failure */ }
 }
