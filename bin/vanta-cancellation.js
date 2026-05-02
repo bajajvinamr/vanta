@@ -98,13 +98,19 @@ function record(entry) {
     const inflight = entry.in_flight_remote_call;
     if (!inflight.provider || !['codex', 'gemini', 'both'].includes(inflight.provider)) return false;
     if (!inflight.request_id || typeof inflight.request_id !== 'string') return false;
-    // Cost-honesty: cancelled_locally is always true at record time
-    // (the local executor halted). remote_status starts 'unknown'.
+    // Cost-honesty contract (council R1 P2 fix, both-confirmed):
+    // record() is the ONLY entry point that creates a cancellation;
+    // remote_status MUST start 'unknown' regardless of what the
+    // caller supplied. Allowing caller-supplied 'completed' or
+    // 'aborted' would let the contract be bypassed (a buggy caller
+    // could persist a misleadingly certain status before the actual
+    // remote call finished). The only path that can flip
+    // remote_status is reconcile().
     out.in_flight_remote_call = {
       provider: inflight.provider,
       request_id: inflight.request_id,
       cancelled_locally: true,
-      remote_status: REMOTE_STATUSES.includes(inflight.remote_status) ? inflight.remote_status : 'unknown',
+      remote_status: 'unknown',
       estimated_cost_usd: typeof inflight.estimated_cost_usd === 'number' ? inflight.estimated_cost_usd : null,
       actual_cost_usd: null,  // filled by reconcile() on next session
     };
@@ -119,20 +125,37 @@ function record(entry) {
   }
 }
 
-// Read all cancellations across live + .bak.<ts>. Returns parsed
-// entries, dedupe by (action_id, cancelled_at) — same action can
-// be re-cancelled after a re-route, but that's a separate ts.
+// Read all cancellations across live + .bak.<ts>. Council R1 P1 fix
+// (Codex+Gemini both-confirmed): the prior implementation pushed every
+// line without dedup, so reconciliation entries left the original
+// 'unknown' rows visible forever AND repeated stop+undo of the same
+// action returned both rows (doubling estimated cost in
+// summarizePending).
+//
+// Dedup key: action_id alone. The latest cancelled_at for a given
+// action_id wins (a reconciliation entry has a later ts than the
+// original record, so it supersedes). For tied ts (sub-millisecond
+// writes), append-order wins via `>=`. Reconciliation entries
+// (cancellation_kind='reconciliation') are sentinel writes that
+// override the original; readAll surfaces only the latest state per
+// action.
 function readAll() {
   const file = _file();
   if (!fs.existsSync(file) && !_anyBakFor(file)) return [];
   const raw = jsonl().readMergedJsonl(file);
-  const out = [];
+  const byActionId = new Map();
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
-    try { out.push(JSON.parse(t)); } catch { /* torn */ }
+    let e;
+    try { e = JSON.parse(t); } catch { continue; /* torn */ }
+    if (!e || !e.action_id) continue;
+    const prior = byActionId.get(e.action_id);
+    if (!prior || (e.cancelled_at || '') >= (prior.cancelled_at || '')) {
+      byActionId.set(e.action_id, e);
+    }
   }
-  return out;
+  return [...byActionId.values()];
 }
 
 function _anyBakFor(file) {

@@ -136,11 +136,26 @@ function handle({ project, session, prompt }) {
     }
   }
 
-  // Transition lifecycle
+  // Transition lifecycle with CAS (council R1 P1 fix). The expected
+  // state is 'pending' — _findInFlight returned a pending action; if
+  // another session beat us to it (transitioned to applied or
+  // rolled_back), the CAS throws and we report a clean conflict
+  // signal rather than over-writing the peer's transition.
   let updated = null;
   try {
-    updated = a.updateLifecycle(inflight.id, nextLifecycle, { reason: 'user-initiated-stop' });
+    updated = a.updateLifecycle(inflight.id, nextLifecycle, {
+      reason: 'user-initiated-stop',
+      expectedState: 'pending',
+    });
   } catch (err) {
+    if (err && err.code === 'CAS_FAILED') {
+      return {
+        halted: false,
+        reason: 'concurrent-conflict',
+        error: err.message,
+        message: `[Vanta] Another session has already handled this action (it's now "${err.actual_state}"). Nothing left to halt.`,
+      };
+    }
     return {
       halted: false,
       reason: 'lifecycle-update-failed',

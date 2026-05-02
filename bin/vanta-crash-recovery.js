@@ -30,7 +30,7 @@
 const path = require('path');
 const os = require('os');
 
-let _action, _cancellation;
+let _action, _cancellation, _safe;
 function action() {
   if (_action) return _action;
   for (const p of [
@@ -50,6 +50,16 @@ function cancellation() {
     try { _cancellation = require(p); return _cancellation; } catch (_) { /* try next */ }
   }
   throw new Error('vanta-cancellation.js not resolvable');
+}
+function safeMode() {
+  if (_safe) return _safe;
+  for (const p of [
+    path.join(__dirname, 'vanta-safe-mode.js'),
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-safe-mode.js'),
+  ]) {
+    try { _safe = require(p); return _safe; } catch (_) { /* try next */ }
+  }
+  return null;  // safe-mode is optional; recovery still works without it
 }
 
 // "Stale" = pending or applied for longer than this without lifecycle
@@ -84,7 +94,13 @@ function _findStaleActions(project, now) {
   const all = action().readActions(project ? { project } : {});
   const cutoff = new Date(now - STALE_MS).toISOString();
   return all.filter(a => {
-    if (a.lifecycle !== 'pending' && a.lifecycle !== 'applied') return false;
+    // Council R1 P1 fix (Gemini): `applied` is the terminal success
+    // state for a VantaAction. Flagging applied actions older than
+    // STALE_MS as stale would surface every successful action from
+    // every prior session forever — an infinite recovery prompt loop
+    // that destroys the Calm Operator UX. Only `pending` is genuinely
+    // stuck (the executor never closed it cleanly).
+    if (a.lifecycle !== 'pending') return false;
     if (!a.ts) return false;
     return a.ts < cutoff;
   });
@@ -122,17 +138,26 @@ function renderBrief({ project = null } = {}) {
     if (pendingMsg) lines.push(`  · ${pendingMsg.message}`);
   }
 
-  lines.push('Options: A) accept B) re-run C) skip / abandon');
-
-  // Generate per-action option specs the hook can present as a real
-  // ASK if the user engages with the brief.
+  // Council R1 P3 fix (Gemini): in safe mode, "re-run" implies
+  // re-firing potentially-risky operations (council, memory promotion)
+  // that safe mode has explicitly disabled. Hide the rerun option when
+  // safe mode is active — accept and skip remain available.
+  const safeActive = !!(safeMode() && project && safeMode().isActive(project));
   const options = [
-    { label: 'Accept the partial state',     kind: 'accept' },
-    { label: 'Re-run the affected actions',  kind: 'rerun' },
-    { label: 'Skip / abandon',               kind: 'skip'   },
+    { label: 'Accept the partial state', kind: 'accept' },
   ];
+  if (!safeActive) {
+    options.push({ label: 'Re-run the affected actions', kind: 'rerun' });
+  }
+  options.push({ label: 'Skip / abandon', kind: 'skip' });
 
-  return { show: true, lines, options, scan_result: result };
+  if (safeActive) {
+    lines.push('Options: A) accept C) skip / abandon  (re-run hidden — safe mode is on)');
+  } else {
+    lines.push('Options: A) accept B) re-run C) skip / abandon');
+  }
+
+  return { show: true, lines, options, scan_result: result, safe_mode_active: safeActive };
 }
 
 function _humanizeKind(k) {

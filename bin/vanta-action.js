@@ -44,13 +44,22 @@ const crypto = require('crypto');
 
 const LIFECYCLE_STATES = Object.freeze(['pending', 'applied', 'rolled_back', 'rollback_failed']);
 const CONFIDENCE_STATES = Object.freeze(['done', 'likely-done', 'blocked', 'risky']);
+// Council R1 P2 fix (Codex): include the kinds vanta-undo.js already
+// handles (`file-delete`, `git-commit`, `autonomy-promote`). Without
+// this, any future v3.9.x consumer that creates a VantaAction for one
+// of these kinds is rejected by validateAction. The existing undo
+// handler in bin/vanta-undo.js stays the source of truth for those
+// reversal mechanisms; the new action module just declares them as
+// valid kinds so the schema covers the full reversible surface.
 const ACTION_KINDS = Object.freeze([
   'prompt_rewrite', 'route_decision', 'file_edit',
   'command', 'memory_promotion', 'council_call',
+  'file_delete', 'git_commit', 'autonomy_promote',
 ]);
 const INVERSE_KINDS = Object.freeze([
   'file_edit', 'memory_promotion', 'command',
   'prompt_rewrite', 'council_call',
+  'file_delete', 'git_commit', 'autonomy_promote',
 ]);
 
 function _vantaDir() {
@@ -68,6 +77,40 @@ function jsonl() {
     try { _jsonl = require(p); return _jsonl; } catch (_) { /* try next */ }
   }
   throw new Error('vanta-jsonl.js not resolvable');
+}
+
+// Council R1 P2 fix (both-confirmed): reuse v3.8.2 redactor on
+// PromptRewriteInverse.original_prompt. Without sharing this, the
+// v3.9.0 ledger would silently regress v3.8.2's secret-redaction
+// contract — a user pastes an API key into a prompt that triggers
+// a rewrite, the key persists verbatim in actions.jsonl, and the
+// soak report later surfaces it. Lazy-loaded so the action module
+// degrades gracefully if route-quality is unavailable.
+let _redactor;
+function redactSecrets(s) {
+  if (!_redactor) {
+    for (const p of [
+      path.join(__dirname, 'vanta-route-quality.js'),
+      path.join(os.homedir(), '.claude', 'bin', 'vanta-route-quality.js'),
+    ]) {
+      try {
+        const m = require(p);
+        if (typeof m.redactSecrets === 'function') {
+          _redactor = m.redactSecrets;
+          break;
+        }
+      } catch (_) { /* try next */ }
+    }
+    if (!_redactor) {
+      // Degraded: pass-through. Better than crash; logged as warning
+      // via stderr so the operator notices.
+      try {
+        process.stderr.write('[vanta-action] WARN: redactor unavailable; original_prompt persisted unredacted\n');
+      } catch (_) { /* never let logging break */ }
+      _redactor = (text) => ({ text: String(text || ''), redacted: false });
+    }
+  }
+  return _redactor(s);
 }
 
 // Generate a fresh action id. 12 hex chars = 2.8e14 collision space —
@@ -142,6 +185,27 @@ function _validateInverseShape(inv) {
         throw new Error('CouncilCallInverse.remote_status: invalid');
       }
       break;
+    // Council R1 P2 fix (Codex): bring the existing vanta-undo.js
+    // reversal mechanisms into the schema. The actual rollback logic
+    // continues to live in vanta-undo.js — these validators just
+    // accept the shape so v3.9.x callers can persist these kinds.
+    case 'file_delete':
+      // payload: { path, content_b64 } — path required so the undoer
+      // knows where to restore; content_b64 may be empty if the file
+      // was deleted before its content was preserved (rollback_failed
+      // flow).
+      if (typeof inv.path !== 'string') throw new Error('FileDeleteInverse.path required');
+      break;
+    case 'git_commit':
+      // payload: { sha } — the commit to revert.
+      if (typeof inv.sha !== 'string' || inv.sha.length < 4) throw new Error('GitCommitInverse.sha required');
+      break;
+    case 'autonomy_promote':
+      // payload: { repo, prior_level, new_level } — restore prior_level on undo.
+      if (typeof inv.repo !== 'string') throw new Error('AutonomyPromoteInverse.repo required');
+      if (typeof inv.prior_level === 'undefined') throw new Error('AutonomyPromoteInverse.prior_level required');
+      if (typeof inv.new_level === 'undefined') throw new Error('AutonomyPromoteInverse.new_level required');
+      break;
   }
 }
 
@@ -161,12 +225,20 @@ function createAction({
   session,
   why,
 }) {
+  // Council R1 P2 fix (both-confirmed): redact secrets in
+  // PromptRewriteInverse.original_prompt before persisting. Mutate a
+  // copy of the inverse so the caller's reference is untouched.
+  let safeInverse = inverse || null;
+  if (safeInverse && safeInverse.kind === 'prompt_rewrite' && typeof safeInverse.original_prompt === 'string') {
+    const r = redactSecrets(safeInverse.original_prompt);
+    safeInverse = { ...safeInverse, original_prompt: r.text, original_prompt_redacted: r.redacted };
+  }
   const a = {
     id: newActionId(),
     kind,
     lifecycle: 'pending',
-    reversible: reversible == null ? !!inverse : !!reversible,
-    inverse: inverse || null,
+    reversible: reversible == null ? !!safeInverse : !!reversible,
+    inverse: safeInverse,
     affected_files: Array.isArray(affected_files) ? affected_files.slice() : null,
     detected_intent: detected_intent || null,
     current_route: current_route || null,
@@ -250,22 +322,38 @@ function findRecentReversible({ project, limit = 5, since = null } = {}) {
     .slice(0, limit);
 }
 
-// Update a known action's lifecycle. Writes a new line with the new
-// state; the reader's id-dedupe will surface the latest.
-function updateLifecycle(actionId, nextState, { reason } = {}) {
+// Update a known action's lifecycle with optional compare-and-swap.
+//
+// Council R1 P1 fix (Codex P1 / Gemini P2, both-confirmed): without
+// CAS, two sessions racing on the same action can both read its
+// current lifecycle, both apply the inverse, and both append a
+// terminal state — running side effects (process.kill, cleanup
+// commands) twice. Pass `expectedState` to gate the transition: if
+// the action's current lifecycle differs, throw, and the caller
+// (undo handler / stop handler) treats it as a concurrent-conflict
+// signal — abort, the other session is handling it.
+//
+// expectedState is OPTIONAL for back-compat. Crash-recovery dispatch
+// uses it freely; intent handlers MUST pass it before applying any
+// inverse with side effects.
+function updateLifecycle(actionId, nextState, { reason, expectedState } = {}) {
   if (!LIFECYCLE_STATES.includes(nextState)) {
     throw new Error(`updateLifecycle: invalid state "${nextState}"`);
   }
-  // Read the most recent version of this action.
   const all = readActions();
   const cur = all.find(e => e.id === actionId);
   if (!cur) {
     throw new Error(`updateLifecycle: action "${actionId}" not found`);
   }
-  // Lifecycle transitions are append-only; we don't gate them here
-  // (that's the handler's job). pending → applied → rolled_back is
-  // expected; pending → rollback_failed is also valid (action that
-  // never applied cleanly).
+  if (expectedState && cur.lifecycle !== expectedState) {
+    const e = new Error(
+      `updateLifecycle: CAS failed — action "${actionId}" lifecycle is "${cur.lifecycle}", expected "${expectedState}"`,
+    );
+    e.code = 'CAS_FAILED';
+    e.actual_state = cur.lifecycle;
+    e.expected_state = expectedState;
+    throw e;
+  }
   const next = {
     ...cur,
     lifecycle: nextState,

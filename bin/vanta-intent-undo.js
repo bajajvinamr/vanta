@@ -186,20 +186,31 @@ function applyInverse(act) {
 // reversed via "write before_content directly" rather than patch
 // application; the inverse can carry either the patch or a
 // `before_content` field. This module handles both.
+// Council R1 P2 fix (Codex): TOCTOU between SHA check and write.
+// Mitigation: read + verify SHA + write via atomic temp + rename under
+// a single best-effort sequence. Atomic rename is the strongest
+// guarantee Node ships without an external lock; we add a re-verify
+// AFTER reading via O_RDONLY but BEFORE writing the temp, then rename
+// in. If a concurrent writer modifies between our read and rename, the
+// rename still atomically replaces the file — the user gets a fresh
+// pre-image but loses a concurrent edit. Document that explicitly so
+// the failure mode is visible.
+//
+// A true cross-process file lock (flock-style) is left for v3.9.x —
+// the action surface is small enough that the user-driven undo race
+// is rare in practice; the SHA re-verify catches the dominant case
+// (external editor saved the file mid-undo).
 function _undoFileEdit(act) {
   const inv = act.inverse;
   const target = inv.target_path;
   if (!target) {
     return _failRollback(act, 'no-target-path', 'No target_path in FileEditInverse.');
   }
-  let exists = fs.existsSync(target);
+  const exists = fs.existsSync(target);
   if (!exists && inv.before_sha === _emptyShaCorrespondingTo(inv)) {
-    // Edge: file was created in the original action and is gone now —
-    // nothing to revert.
     return _completeRollback(act, `File ${target} already absent — no revert needed.`);
   }
-  // Verify current file SHA matches after_sha (i.e. nothing else
-  // touched it since the original edit).
+  // First SHA check — gate before doing any write.
   if (exists) {
     const current = fs.readFileSync(target);
     const currentSha = _sha256(current);
@@ -208,23 +219,33 @@ function _undoFileEdit(act) {
         `${target} changed externally since the edit (SHA ${currentSha.slice(0, 8)} vs expected ${inv.after_sha.slice(0, 8)}). Refusing to overwrite — manual review needed.`);
     }
   }
-  // Apply reverse. Prefer `before_content` if the inverse carries it
-  // verbatim; otherwise reverse-apply the patch.
+  // Apply reverse via atomic temp + rename. Re-verify SHA BEFORE the
+  // rename to catch a writer that snuck in between the first check
+  // and the temp write.
   try {
-    if (typeof inv.before_content === 'string') {
-      fs.writeFileSync(target, inv.before_content);
-    } else if (typeof inv.patch === 'string' && inv.patch) {
-      // Naive reverse-patch: this MVP only supports inverses that
-      // carry `before_content`. A patch-only inverse without before
-      // content is an undoable signal but the v3.9.0 implementation
-      // surfaces it as rollback_failed with a manual-cleanup note.
-      // Real reverse-patch parsing is deferred to v3.9.x.
-      return _failRollback(act, 'patch-only-not-yet-supported',
-        'FileEditInverse carries patch only (no before_content). Re-apply manually or write the inverse with before_content for now.');
-    } else {
+    if (typeof inv.before_content !== 'string') {
+      if (typeof inv.patch === 'string' && inv.patch) {
+        return _failRollback(act, 'patch-only-not-yet-supported',
+          'FileEditInverse carries patch only (no before_content). Re-apply manually or write the inverse with before_content.');
+      }
       return _failRollback(act, 'no-revert-payload',
         'FileEditInverse has neither before_content nor patch.');
     }
+    const tmpPath = target + '.vanta-undo.' + process.pid + '.' + Date.now();
+    fs.writeFileSync(tmpPath, inv.before_content);
+    // Re-verify under retry: if another writer raced us, decline the
+    // rename rather than clobber.
+    if (exists) {
+      let raceSha;
+      try { raceSha = _sha256(fs.readFileSync(target)); }
+      catch (_) { raceSha = null; }
+      if (raceSha && raceSha !== inv.after_sha) {
+        try { fs.unlinkSync(tmpPath); } catch (_) { /* ignore */ }
+        return _failRollback(act, 'race-detected',
+          `${target} mutated during undo (TOCTOU race). Refusing to clobber — manual review needed.`);
+      }
+    }
+    fs.renameSync(tmpPath, target);
   } catch (err) {
     return _failRollback(act, 'write-failed', `Write failed: ${err.message || String(err)}`);
   }
@@ -316,14 +337,36 @@ function _undoCouncilCall(act) {
     `Council call discarded locally. The remote request may have completed (${cost}); reconciled next session.`);
 }
 
+// Council R1 P1 fix: CAS the lifecycle transition to prevent two
+// sessions from both applying the inverse to the same action. If the
+// CAS fails, the peer session has already rolled back; the inverse we
+// just applied was a no-op or a duplicate. Surface this as a soft
+// failure so the user knows something raced.
 function _completeRollback(act, message) {
-  try { action().updateLifecycle(act.id, 'rolled_back', { reason: 'user-initiated-undo' }); }
-  catch (_) { /* the rollback succeeded mechanically; lifecycle update best-effort */ }
+  try {
+    action().updateLifecycle(act.id, 'rolled_back', {
+      reason: 'user-initiated-undo',
+      expectedState: 'applied',
+    });
+  } catch (err) {
+    if (err && err.code === 'CAS_FAILED') {
+      return {
+        ok: false, action_id: act.id, kind: act.inverse && act.inverse.kind,
+        reason: 'concurrent-undo',
+        message: `[Vanta] Another session has already handled this action (state is now "${err.actual_state}"). The inverse may have been applied twice — please review ${(act.affected_files || []).join(', ') || 'the affected files'} manually.`,
+      };
+    }
+    /* the rollback succeeded mechanically; lifecycle update best-effort otherwise */
+  }
   return { ok: true, action_id: act.id, kind: act.inverse.kind, message: `[Vanta] ${message}` };
 }
 function _failRollback(act, reason, why) {
-  try { action().updateLifecycle(act.id, 'rollback_failed', { reason: `undo-failed:${reason}` }); }
-  catch (_) { /* best-effort */ }
+  try {
+    action().updateLifecycle(act.id, 'rollback_failed', {
+      reason: `undo-failed:${reason}`,
+      expectedState: 'applied',
+    });
+  } catch (_) { /* best-effort: rollback already failed; lifecycle is icing on the cake */ }
   return { ok: false, action_id: act.id, kind: act.inverse && act.inverse.kind, reason, message: `[Vanta risky] ${why}` };
 }
 

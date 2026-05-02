@@ -204,17 +204,26 @@ function _humanizeKind(k) {
 }
 
 // Find the prompt that triggered the (now-halted) wrong route. The
-// most recent prompt_rewrite or route_decision in this project before
-// the halted action is our best signal. Returns null if nothing useful.
+// most recent prompt_rewrite predating the halt — same project AND
+// SAME SESSION (council R1 P3 both-confirmed: cross-tab contamination
+// is real if two terminals are open in the same project).
+//
+// Returns null if nothing useful. Future v3.9.x can add a
+// `parent_action_id` link on routed actions for stronger causal
+// linkage; for v3.9.0 the (project, session) tuple plus ts ordering
+// is the best we have.
 function _findOriginalContext(project, haltedActionId) {
   if (!haltedActionId) return null;
   try {
     const halted = action().findById(haltedActionId);
     if (!halted) return null;
-    // Look for a recent prompt_rewrite predating the halt.
     const recent = action().readActions({ project }).filter(a =>
       a.kind === 'prompt_rewrite' &&
       a.id !== haltedActionId &&
+      // Council R1 P3 fix: filter by session so two parallel terminal
+      // tabs in the same project can't cross-contaminate each other's
+      // re-route context.
+      a.session === halted.session &&
       (a.ts || '') <= (halted.ts || ''),
     );
     if (recent.length === 0) return null;

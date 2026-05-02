@@ -120,6 +120,56 @@ describe('v3.9.0 — VantaAction schema', () => {
     });
   });
 
+  test('updateLifecycle CAS guard rejects mismatched expectedState (R1 P1 both)', () => {
+    _withDir(() => {
+      const a = va.createAction({
+        kind: 'prompt_rewrite',
+        inverse: { kind: 'prompt_rewrite', original_prompt: 'fix' },
+        project: 'cas', session: 's',
+      });
+      va.persistAction(a);
+      // Action is currently 'pending' — try to CAS from 'applied' should fail
+      assert.throws(() => {
+        va.updateLifecycle(a.id, 'rolled_back', { expectedState: 'applied' });
+      }, (err) => err.code === 'CAS_FAILED' && err.actual_state === 'pending');
+      // The action's lifecycle must NOT have changed
+      assert.equal(va.findById(a.id).lifecycle, 'pending');
+    });
+  });
+
+  test('updateLifecycle CAS guard accepts matching expectedState', () => {
+    _withDir(() => {
+      const a = va.createAction({
+        kind: 'prompt_rewrite',
+        inverse: { kind: 'prompt_rewrite', original_prompt: 'fix' },
+        project: 'cas-ok', session: 's',
+      });
+      va.persistAction(a);
+      va.updateLifecycle(a.id, 'applied', { expectedState: 'pending' });
+      va.updateLifecycle(a.id, 'rolled_back', { expectedState: 'applied' });
+      assert.equal(va.findById(a.id).lifecycle, 'rolled_back');
+    });
+  });
+
+  test('PromptRewriteInverse redacts secrets (R1 P2 both)', () => {
+    _withDir(() => {
+      const a = va.createAction({
+        kind: 'prompt_rewrite',
+        inverse: { kind: 'prompt_rewrite', original_prompt: 'use sk-AbCdEfGhIjKlMnOpQrStUvWxYz12345678 for the API' },
+        project: 'red', session: 's',
+      });
+      assert.ok(!a.inverse.original_prompt.includes('sk-AbCd'),
+        'API key must be redacted in PromptRewriteInverse.original_prompt');
+      assert.equal(a.inverse.original_prompt_redacted, true);
+    });
+  });
+
+  test('Schema includes file_delete / git_commit / autonomy_promote kinds (R1 P2 Codex)', () => {
+    assert.ok(va.ACTION_KINDS.includes('file_delete'));
+    assert.ok(va.ACTION_KINDS.includes('git_commit'));
+    assert.ok(va.ACTION_KINDS.includes('autonomy_promote'));
+  });
+
   test('readActions filters out non-VantaAction action-log entries', () => {
     _withDir(dir => {
       // Synthetic action-log entry without `kind` (the v3.8.x shape)
@@ -176,6 +226,56 @@ describe('v3.9.0 — cancellation tracker', () => {
       });
       const all = cancel.readAll();
       assert.equal(all[0].in_flight_remote_call.cancelled_locally, true);
+    });
+  });
+
+  test('remote_status is hardcoded "unknown" at record time (R1 P2 both)', () => {
+    _withDir(() => {
+      // Caller tries to lie about remote completion
+      cancel.record({
+        action_id: 'liar',
+        cancellation_kind: 'user-initiated-stop',
+        in_flight_remote_call: { provider: 'codex', request_id: 'r', remote_status: 'completed' },
+      });
+      const all = cancel.readAll();
+      assert.equal(all[0].in_flight_remote_call.remote_status, 'unknown',
+        'cost-honesty contract: caller-supplied remote_status MUST be ignored');
+    });
+  });
+
+  test('reconcile supersedes the original cancellation (R1 P1 both)', () => {
+    _withDir(() => {
+      cancel.record({
+        action_id: 'rec-1',
+        cancellation_kind: 'user-initiated-stop',
+        in_flight_remote_call: { provider: 'codex', request_id: 'r', estimated_cost_usd: 0.18 },
+      });
+      assert.equal(cancel.findPendingReconciliation().length, 1);
+      cancel.reconcile('rec-1', { remote_status: 'completed', actual_cost_usd: 0.20 });
+      // After reconcile, the action should NOT appear in pending
+      // reconciliation any more — readAll dedupes by action_id and the
+      // reconciliation entry's remote_status='completed' supersedes
+      // the original 'unknown'.
+      assert.equal(cancel.findPendingReconciliation().length, 0,
+        'reconciled action must clear from pending');
+    });
+  });
+
+  test('readAll dedupes by action_id (R1 P1 Gemini)', () => {
+    _withDir(() => {
+      // Same action cancelled twice (e.g. stop + later undo)
+      cancel.record({
+        action_id: 'dup',
+        cancellation_kind: 'user-initiated-stop',
+        in_flight_remote_call: { provider: 'codex', request_id: 'r', estimated_cost_usd: 0.18 },
+      });
+      cancel.record({
+        action_id: 'dup',
+        cancellation_kind: 'user-initiated-undo',
+        in_flight_remote_call: { provider: 'codex', request_id: 'r', estimated_cost_usd: 0.18 },
+      });
+      const all = cancel.readAll();
+      assert.equal(all.length, 1, 'readAll must dedupe — same action_id appears once');
     });
   });
 
@@ -431,6 +531,23 @@ describe('v3.9.0 — crash recovery', () => {
     });
   });
 
+  test('applied lifecycle is NOT flagged as stale (R1 P1 Gemini)', () => {
+    _withDir(() => {
+      // Plant an applied action older than STALE_MS — must NOT be flagged.
+      const old = va.createAction({
+        kind: 'prompt_rewrite',
+        inverse: { kind: 'prompt_rewrite', original_prompt: 'fix' },
+        project: 'cr-applied', session: 's',
+      });
+      old.ts = new Date(Date.now() - 7200 * 1000).toISOString();
+      old.lifecycle = 'applied';
+      va.persistAction(old);
+      const r = recovery.scan({ project: 'cr-applied' });
+      assert.equal(r.stale_actions.length, 0,
+        'applied is the terminal success state — must NOT trigger crash recovery');
+    });
+  });
+
   test('stale pending action → brief surfaces it', () => {
     _withDir(() => {
       const stale = va.createAction({
@@ -617,6 +734,69 @@ describe('v3.9.0 — integration scenarios', () => {
       const eff = safe.effective('crash-sm');
       assert.equal(eff.council, 'off');
       assert.equal(eff.ambient, 'off');
+      // R1 P3 fix (Gemini): rerun option must be hidden when safe mode is on
+      assert.equal(b.safe_mode_active, true);
+      assert.ok(!b.options.some(o => o.kind === 'rerun'),
+        'rerun option must be hidden in safe mode');
+      assert.ok(b.options.some(o => o.kind === 'accept'));
+      assert.ok(b.options.some(o => o.kind === 'skip'));
+    });
+  });
+
+  test('re-route does NOT cross-contaminate sessions (R1 P3 both)', () => {
+    _withDir(() => {
+      // Two sessions in the same project, each with their own
+      // prompt_rewrite. The re-route in session A must pull session
+      // A's original prompt, not session B's.
+      const aRewrite = va.createAction({
+        kind: 'prompt_rewrite',
+        inverse: { kind: 'prompt_rewrite', original_prompt: 'review the auth diff' },
+        project: 'cross-tab', session: 'A',
+      });
+      va.persistAction(aRewrite); va.updateLifecycle(aRewrite.id, 'applied', { expectedState: 'pending' });
+      const bRewrite = va.createAction({
+        kind: 'prompt_rewrite',
+        inverse: { kind: 'prompt_rewrite', original_prompt: 'review the payments diff' },
+        project: 'cross-tab', session: 'B',
+      });
+      va.persistAction(bRewrite); va.updateLifecycle(bRewrite.id, 'applied', { expectedState: 'pending' });
+      const aCouncil = va.createAction({
+        kind: 'council_call',
+        inverse: { kind: 'council_call', request_id: 'A-r', cancelled_locally: false, remote_status: 'unknown' },
+        project: 'cross-tab', session: 'A',
+      });
+      va.persistAction(aCouncil);
+      const r = reroute.handle({ project: 'cross-tab', session: 'A', prompt: 'no, I meant test it' });
+      assert.equal(r.kind, 'apply');
+      assert.equal(r.original_context.original_prompt, 'review the auth diff',
+        'session A re-route must pull session A original prompt, not session B');
+    });
+  });
+
+  test('cost-honesty contract end-to-end: no message contains "no charge" (R1 P4 Gemini)', () => {
+    _withDir(() => {
+      // Fire stop with council in flight
+      const a = va.createAction({
+        kind: 'council_call',
+        inverse: { kind: 'council_call', request_id: 'r', cancelled_locally: false, remote_status: 'unknown', estimated_cost_usd: 0.18 },
+        project: 'cost', session: 's',
+      });
+      va.persistAction(a);
+      const stopR = stop.handle({ project: 'cost', session: 's', prompt: 'stop' });
+      // Fire reroute with another council in flight
+      const b = va.createAction({
+        kind: 'council_call',
+        inverse: { kind: 'council_call', request_id: 'r2', cancelled_locally: false, remote_status: 'unknown', estimated_cost_usd: 0.25 },
+        project: 'cost-rr', session: 's',
+      });
+      va.persistAction(b);
+      const rerR = reroute.handle({ project: 'cost-rr', session: 's', prompt: 'no, I meant test it' });
+
+      const banned = /\b(free|no charge)\b/i;
+      for (const msg of [stopR.message, rerR.message]) {
+        assert.ok(!banned.test(msg),
+          `cost-honesty violation in user message: ${msg}`);
+      }
     });
   });
 });
