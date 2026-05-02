@@ -365,7 +365,22 @@ function _formatChain(_original, rule) {
   return steps.map((s, i) => `${i + 1}. ${s}`).join('\n');
 }
 
-module.exports = { rewrite, RULES, _isPassthrough };
+// v3.8.2 hidden observability — count how many RULES could have fired
+// for a given prompt. The current rewriter is winner-takes-priority
+// (first match in priority order wins); when N >= 2, the executor's
+// `top1_top2_margin` shrinks proportionally and the soak report flags
+// the prompt as ambiguous. Pure helper — no side effects, safe for
+// `--explain` to call without poisoning telemetry.
+function candidatesFor(prompt) {
+  if (!prompt || typeof prompt !== 'string') return [];
+  const matches = [];
+  for (const r of RULES) {
+    if (r.rx.test(prompt)) matches.push({ id: r.id, intent: r.intent });
+  }
+  return matches;
+}
+
+module.exports = { rewrite, RULES, _isPassthrough, candidatesFor };
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 //   echo "fix the bug" | vanta-rewriter

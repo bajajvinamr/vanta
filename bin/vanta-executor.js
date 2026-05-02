@@ -611,6 +611,26 @@ function decide(input = {}) {
 }
 
 function _make(ctx, ts, decision_id, d) {
+  // v3.8.2 — `n_candidates` and `top1_top2_margin` are computed lazily
+  // here from rewriter.candidatesFor() so every code path that returns
+  // through _make picks them up. Safety-floor / kill-switch / passthrough
+  // all flow through one funnel; one place to compute means one place
+  // to keep honest. Margin = 1 / N_candidates (winner-takes-priority);
+  // when only one rule could fire, margin is 1.0 (clean signal).
+  // Empty prompt → margin 1.0, n_candidates 0 (deterministic flows like
+  // tool-only PreToolUse decisions never hit the rewriter).
+  let n_candidates = 0;
+  let top1_top2_margin = 1.0;
+  if (ctx.prompt) {
+    try {
+      const rw = rewriter();
+      if (rw && typeof rw.candidatesFor === 'function') {
+        const cands = rw.candidatesFor(ctx.prompt);
+        n_candidates = cands.length;
+        if (n_candidates >= 2) top1_top2_margin = 1 / n_candidates;
+      }
+    } catch (_) { /* never let observability break the executor */ }
+  }
   return {
     decision_id,
     ts,
@@ -631,6 +651,8 @@ function _make(ctx, ts, decision_id, d) {
     uncertainty: d.uncertainty || null,
     two_eyes:    d.two_eyes === true,
     inline_ready: d.inline_ready === true,
+    n_candidates,
+    top1_top2_margin,
     budget_ms:   BUDGET_MS[d.tier] || BUDGET_MS.T0,
     why:         d.why || '',
     confidence:  d.confidence || 'high',
@@ -645,17 +667,58 @@ function _make(ctx, ts, decision_id, d) {
   };
 }
 
-module.exports = { decide, BUDGET_MS, SOURCES, invalidateTrustCache, _trustCacheSnapshot };
+// v3.8.2 — `--explain` mode renders a Decision in human-readable form
+// for "why did Vanta route there?" debugging. Pure formatter; no I/O,
+// no telemetry. Tests assert the schema; the CLI just prints what this
+// returns.
+function explain(decision) {
+  if (!decision || typeof decision !== 'object') return 'no decision';
+  const lines = [];
+  const truncate = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + '…' : s);
+  lines.push(`prompt:      ${truncate(decision.context && decision.context.prompt, 100) || '(empty)'}`);
+  lines.push(`intent:      ${decision.intent || '(none)'}`);
+  lines.push(`route:       ${decision.skill_route || '(none)'}`);
+  const tierWhy = decision.floor
+    ? `safety-floor:${decision.floor.id}`
+    : (decision.rule_id ? `rule:${decision.rule_id}` : decision.source || 'risk-classifier');
+  lines.push(`tier:        ${decision.tier} · ${tierWhy}`);
+  lines.push(`decision:    ${decision.decision}`);
+  lines.push(`confidence:  ${decision.confidence}`);
+  const margin = typeof decision.top1_top2_margin === 'number'
+    ? decision.top1_top2_margin.toFixed(2)
+    : '1.00';
+  lines.push(`margin:      ${margin} (top-1 vs top-2 over ${decision.n_candidates || 0} candidates)`);
+  const sc = decision.score || {};
+  lines.push(`risk:        ${decision.risk}/10 · reversibility=${sc.reversibility}/5, blast=${sc.blast_radius}/5, product_authority=${sc.product_authority === true}`);
+  if (decision.floor) lines.push(`floor:       ${decision.floor.id} · ${decision.floor.why || ''}`);
+  if (decision.peer) lines.push(`peer:        ${typeof decision.peer === 'string' ? decision.peer : (decision.peer.peer || JSON.stringify(decision.peer))}`);
+  if (decision.escalation) lines.push(`escalation:  ${decision.escalation.why || ''}`);
+  lines.push(`why:         ${decision.why || ''}`);
+  lines.push(`budget_ms:   ${decision.budget_ms}`);
+  return lines.join('\n');
+}
+
+module.exports = { decide, explain, BUDGET_MS, SOURCES, invalidateTrustCache, _trustCacheSnapshot };
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 //   echo '{"prompt":"delete all users"}' | vanta-executor
 //   vanta-executor --prompt "ship this" --file src/api/auth.ts
+//   vanta-executor --explain "fix this"     ← v3.8.2 hidden observability
 if (require.main === module) {
   const args = process.argv.slice(2);
   const find = (flag) => {
     const i = args.indexOf(flag);
     return i >= 0 ? args[i + 1] : undefined;
   };
+  // v3.8.2: --explain takes the prompt as its arg-value, runs decide(),
+  // and prints the human-readable explanation. Targeted at <2s for any
+  // rule-path prompt; LLM fallback already capped via BUDGET_MS.
+  const explainPrompt = find('--explain');
+  if (explainPrompt !== undefined) {
+    const d = decide({ prompt: explainPrompt });
+    process.stdout.write(explain(d) + '\n');
+    process.exit(0);
+  }
   const flagInput = {
     prompt:    find('--prompt'),
     file_path: find('--file'),
