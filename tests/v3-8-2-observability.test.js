@@ -53,23 +53,31 @@ describe('v3.8.2 — executor Decision shape', () => {
     assert.equal(d.top1_top2_margin, 1.0);
   });
 
-  test('margin shrinks proportionally when multiple rules match', () => {
-    // Find a prompt that matches >=2 rules. We construct one
-    // synthetically based on RULES; if the corpus shifts, this test
-    // self-adjusts by picking a real overlapping prompt.
+  test('margin == 0.0 when multiple rules match (R1 council fix)', () => {
+    // R1 council both-flagged P2: the prior `1/N` formula could not
+    // trip the v3.9.1 catch-all `<0.10` threshold. Margin is now
+    // `n_candidates >= 2 ? 0.0 : 1.0`. When N >= 2 the rules are
+    // priority-ordered with no numeric scoring, so the top-1 vs top-2
+    // gap is structurally 0.
     let multi = null;
     for (const probe of ['ship and review this', 'review and ship this', 'fix and ship']) {
       if (rewriter.candidatesFor(probe).length >= 2) { multi = probe; break; }
     }
     if (!multi) {
-      // No multi-match in current rule set — skip honestly rather than
-      // fabricating a probe; the property is still asserted by the
-      // formula, and the single-match test above covers the path.
+      // Self-skipping if the rule corpus has no overlap probe.
       return;
     }
     const d = executor.decide({ prompt: multi });
     assert.ok(d.n_candidates >= 2);
-    assert.ok(d.top1_top2_margin <= 0.5 + 1e-9);
+    assert.equal(d.top1_top2_margin, 0.0,
+      'multi-rule overlap must produce margin=0 to feed v3.9.1 catch-all');
+    assert.ok(d.top1_top2_margin < 0.10, 'must trip the v3.9.1 <0.10 threshold');
+  });
+
+  test('rewriter_error present and null on healthy paths (R1 Codex P3)', () => {
+    const d = executor.decide({ prompt: 'fix this' });
+    assert.ok('rewriter_error' in d);
+    assert.equal(d.rewriter_error, null);
   });
 
   test('empty prompt → margin 1.0, n_candidates 0', () => {
@@ -151,18 +159,85 @@ describe('v3.8.2 — route-quality writer', () => {
     const lines = raw.split('\n').filter(Boolean);
     assert.equal(lines.length, 1);
     const entry = JSON.parse(lines[0]);
+    // R1 council fixes added prompt_redacted + rewriter_error fields.
     for (const field of [
-      'ts', 'decision_id', 'prompt', 'detected_intent', 'confidence',
-      'top1_top2_margin', 'n_candidates', 'suggested_route', 'tier',
-      'decision', 'source', 'user_followed_route',
-      'user_used_different_command', 'later_undo',
-      'later_manual_correction', 'session_ended_state', 'project', 'session_id',
+      'ts', 'decision_id', 'prompt', 'prompt_redacted', 'detected_intent',
+      'confidence', 'top1_top2_margin', 'n_candidates', 'suggested_route',
+      'tier', 'decision', 'source', 'rewriter_error',
+      'user_followed_route', 'user_used_different_command',
+      'later_undo', 'later_manual_correction', 'session_ended_state',
+      'project', 'session_id',
     ]) {
       assert.ok(field in entry, `route-quality entry missing "${field}"`);
     }
     assert.equal(entry.detected_intent, 'fix-bug');
     assert.equal(entry.confidence, 0.9, 'confidence string mapped to numeric 0.9');
     assert.equal(entry.suggested_route, '/investigate');
+    assert.equal(entry.prompt_redacted, false, 'clean prompt → not redacted');
+  });
+
+  test('recordRoute redacts common secret patterns (R1 Codex P2)', () => {
+    routeQuality.recordRoute({
+      prompt: 'fix this; my key is sk-AbCdEfGhIjKlMnOpQrStUvWxYz12345678',
+      detected_intent: 'fix-bug',
+      project: 'vanta',
+    });
+    const raw = fs.readFileSync(path.join(dir, 'route-quality.jsonl'), 'utf8');
+    const entry = JSON.parse(raw.split('\n').filter(Boolean)[0]);
+    assert.equal(entry.prompt_redacted, true);
+    assert.ok(!entry.prompt.includes('sk-AbCdEfGhIjKlMnOpQrStUvWxYz12345678'),
+      'raw API key must not survive in logged prompt');
+    assert.ok(entry.prompt.includes('[REDACTED]'),
+      'redaction marker should appear');
+  });
+
+  test('recordRoute redacts JWTs and bearer headers', () => {
+    routeQuality.recordRoute({
+      prompt: 'curl with Authorization: Bearer abc123def456ghi789',
+      detected_intent: 'unmatched',
+      project: 'vanta',
+    });
+    routeQuality.recordRoute({
+      prompt: 'use eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.signaturepart',
+      detected_intent: 'unmatched',
+      project: 'vanta',
+    });
+    const raw = fs.readFileSync(path.join(dir, 'route-quality.jsonl'), 'utf8');
+    const entries = raw.split('\n').filter(Boolean).map(JSON.parse);
+    for (const e of entries) {
+      assert.equal(e.prompt_redacted, true);
+      assert.ok(e.prompt.includes('[REDACTED]'));
+    }
+  });
+
+  test('recordRecall persists decision_id for v3.9.1 join (R1 both-confirmed)', () => {
+    routeQuality.recordRecall({
+      prompt: '/ship now',
+      project: 'vanta',
+      session_id: 'sess-x',
+      decision_id: 'dec-xyz789',
+    });
+    const raw = fs.readFileSync(path.join(dir, 'manual-recalls.jsonl'), 'utf8');
+    const entry = JSON.parse(raw.split('\n').filter(Boolean)[0]);
+    assert.equal(entry.decision_id, 'dec-xyz789',
+      'decision_id must be persisted to enable user_used_different_command backfill');
+    assert.ok('prompt_redacted' in entry, 'recalls also flag redaction');
+  });
+
+  test('detectRecall surfaces vanta-internal for /vanta-* debug commands (R1 Codex P3)', () => {
+    // Surface allowlist tightening: only the three promised commands
+    // are exempt. /vanta-status etc. are now classified as
+    // vanta-internal so the soak report can spot debug-only usage.
+    assert.deepEqual(routeQuality.detectRecall('/vanta-status'),
+      { surface: 'vanta-internal', command: 'vanta-status' });
+    assert.deepEqual(routeQuality.detectRecall('/vanta-undo'),
+      { surface: 'vanta-internal', command: 'vanta-undo' });
+    assert.deepEqual(routeQuality.detectRecall('/vanta-trust'),
+      { surface: 'vanta-internal', command: 'vanta-trust' });
+    // Three promised commands still exempt.
+    assert.equal(routeQuality.detectRecall('/vanta'), null);
+    assert.equal(routeQuality.detectRecall('/vanta-sync'), null);
+    assert.equal(routeQuality.detectRecall('/council'), null);
   });
 
   test('truncates oversized prompts in the entry', () => {
@@ -282,5 +357,81 @@ describe('v3.8.2 — soak report', () => {
     const md = soak.buildReport();
     // Should not throw, and should report 2 valid entries.
     assert.match(md, /Vanta-routed prompts: \*\*2\*\*/);
+  });
+
+  test('bypass rate uses recall/total denominator (R1 Codex P3)', () => {
+    // 10 routed prompts (recall is a subset) → bypass = 3/10 = 30%.
+    // The prior buggy denominator was 3/(10+3) = ~23%.
+    const now = new Date().toISOString();
+    fs.mkdirSync(dir, { recursive: true });
+    const route = path.join(dir, 'route-quality.jsonl');
+    const recall = path.join(dir, 'manual-recalls.jsonl');
+    let routeLines = '';
+    for (let i = 0; i < 10; i++) {
+      routeLines += '\n' + JSON.stringify({ ts: now, prompt: `p${i}`, detected_intent: 'fix-bug', confidence: 0.9, top1_top2_margin: 1.0 }) + '\n';
+    }
+    fs.writeFileSync(route, routeLines);
+    let recallLines = '';
+    for (let i = 0; i < 3; i++) {
+      recallLines += '\n' + JSON.stringify({ ts: now, prompt: '/ship', surface: 'gstack', command: 'ship' }) + '\n';
+    }
+    fs.writeFileSync(recall, recallLines);
+    const md = soak.buildReport();
+    assert.match(md, /\(30% bypass\)/, 'bypass rate must be recall/total = 30%, not 3/13 = 23%');
+  });
+});
+
+// ─── 5. Bak rotation pruning + concurrent-rotation safety ────────────
+
+describe('v3.8.2 — bak rotation', () => {
+  let dir, prevOverride;
+  beforeEach(() => {
+    dir = _tmpDir('rotate');
+    prevOverride = process.env.VANTA_DIR_OVERRIDE;
+    process.env.VANTA_DIR_OVERRIDE = dir;
+  });
+  afterEach(() => {
+    if (prevOverride === undefined) delete process.env.VANTA_DIR_OVERRIDE;
+    else process.env.VANTA_DIR_OVERRIDE = prevOverride;
+    _rmTmp(dir);
+  });
+
+  test('keeps only the last 5 .bak siblings (R1 Gemini P3)', () => {
+    fs.mkdirSync(dir, { recursive: true });
+    const baseFile = path.join(dir, 'route-quality.jsonl');
+    // Seed 8 .bak siblings with monotonically-increasing mtimes by
+    // creating them with controlled mtime stamps.
+    for (let i = 0; i < 8; i++) {
+      const bak = `${baseFile}.bak.${1000 + i}`;
+      fs.writeFileSync(bak, `synthetic-${i}\n`);
+      const t = new Date(1_700_000_000_000 + i * 1000);
+      fs.utimesSync(bak, t, t);
+    }
+    // Now write a >5MB record to trigger rotation, which calls _pruneBaks.
+    const big = 'x'.repeat(6_000_000);
+    fs.writeFileSync(baseFile, big);
+    routeQuality.recordRoute({ prompt: 'fix this', detected_intent: 'fix-bug', project: 'vanta' });
+    const remaining = fs.readdirSync(dir).filter(f => f.startsWith('route-quality.jsonl.bak.'));
+    assert.ok(remaining.length <= 5,
+      `pruner should retain at most 5 baks; saw ${remaining.length}`);
+  });
+
+  test('concurrent-rotation race: one writer wins, neither corrupts (R1 Gemini P4)', () => {
+    // Simulate two processes seeing size > MAX_BYTES and both calling
+    // _maybeRotate. The re-stat-after-rename check should make one
+    // succeed and the other no-op without throwing.
+    fs.mkdirSync(dir, { recursive: true });
+    const baseFile = path.join(dir, 'route-quality.jsonl');
+    const big = 'y'.repeat(6_000_000);
+    fs.writeFileSync(baseFile, big);
+    // Two concurrent rotations: both call recordRoute.
+    let errs = 0;
+    try { routeQuality.recordRoute({ prompt: 'a', detected_intent: 'fix-bug', project: 'vanta' }); } catch (_) { errs++; }
+    try { routeQuality.recordRoute({ prompt: 'b', detected_intent: 'fix-bug', project: 'vanta' }); } catch (_) { errs++; }
+    assert.equal(errs, 0, 'rotation race must not throw');
+    // The new live file exists and contains at least one fresh entry.
+    assert.ok(fs.existsSync(baseFile));
+    const live = fs.readFileSync(baseFile, 'utf8');
+    assert.ok(live.includes('"detected_intent":"fix-bug"'));
   });
 });

@@ -94,11 +94,18 @@ function buildReport({ windowDays = DEFAULT_WINDOW_DAYS } = {}) {
   lines.push('');
 
   // ── 1. Manual command recall ────────────────────────────────────────
+  // R1 council fix (Codex P3): the prior denominator was
+  // `totalPrompts + recallTotal`, but route-quality.jsonl already
+  // includes recall prompts (recordRoute fires on every prompt that
+  // hits the executor, regardless of slash-prefix). That math
+  // double-counted recalls and diluted the bypass rate. Correct
+  // formula: bypass rate = recallTotal / totalPrompts (recall is a
+  // subset of total).
   lines.push('## 1. Manual command recall (v3.9 success metric)');
   lines.push('');
   const totalPrompts = route.length;
   const recallTotal = recall.length;
-  const recallPct = totalPrompts > 0 ? Math.round(100 * recallTotal / (totalPrompts + recallTotal)) : 0;
+  const recallPct = totalPrompts > 0 ? Math.round(100 * recallTotal / totalPrompts) : 0;
   lines.push(`- Vanta-routed prompts: **${totalPrompts}**`);
   lines.push(`- Manual recalls (non-/vanta slash commands): **${recallTotal}** (${recallPct}% bypass)`);
   if (recallTotal > 0) {

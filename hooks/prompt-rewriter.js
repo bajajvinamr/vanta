@@ -151,11 +151,21 @@ process.stdin.on('end', () => {
     tier: decision.tier,
     decision: decision.decision,
     source: decision.source,
+    rewriter_error: decision.rewriter_error || null,
     project,
     session_id: sessionId,
     ts: decision.ts,
   });
-  _logManualRecall({ prompt, project, session_id: sessionId });
+  // R1 council fix (Codex+Gemini, both-confirmed): thread decision_id
+  // into the recall entry so v3.9.1 can join recall ↔ route-quality
+  // when backfilling user_used_different_command on the matching row.
+  _logManualRecall({
+    prompt,
+    project,
+    session_id: sessionId,
+    decision_id: decision.decision_id,
+    ts: decision.ts,
+  });
 
   // ── 1. ASK at T3 (safety-floor or rewriter-ask) — surface a single
   //       "/<route> recommended · T3 ASK · <why>" hint. Never inject a

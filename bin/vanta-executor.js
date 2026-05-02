@@ -615,21 +615,41 @@ function _make(ctx, ts, decision_id, d) {
   // here from rewriter.candidatesFor() so every code path that returns
   // through _make picks them up. Safety-floor / kill-switch / passthrough
   // all flow through one funnel; one place to compute means one place
-  // to keep honest. Margin = 1 / N_candidates (winner-takes-priority);
-  // when only one rule could fire, margin is 1.0 (clean signal).
-  // Empty prompt → margin 1.0, n_candidates 0 (deterministic flows like
-  // tool-only PreToolUse decisions never hit the rewriter).
+  // to keep honest.
+  //
+  // R1 council fix (Codex+Gemini both-confirmed P2): margin must be the
+  // *gap* between top-1 and top-2, not a per-rule probability. The
+  // current rewriter is winner-takes-priority across N rules with no
+  // numeric scoring — so when N >= 2 the top-1 vs top-2 gap is
+  // structurally 0 (any of the N could have won by priority order;
+  // they all have equal "rule-fired" weight). Margin = 0 cleanly trips
+  // the v3.9.1 catch-all `<0.10` threshold; margin = 1.0 when N <= 1
+  // means a clean unambiguous match. The prior `1/N` formulation was
+  // mathematically incompatible with the planned threshold (would have
+  // required 11+ overlapping rules to fire — impossible).
+  //
+  // Empty prompt → margin 1.0, n_candidates 0 (deterministic flows
+  // like tool-only PreToolUse decisions never hit the rewriter).
+  //
+  // R1 council fix (Codex P3): if the rewriter helper THROWS at load
+  // or call time, the catch silently produced a "clean" margin=1.0
+  // entry indistinguishable from a real clean match. Tag the decision
+  // with `rewriter_error` so the soak report can separate genuine
+  // clean signals from rewriter-blew-up noise.
   let n_candidates = 0;
   let top1_top2_margin = 1.0;
+  let rewriter_error = null;
   if (ctx.prompt) {
     try {
       const rw = rewriter();
       if (rw && typeof rw.candidatesFor === 'function') {
         const cands = rw.candidatesFor(ctx.prompt);
         n_candidates = cands.length;
-        if (n_candidates >= 2) top1_top2_margin = 1 / n_candidates;
+        top1_top2_margin = n_candidates >= 2 ? 0.0 : 1.0;
       }
-    } catch (_) { /* never let observability break the executor */ }
+    } catch (err) {
+      rewriter_error = (err && err.message) ? String(err.message).slice(0, 120) : 'unknown';
+    }
   }
   return {
     decision_id,
@@ -653,6 +673,7 @@ function _make(ctx, ts, decision_id, d) {
     inline_ready: d.inline_ready === true,
     n_candidates,
     top1_top2_margin,
+    rewriter_error,
     budget_ms:   BUDGET_MS[d.tier] || BUDGET_MS.T0,
     why:         d.why || '',
     confidence:  d.confidence || 'high',
