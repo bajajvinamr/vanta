@@ -28,13 +28,40 @@ const os = require('os');
 // degrades to a permissive default rather than crashing the executor.
 let _killSwitch, _safetyFloor, _rewriter, _riskClassifier, _peerRouter, _escalation, _trust, _projects;
 
+// v3.8.1 hardening — distinguish "module not present" from "module
+// crashed at load time". Swallowing every require error silently
+// downgrades the executor to its degraded-no-helper path, which masks
+// real syntax/runtime regressions in helper modules. Codex council R3
+// P3: only swallow MODULE_NOT_FOUND; warn loudly on anything else so
+// the operator notices that a dependency broke instead of inferring
+// "Vanta is just being permissive today" from the lack of routing.
 function _resolve(name) {
   for (const p of [
     path.join(os.homedir(), '.claude', 'bin', name),
     path.join(__dirname, name),
     path.join(os.homedir(), 'Projects', 'vanta', 'bin', name),
   ]) {
-    try { return require(p); } catch {}
+    try {
+      return require(p);
+    } catch (err) {
+      if (err && err.code === 'MODULE_NOT_FOUND') continue;
+      // Non-MODULE_NOT_FOUND = the file exists but failed to load
+      // (syntax error, runtime throw at require-time, or a require()
+      // inside the file that itself fails). Surface this — silent
+      // degradation here is exactly the failure mode v3.8.1 fixes.
+      try {
+        const stderr = process.stderr;
+        if (stderr && typeof stderr.write === 'function') {
+          stderr.write(
+            `[vanta-executor] WARN: ${p} failed to load (${err.code || 'no-code'}): ${err.message || String(err)}\n`,
+          );
+        }
+      } catch (_) { /* never let logging break the resolver */ }
+      // Continue to the next candidate path — the helper might exist
+      // at a fallback location even if the preferred copy is broken.
+      // If every path fails, the helper still ends up null and the
+      // executor degrades, but the operator now has a stderr breadcrumb.
+    }
   }
   return null;
 }
@@ -147,6 +174,36 @@ function _cachedTrust(tm, project) {
   }
   _trustCache.set(key, { ts: now, m });
   return m;
+}
+
+// v3.8.1 — explicit cache invalidation on regret signals. The 15s TTL
+// is a passive bound on stale-trust lag; this function lets callers
+// (vanta-undo, interrupt-detection paths) drop the cached entry the
+// instant a regret signal lands, so the next `decide()` re-reads the
+// action-log and reflects the new manual_interrupt / undo_within_2m
+// rate immediately.
+//
+// `project` is the canonical slug from `_canonProjectFromCwd(cwd)`.
+// Pass null/undefined to clear the entire cache (used after global
+// state events like sync-queue drain or large-scale revert).
+function invalidateTrustCache(project) {
+  if (project == null) {
+    _trustCache.clear();
+    return { cleared: 'all' };
+  }
+  const key = project || '__null__';
+  const had = _trustCache.delete(key);
+  return { cleared: had ? key : null };
+}
+
+// Test-seam — exposes the cache state for regression tests. Not part
+// of the public API; consumers should never read this. Returns a
+// shallow snapshot so the test can't accidentally mutate the live
+// cache.
+function _trustCacheSnapshot() {
+  return Array.from(_trustCache.entries()).map(([k, v]) => ({
+    key: k, ts: v.ts, ready: !!(v.m && v.m.ready_for_inline),
+  }));
 }
 
 // Apply tier bumps in priority order. Higher priority signals dominate.
@@ -588,7 +645,7 @@ function _make(ctx, ts, decision_id, d) {
   };
 }
 
-module.exports = { decide, BUDGET_MS, SOURCES };
+module.exports = { decide, BUDGET_MS, SOURCES, invalidateTrustCache, _trustCacheSnapshot };
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 //   echo '{"prompt":"delete all users"}' | vanta-executor

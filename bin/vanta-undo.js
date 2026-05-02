@@ -257,7 +257,44 @@ function undo({ action, subject, force } = {}) {
       } },
     });
   } catch (err) { vlog().error('undo.record', err.message); }
+
+  // v3.8.1 — explicit trust-cache invalidation. The executor caches
+  // trust-metrics per project for 15s; an undo is a regret signal that
+  // should drop trust immediately, not wait for the TTL. Lazy-loaded so
+  // a stale or missing executor doesn't break the undo path.
+  try {
+    const ex = _resolveExecutor();
+    if (ex && typeof ex.invalidateTrustCache === 'function') {
+      ex.invalidateTrustCache(target.project || null);
+    }
+  } catch (err) {
+    try { vlog().warn('undo.cache-invalidate', err.message || String(err)); }
+    catch (_) { /* never let logging break undo */ }
+  }
   return { ...result, target };
+}
+
+// Lazy-resolve the executor module so vanta-undo stays loadable even
+// in degraded environments where the executor isn't deployed yet.
+let _executorMod;
+function _resolveExecutor() {
+  if (_executorMod !== undefined) return _executorMod;  // including null
+  for (const p of [
+    require('path').join(require('os').homedir(), '.claude', 'bin', 'vanta-executor.js'),
+    require('path').join(__dirname, 'vanta-executor.js'),
+    require('path').join(require('os').homedir(), 'Projects', 'vanta', 'bin', 'vanta-executor.js'),
+  ]) {
+    try {
+      _executorMod = require(p);
+      return _executorMod;
+    } catch (err) {
+      if (err && err.code === 'MODULE_NOT_FOUND') continue;
+      try { vlog().warn('undo.executor-load', `${p}: ${err.message || String(err)}`); }
+      catch (_) { /* never let logging break load */ }
+    }
+  }
+  _executorMod = null;
+  return null;
 }
 
 module.exports = { undo, findTarget };
