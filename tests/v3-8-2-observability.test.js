@@ -191,6 +191,19 @@ describe('v3.8.2 — route-quality writer', () => {
       'redaction marker should appear');
   });
 
+  test('recordRoute redacts GitHub fine-grained PATs (R2 Codex P2)', () => {
+    routeQuality.recordRoute({
+      prompt: 'use github_pat_11ABCDEFG0_AbCdEfGhIjKlMnOpQrStUvWxYz12345 to clone',
+      detected_intent: 'unmatched',
+      project: 'vanta',
+    });
+    const raw = fs.readFileSync(path.join(dir, 'route-quality.jsonl'), 'utf8');
+    const entry = JSON.parse(raw.split('\n').filter(Boolean)[0]);
+    assert.equal(entry.prompt_redacted, true);
+    assert.ok(!entry.prompt.includes('github_pat_11ABCDEFG'),
+      'github_pat_ fine-grained PAT must be redacted');
+  });
+
   test('recordRoute redacts JWTs and bearer headers', () => {
     routeQuality.recordRoute({
       prompt: 'curl with Authorization: Bearer abc123def456ghi789',
@@ -416,22 +429,30 @@ describe('v3.8.2 — bak rotation', () => {
       `pruner should retain at most 5 baks; saw ${remaining.length}`);
   });
 
-  test('concurrent-rotation race: one writer wins, neither corrupts (R1 Gemini P4)', () => {
-    // Simulate two processes seeing size > MAX_BYTES and both calling
-    // _maybeRotate. The re-stat-after-rename check should make one
-    // succeed and the other no-op without throwing.
+  test('post-rotation: subsequent writes go to a fresh file without throwing', () => {
+    // R2 Codex P4 honest scope statement: this test verifies post-
+    // rotation CONTINUITY (caller A rotates, caller B writes to the
+    // new tiny file without throwing). It does NOT exercise the
+    // single-millisecond dual-rotate ENOENT race where two processes
+    // both pass the `size > MAX_BYTES` check before either calls
+    // renameSync. That race is bounded by the outer try/catch in
+    // _maybeRotate and the re-stat-after-rename guard, but exercising
+    // it deterministically requires worker_threads with a barrier —
+    // outside v3.8.2 scope. Tracked for v3.8.3 (cross-process JSONL
+    // hardening) along with the same race in action-log.js.
     fs.mkdirSync(dir, { recursive: true });
     const baseFile = path.join(dir, 'route-quality.jsonl');
     const big = 'y'.repeat(6_000_000);
     fs.writeFileSync(baseFile, big);
-    // Two concurrent rotations: both call recordRoute.
     let errs = 0;
     try { routeQuality.recordRoute({ prompt: 'a', detected_intent: 'fix-bug', project: 'vanta' }); } catch (_) { errs++; }
     try { routeQuality.recordRoute({ prompt: 'b', detected_intent: 'fix-bug', project: 'vanta' }); } catch (_) { errs++; }
-    assert.equal(errs, 0, 'rotation race must not throw');
-    // The new live file exists and contains at least one fresh entry.
+    assert.equal(errs, 0, 'post-rotation writes must not throw');
     assert.ok(fs.existsSync(baseFile));
     const live = fs.readFileSync(baseFile, 'utf8');
     assert.ok(live.includes('"detected_intent":"fix-bug"'));
+    // Verify the rotation actually happened: the .bak file exists.
+    const baks = fs.readdirSync(dir).filter(f => f.startsWith('route-quality.jsonl.bak.'));
+    assert.ok(baks.length >= 1, 'rotation should have produced a .bak sibling');
   });
 });

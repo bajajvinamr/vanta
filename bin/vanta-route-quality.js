@@ -154,6 +154,7 @@ const _SECRET_PATTERNS = [
   /\bghp_[A-Za-z0-9]{30,}\b/g,               // GitHub personal token
   /\bghs_[A-Za-z0-9]{30,}\b/g,               // GitHub server token
   /\bghu_[A-Za-z0-9]{30,}\b/g,               // GitHub user token
+  /\bgithub_pat_[A-Za-z0-9_]{40,}\b/g,       // GitHub fine-grained PAT (R2 Codex P2)
   /\bAKIA[0-9A-Z]{16}\b/g,                   // AWS access key
   /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, // JWT
   // env-style secrets
