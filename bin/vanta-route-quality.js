@@ -262,6 +262,12 @@ module.exports = {
   recordRoute,
   recordRecall,
   detectRecall,
+  // v3.9.0 council R1 P2 fix (both-confirmed): exported so the
+  // VantaAction layer can reuse the same redactor on
+  // PromptRewriteInverse.original_prompt. Without the shared
+  // redactor, v3.9.0 would regress the v3.8.2 secret-redaction
+  // contract (raw prompts persisted in actions.jsonl).
+  redactSecrets: _redactSecrets,
   _coerceConfidence,
   _routeFile,
   _recallFile,
