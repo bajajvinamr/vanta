@@ -83,10 +83,16 @@ process.stdin.on('end', () => {
   // and trust signals fragment across the workspace. The executor uses
   // the same helper (bin/vanta-executor.js _canonProjectFromCwd) — keep
   // them in sync.
+  // v3.8.1 hardening — distinguish "vanta-projects.js absent from this
+  // install" (fall through silently — degraded mode is OK) from
+  // "vanta-projects.js exists but failed to load" (loud warning — a
+  // syntax/runtime error in the helper would otherwise revert the
+  // hook to old broken basename slugging with no signal). Mirrors the
+  // executor's _resolve() hardening.
   let project = null;
-  try {
-    const projectsPath = _resolveBin('vanta-projects.js');
-    if (projectsPath) {
+  const projectsPath = _resolveBin('vanta-projects.js');
+  if (projectsPath) {
+    try {
       const projectsMod = require(projectsPath);
       if (typeof projectsMod.slugFromCwd === 'function') {
         project = projectsMod.slugFromCwd(cwd) || null;
@@ -94,8 +100,17 @@ process.stdin.on('end', () => {
         const slug = path.basename(cwd);
         project = projectsMod.canonProject(slug) || slug;
       }
+    } catch (err) {
+      // _resolveBin already confirmed the file exists, so this
+      // catch only fires on syntax/runtime errors at load — exactly
+      // the silent-downgrade case Codex R3 P3 flagged. Log via vlog
+      // so the warning lands in the structured Vanta log, not the
+      // user's prompt context (which would leak hook internals).
+      try { vlog().warn('prompt-rewriter.projects-load',
+        `${projectsPath}: ${err && err.message ? err.message : String(err)}`); }
+      catch (_) { /* never let logging break the hook */ }
     }
-  } catch (_) { /* fall through to basename */ }
+  }
   if (!project) project = path.basename(cwd);
 
   // Resolve executor bin and call it directly (in-process).
