@@ -146,9 +146,16 @@ describe('v3.9.0 — VantaAction schema', () => {
       });
       va.persistAction(a);
       va.updateLifecycle(a.id, 'applied', { expectedState: 'pending' });
-      va.updateLifecycle(a.id, 'rolled_back', { expectedState: 'applied' });
+      // Two-phase claim → finalize (R2 P1 fix)
+      va.updateLifecycle(a.id, 'rolling_back', { expectedState: 'applied' });
+      va.updateLifecycle(a.id, 'rolled_back', { expectedState: 'rolling_back' });
       assert.equal(va.findById(a.id).lifecycle, 'rolled_back');
     });
+  });
+
+  test('LIFECYCLE_STATES includes rolling_back transient (R2 P1 fix)', () => {
+    assert.ok(va.LIFECYCLE_STATES.includes('rolling_back'),
+      'two-phase claim requires the rolling_back transient state');
   });
 
   test('PromptRewriteInverse redacts secrets (R1 P2 both)', () => {
@@ -770,6 +777,106 @@ describe('v3.9.0 — integration scenarios', () => {
       assert.equal(r.kind, 'apply');
       assert.equal(r.original_context.original_prompt, 'review the auth diff',
         'session A re-route must pull session A original prompt, not session B');
+    });
+  });
+
+  test('two-phase claim prevents double inverse application (R2 P1 Codex)', () => {
+    _withDir(() => {
+      const tmp = _tmpDir('claim');
+      const file = path.join(tmp, 'invariants.md');
+      const inserted = '\n## Promoted\n- One thing\n';
+      fs.writeFileSync(file, '# Title\n## Other\n- existing\n' + inserted);
+      const a = va.createAction({
+        kind: 'memory_promotion',
+        inverse: { kind: 'memory_promotion', target_file: file, inserted_text: inserted, insertion_anchor: '## Promoted' },
+        project: 'race', session: 's',
+      });
+      va.persistAction(a);
+      va.updateLifecycle(a.id, 'applied', { expectedState: 'pending' });
+
+      // First undo claims and finalizes
+      const r1 = undo.applyInverse(va.findById(a.id));
+      assert.equal(r1.ok, true, 'first undo should succeed');
+
+      // Second undo on the same action — find it again (it's now rolled_back),
+      // try applyInverse: claim CAS will fail because expected='applied'
+      // but actual='rolled_back'.
+      const aAfter = va.findById(a.id);
+      assert.equal(aAfter.lifecycle, 'rolled_back');
+      const r2 = undo.applyInverse(aAfter);
+      assert.equal(r2.ok, false, 'second undo must NOT re-run the inverse');
+      assert.equal(r2.reason, 'concurrent-undo');
+      // File content should still be the once-removed state — not double-applied
+      const post = fs.readFileSync(file, 'utf8');
+      assert.ok(!post.includes(inserted), 'inserted text removed exactly once');
+      _rmTmp(tmp);
+    });
+  });
+
+  test('Stop two-phase claim: race results in clean conflict signal (R2 P1)', () => {
+    _withDir(() => {
+      const a = va.createAction({
+        kind: 'council_call',
+        inverse: { kind: 'council_call', request_id: 'r-claim', cancelled_locally: false, remote_status: 'unknown', estimated_cost_usd: 0.18 },
+        project: 'stop-race', session: 's',
+      });
+      va.persistAction(a);
+      // First Stop succeeds
+      const r1 = stop.handle({ project: 'stop-race', session: 's', prompt: 'stop' });
+      assert.equal(r1.halted, true);
+      // Second Stop on a fresh _findInFlight result — no in-flight pending
+      // remains, so it returns nothing-pending. (Stop's _findInFlight
+      // looks for pending; rolling_back/rolled_back are excluded.)
+      const r2 = stop.handle({ project: 'stop-race', session: 's', prompt: 'stop' });
+      assert.equal(r2.halted, false);
+      assert.equal(r2.reason, 'nothing-pending');
+      // Critical: only one cancellation should have been recorded
+      assert.equal(cancel.findPendingReconciliation().length, 1,
+        'Stop CAS prevents double-recording of cancellation entries');
+    });
+  });
+
+  test('read-time redaction applies to historical entries (R2 P3 Codex)', () => {
+    _withDir(dir => {
+      // Plant a HISTORICAL entry that was written before the redaction
+      // fix — raw secret in original_prompt. We bypass createAction to
+      // simulate a v3.8.x-era entry.
+      const file = path.join(dir, 'actions.jsonl');
+      const ts = new Date().toISOString();
+      const session = 'hist-s';
+      const promptRewrite = {
+        id: 'va-historical1',
+        kind: 'prompt_rewrite',
+        lifecycle: 'applied',
+        reversible: true,
+        inverse: {
+          kind: 'prompt_rewrite',
+          original_prompt: 'use sk-AbCdEfGhIjKlMnOpQrStUvWxYz12345678 to authenticate',
+          // No original_prompt_redacted — historical entry
+        },
+        project: 'hist', session, ts,
+      };
+      // Persist the historical (raw) entry directly — bypasses createAction
+      const { appendJsonlLine } = require('../bin/vanta-jsonl');
+      fs.mkdirSync(dir, { recursive: true });
+      appendJsonlLine(file, promptRewrite);
+
+      // Plant a council_call to halt
+      const council = va.createAction({
+        kind: 'council_call',
+        inverse: { kind: 'council_call', request_id: 'r', cancelled_locally: false, remote_status: 'unknown' },
+        project: 'hist', session,
+      });
+      va.persistAction(council);
+
+      // Re-route — this surfaces original_prompt; the read-time
+      // redactor must catch the historical secret.
+      const r = reroute.handle({ project: 'hist', session, prompt: 'no, I meant test it' });
+      assert.equal(r.kind, 'apply');
+      assert.ok(r.original_context);
+      assert.ok(!r.original_context.original_prompt.includes('sk-AbCd'),
+        'read-time redaction must scrub historical raw secrets before surfacing');
+      assert.equal(r.original_context.original_prompt_redacted, true);
     });
   });
 

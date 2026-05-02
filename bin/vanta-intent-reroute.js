@@ -212,6 +212,24 @@ function _humanizeKind(k) {
 // `parent_action_id` link on routed actions for stronger causal
 // linkage; for v3.9.0 the (project, session) tuple plus ts ordering
 // is the best we have.
+// Council R2 P3 fix (Codex): defense-in-depth read-time redaction.
+// The forward-only fix in createAction redacts new entries, but
+// historical entries in actions.jsonl predating the fix may still
+// contain unredacted secrets. Re-applying the redactor on read
+// before surfacing original_prompt to the user closes that gap
+// without requiring a one-shot migration.
+let _readTimeRedactor;
+function _readRedact(s) {
+  if (!_readTimeRedactor) {
+    try {
+      const m = require(path.join(__dirname, 'vanta-route-quality.js'));
+      if (typeof m.redactSecrets === 'function') _readTimeRedactor = m.redactSecrets;
+    } catch (_) { /* best-effort */ }
+    if (!_readTimeRedactor) _readTimeRedactor = (text) => ({ text: String(text || ''), redacted: false });
+  }
+  return _readTimeRedactor(s);
+}
+
 function _findOriginalContext(project, haltedActionId) {
   if (!haltedActionId) return null;
   try {
@@ -228,8 +246,14 @@ function _findOriginalContext(project, haltedActionId) {
     );
     if (recent.length === 0) return null;
     const candidate = recent[0];
+    const raw = (candidate.inverse && candidate.inverse.original_prompt) || null;
+    if (!raw) return { original_prompt: null, affected_files: halted.affected_files || null };
+    // Redact at read time too — defense in depth for entries written
+    // before the createAction redaction landed.
+    const r = _readRedact(raw);
     return {
-      original_prompt: candidate.inverse && candidate.inverse.original_prompt || null,
+      original_prompt: r.text,
+      original_prompt_redacted: r.redacted,
       affected_files: halted.affected_files || null,
     };
   } catch (_) { return null; }

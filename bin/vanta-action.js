@@ -42,7 +42,16 @@ const crypto = require('crypto');
 //     detected_intent?, current_route?, confidence_state?,
 //     verification_evidence?, project, session, ts, why? }
 
-const LIFECYCLE_STATES = Object.freeze(['pending', 'applied', 'rolled_back', 'rollback_failed']);
+// Council R2 P1 fix (Codex): a two-phase claim → finalize lifecycle is
+// the only way to actually PREVENT (not just detect) double rollback.
+// `rolling_back` is the transient claim state. The intent handlers
+// CAS into rolling_back BEFORE running side effects (process.kill,
+// file rewrite, cancellation record); a peer racing in observes
+// rolling_back and bails out. Finalization then CASes from
+// rolling_back → rolled_back (or rollback_failed). The prior single-
+// CAS-after-effects could detect the race only after side effects had
+// already run twice.
+const LIFECYCLE_STATES = Object.freeze(['pending', 'applied', 'rolling_back', 'rolled_back', 'rollback_failed']);
 const CONFIDENCE_STATES = Object.freeze(['done', 'likely-done', 'blocked', 'risky']);
 // Council R1 P2 fix (Codex): include the kinds vanta-undo.js already
 // handles (`file-delete`, `git-commit`, `autonomy-promote`). Without

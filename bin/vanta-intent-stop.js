@@ -105,11 +105,42 @@ function handle({ project, session, prompt }) {
   const a = action();
   const c = cancellation();
   const inv = inflight.inverse;
+
+  // Council R2 P1 fix (Codex): CLAIM the action via two-phase CAS
+  // BEFORE running any side effects. Without this, two sessions both
+  // racing on the same in-flight action could each pass the
+  // _findInFlight check, both record cancellation entries, and the
+  // post-hoc CAS would only detect the race after the damage. The
+  // claim transition is `pending → rolling_back`; only the winning
+  // session proceeds to record cancellation + finalize.
+  try {
+    a.updateLifecycle(inflight.id, 'rolling_back', {
+      reason: 'user-initiated-stop:claim',
+      expectedState: 'pending',
+    });
+  } catch (err) {
+    if (err && err.code === 'CAS_FAILED') {
+      return {
+        halted: false,
+        reason: 'concurrent-conflict',
+        error: err.message,
+        message: `[Vanta] Another session has already handled this action (it's now "${err.actual_state}"). Nothing left to halt.`,
+      };
+    }
+    return {
+      halted: false,
+      reason: 'lifecycle-update-failed',
+      error: err.message || String(err),
+      message: `[Vanta blocked] Stop signaled, but I couldn't claim action ${inflight.id}.`,
+    };
+  }
+
+  // Claim succeeded — we are the sole halter. Run side effects.
   let nextLifecycle = 'rolled_back';
   const messages = [];
   const cancellations_recorded = [];
 
-  // council_call: cost-honest cancellation entry
+  // council_call: cost-honest cancellation entry (post-claim only)
   if (inv && inv.kind === 'council_call' && inv.remote_status === 'unknown') {
     const ok = c.record({
       action_id: inflight.id,
@@ -136,32 +167,16 @@ function handle({ project, session, prompt }) {
     }
   }
 
-  // Transition lifecycle with CAS (council R1 P1 fix). The expected
-  // state is 'pending' — _findInFlight returned a pending action; if
-  // another session beat us to it (transitioned to applied or
-  // rolled_back), the CAS throws and we report a clean conflict
-  // signal rather than over-writing the peer's transition.
-  let updated = null;
+  // Finalize: rolling_back → rolled_back / rollback_failed.
   try {
-    updated = a.updateLifecycle(inflight.id, nextLifecycle, {
-      reason: 'user-initiated-stop',
-      expectedState: 'pending',
+    a.updateLifecycle(inflight.id, nextLifecycle, {
+      reason: 'user-initiated-stop:finalize',
+      expectedState: 'rolling_back',
     });
   } catch (err) {
-    if (err && err.code === 'CAS_FAILED') {
-      return {
-        halted: false,
-        reason: 'concurrent-conflict',
-        error: err.message,
-        message: `[Vanta] Another session has already handled this action (it's now "${err.actual_state}"). Nothing left to halt.`,
-      };
-    }
-    return {
-      halted: false,
-      reason: 'lifecycle-update-failed',
-      error: err.message || String(err),
-      message: `[Vanta blocked] Stop signaled, but I couldn't update the lifecycle for action ${inflight.id}.`,
-    };
+    // Finalize CAS shouldn't fail unless something else mutated the
+    // ledger out from under us — best-effort tolerance.
+    /* swallow: side effects already ran; lifecycle is icing on the cake */
   }
 
   const summary = _summarizeAction(inflight);

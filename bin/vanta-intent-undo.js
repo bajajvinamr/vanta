@@ -158,10 +158,41 @@ function _humanAgo(ts) {
 // Apply the inverse for a specific action. Returns:
 //   { ok: true, action_id, kind, message }
 //   { ok: false, action_id, reason, message } — rollback_failed; manual cleanup required
+//
+// Council R2 P1 fix (Codex): CLAIM the action via CAS into
+// `rolling_back` BEFORE running any side effect. Two sessions racing
+// on the same applied action would otherwise both pass through the
+// inverse-application block (process.kill, file rewrite, cancellation
+// record, indexOf-and-remove on inserted_text), running side effects
+// twice. With the claim CAS, only the winner proceeds; the loser
+// observes lifecycle='rolling_back' (or terminal state), CAS fails,
+// and we surface a clean concurrent-undo message without re-running
+// side effects.
 function applyInverse(act) {
   if (!act || !act.inverse) {
     return { ok: false, action_id: act && act.id, reason: 'no-inverse', message: '[Vanta blocked] No inverse recorded — cannot undo.' };
   }
+  // Phase 1 — claim
+  try {
+    action().updateLifecycle(act.id, 'rolling_back', {
+      reason: 'user-initiated-undo:claim',
+      expectedState: 'applied',
+    });
+  } catch (err) {
+    if (err && err.code === 'CAS_FAILED') {
+      return {
+        ok: false, action_id: act.id, kind: act.inverse && act.inverse.kind,
+        reason: 'concurrent-undo',
+        message: `[Vanta] Another session is already undoing this action (state is "${err.actual_state}"). Skipping to avoid double-rollback.`,
+      };
+    }
+    return {
+      ok: false, action_id: act.id, kind: act.inverse && act.inverse.kind,
+      reason: 'claim-failed',
+      message: `[Vanta blocked] Couldn't claim action ${act.id} for undo: ${err.message || String(err)}`,
+    };
+  }
+  // Phase 2 — run inverse + finalize via _completeRollback / _failRollback
   switch (act.inverse.kind) {
     case 'file_edit':        return _undoFileEdit(act);
     case 'memory_promotion': return _undoMemoryPromotion(act);
@@ -169,8 +200,7 @@ function applyInverse(act) {
     case 'prompt_rewrite':   return _undoPromptRewrite(act);
     case 'council_call':     return _undoCouncilCall(act);
     default:
-      return { ok: false, action_id: act.id, reason: 'unknown-kind',
-               message: `[Vanta blocked] Unknown inverse kind: ${act.inverse.kind}` };
+      return _failRollback(act, 'unknown-kind', `Unknown inverse kind: ${act.inverse.kind}`);
   }
 }
 
@@ -337,34 +367,23 @@ function _undoCouncilCall(act) {
     `Council call discarded locally. The remote request may have completed (${cost}); reconciled next session.`);
 }
 
-// Council R1 P1 fix: CAS the lifecycle transition to prevent two
-// sessions from both applying the inverse to the same action. If the
-// CAS fails, the peer session has already rolled back; the inverse we
-// just applied was a no-op or a duplicate. Surface this as a soft
-// failure so the user knows something raced.
+// Council R2 P1 fix (Codex): finalize from `rolling_back` (the claim
+// state) — applyInverse already CASed `applied → rolling_back` before
+// running side effects, so finalization expects `rolling_back`.
 function _completeRollback(act, message) {
   try {
     action().updateLifecycle(act.id, 'rolled_back', {
       reason: 'user-initiated-undo',
-      expectedState: 'applied',
+      expectedState: 'rolling_back',
     });
-  } catch (err) {
-    if (err && err.code === 'CAS_FAILED') {
-      return {
-        ok: false, action_id: act.id, kind: act.inverse && act.inverse.kind,
-        reason: 'concurrent-undo',
-        message: `[Vanta] Another session has already handled this action (state is now "${err.actual_state}"). The inverse may have been applied twice — please review ${(act.affected_files || []).join(', ') || 'the affected files'} manually.`,
-      };
-    }
-    /* the rollback succeeded mechanically; lifecycle update best-effort otherwise */
-  }
+  } catch (_) { /* best-effort: side effects already ran; finalization is icing */ }
   return { ok: true, action_id: act.id, kind: act.inverse.kind, message: `[Vanta] ${message}` };
 }
 function _failRollback(act, reason, why) {
   try {
     action().updateLifecycle(act.id, 'rollback_failed', {
       reason: `undo-failed:${reason}`,
-      expectedState: 'applied',
+      expectedState: 'rolling_back',
     });
   } catch (_) { /* best-effort: rollback already failed; lifecycle is icing on the cake */ }
   return { ok: false, action_id: act.id, kind: act.inverse && act.inverse.kind, reason, message: `[Vanta risky] ${why}` };
