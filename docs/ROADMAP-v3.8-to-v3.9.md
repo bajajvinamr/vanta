@@ -234,22 +234,39 @@ v3.8.0  ✓ tagged 2026-05-02
    │      ship trigger: real bug found in v3.8.2 soak; otherwise skip
    │
    ▼
-v3.9.0
-   prereqs (NOT optional):
-   - v3.8.2 has been live for ≥14 calendar days
-   - shadow telemetry shows ≥1 project would have triggered inline_ready
-     (proves the math works on real data, not just unit tests)
-   - council R1+R2 reviewed v3.9-A.2 implementation BEFORE flag flip
-   - rollback path (conversational revert OR action-log replay) is
-     implemented and tested with canary scenarios from §3.5
+v3.9.0  ── SHIP CRITERIA (covers A.1 + B + C only, NOT A.2) ──
+   prereqs to tag v3.9.0:
+   - v3.8.2 has been live for ≥14 calendar days (shadow telemetry
+     in production; informs A.2 calibration but doesn't gate the tag)
+   - council R1+R2 reviewed A.1 + B + C implementations
+   - 350+/350+ tests, 15/15 smoke gate
+   - no surface delta beyond §2 (zero new commands; brief grows under
+     signal; one config flag for A.1 preview)
 
-   sequencing:
+   sequencing within v3.9.0:
    - v3.9-A.1 (preview-only) lands first — no trust gate, lowest risk
    - v3.9-C lands second (zero new surface, mechanical verb table)
    - v3.9-B lands third (brief enrichment, no new commands)
-   - v3.9-A.2 (real inline replacement) lands LAST, behind default-off
-     flag, with 14d real-data soak BEFORE flag default flips on for
-     any project
+   - tag v3.9.0 here. A.2 does NOT block this tag.
+
+v3.9-A.2  ── ENABLEMENT CRITERIA (post-tag, gated separately) ──
+   v3.9-A.2 is a runtime-flag flip, not a release. The code that
+   reads the flag may ship inside v3.9.0 (gated default-off and
+   functionally inert until enabled) or in a v3.9.x patch — that's
+   an implementation detail. What matters is that the flag never
+   defaults to "auto" until ALL enablement criteria pass:
+
+   prereqs to flip default `rewriter.inline = "auto"` for any project:
+   - shadow telemetry from v3.8.2 shows ≥1 project would have
+     triggered inline_ready under real workload
+   - 14 calendar days of shadow telemetry on a project before that
+     project's flag is eligible to flip (per-project soak, not global)
+   - council R1+R2 reviewed the A.2 implementation
+   - rollback path (conversational "revert that" routed through the
+     existing safety floor + /vanta verb expansion, OR action-log
+     replay) is IMPLEMENTED AND TESTED against §3.5 canaries
+   - explicit operator opt-in recorded in `~/.vanta/config.json` for
+     each project (per §5 qualitative leading indicator)
 
 §3.5 — Required canary scenarios before v3.9-A.2 flag flip:
 
