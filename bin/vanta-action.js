@@ -206,6 +206,10 @@ function readActions({ project = null, lifecycle = null, kind = null, since = nu
   if (!fs.existsSync(file) && !_anyBakFor(file)) return [];
   const raw = jsonl().readMergedJsonl(file);
   const byId = new Map();
+  // Dedup tiebreaker: when two entries for the same id have identical
+  // ts (sub-millisecond writes via updateLifecycle), prefer the LATER
+  // line. JSONL append-only puts later writes physically later, so
+  // `>=` (not `>`) gives last-write-wins on ts ties.
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
@@ -213,7 +217,7 @@ function readActions({ project = null, lifecycle = null, kind = null, since = nu
     try { e = JSON.parse(t); } catch { continue; /* torn — skip */ }
     if (!e || !e.id) continue;
     const prior = byId.get(e.id);
-    if (!prior || (e.ts || '') > (prior.ts || '')) byId.set(e.id, e);
+    if (!prior || (e.ts || '') >= (prior.ts || '')) byId.set(e.id, e);
   }
   let out = [...byId.values()];
   // Migrate the v3.8.x and pre-v3.8.x action-log shape: entries
