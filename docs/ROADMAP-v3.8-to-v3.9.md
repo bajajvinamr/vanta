@@ -1,35 +1,82 @@
-# Vanta v3.9 Roadmap — The Router Release
+# Vanta v3.9 — The Operator Release
 
-> Vanta is not a developer tool for people who already know what to run.
-> Vanta is a senior-engineer operating layer for a non-engineer founder.
+> The non-engineer founder does not want autonomy first.
+> They want **competent initiative with reversibility**.
 
-This roadmap was rewritten from a UX-first perspective. The prior version
-optimized for surface-impact discipline; that mattered for v3.7→v3.8
-sprint hygiene, but it accidentally smuggled in engineer-thinking
-about a product whose user is not an engineer. This version starts from
-the user, not the architecture.
+This roadmap was rewritten twice. The first version was engineer-thinking
+about engineer-tools. The second tried to fix that by leading with
+"Universal /vanta Router" — but a router is not a product, it's an
+organ. The product is the whole operator loop: **understand → inspect →
+decide → act → verify → explain → remember**.
 
-## North Star
+A clever classifier that confidently routes wrong is worse than no
+classifier — because the user trusted it and now can't recover. That's
+the moment trust dies. So the v3.9 sequencing has changed: the
+reversibility backbone (stop, undo, re-route, action-object model)
+ships in **v3.9.0**, before any router expansion.
 
-The user should be able to type any of:
+---
 
-- "it broke"
-- "fix this"
-- "ship it"
-- "is this good?"
-- "continue"
-- "what should I do next?"
-- "make this better"
-- "find issues"
-- "don't mess this up"
+## Promise
 
-…and Vanta should understand the intent, choose the correct workflow,
-call the right tools/models, and explain only what matters.
+The user types a vague goal:
 
-The goal is not more commands. The goal is **less thinking about
-commands**.
+```
+fix this
+ship it
+this looks weird
+should we rename tier to plan_level?
+continue
+```
 
-## UX Principles (the spec — every release tests against these)
+Vanta turns that into a **safe engineering outcome**.
+
+Not a command. Not a dashboard. Not a classifier. An outcome.
+
+---
+
+## The Loop
+
+Every Vanta interaction follows this 8-step loop. Every release in v3.9
+hardens one or more steps; nothing ships without all eight working
+end-to-end.
+
+1. **Understand** the intent (router + catch-all + ambient mode)
+2. **Inspect** repo/session state (read before guessing)
+3. **Choose** route (rule + outcome label, not implementation name)
+4. **Act** if safe (engineering decisions = silent or mention)
+5. **Ask** if a boundary is crossed (product / destructive / money / privacy / unclear-after-inspect)
+6. **Verify** the work landed
+7. **Report** with one clear next action and an explicit confidence state
+8. **Learn** what's worth remembering (project automatic, global gated)
+
+---
+
+## The hardest product truth
+
+The non-engineer user does **not** want autonomy first.
+
+The trust ladder is:
+
+```
+1. Can I stop it?
+2. Can I undo it?
+3. Does it know what I mean?
+4. Does it ask only when I should decide?
+5. Does it verify its work?
+6. Does it remember?
+7. Can it become more automatic later?
+```
+
+Every prior version of this roadmap put step 3 ("does it know what I
+mean?") first. That's close, but unsafe. **Reversibility (steps 1+2)
+must ship first.** Otherwise the first time Vanta confidently does the
+wrong thing, the user has no clean way back, and the entire product is
+dead.
+
+---
+
+## UX Principles
 
 ### 1. Never make the user remember skill names
 
@@ -39,39 +86,91 @@ commands**.
 > ship-readiness loop: tests, review, risk check. I'll ask before
 > push/deploy."
 
-The user should not care whether the underlying route is gstack, GSD,
-superpowers, Codex, Gemini, `/review`, `/qa`, `/council`, or
-`/vanta-sync`. **Vanta chooses.**
-
-### 2. Speak in outcomes, not system internals
+### 2. Speak in outcomes, not internals
 
 | Engineer-speak (bad) | Founder-speak (good) |
 |---|---|
-| "T2 peer route selected with 60s budget." | "This touches auth, so I'm getting a second opinion before changing it." |
-| "inline_ready = true." | "Your last 60 Vanta actions in this repo were clean. I can start applying rewritten prompts automatically here, but you can keep preview mode." |
-| "Council R1 found 2 P2s." | "Two reviewers flagged the same risk. I'll address it before continuing." |
+| "Routing to /investigate, T2 peer." | "I'll diagnose the failure first." |
+| "T3 council triggered." | "This touches auth, so I'm getting a second opinion." |
+| "inline_ready = true." | "Your last 60 actions in this repo were clean. I can apply rewrites automatically here, or keep showing previews." |
+| "Council R1 found 2 P2s." | "Two reviewers flagged the same risk. I'll address it first." |
 | "Trust: undo 0.0% · interrupt 0.0% · chain 100%" | (Hidden by default. Shown only on `--explain`.) |
 
-### 3. Ask only when the user owns the decision
+### 3. Outcome-language route names
 
-| Vanta should NOT ask | Vanta SHOULD ask |
+Even the route names shown to the user must be outcomes, not
+implementations. Internally the router targets `/qa`; externally Vanta
+says "I'll write the right tests."
+
+| Internal route | User-facing label |
 |---|---|
-| Should I run tests? | Should this be a paid feature? |
-| Should I inspect the logs? | Should we rename this concept? |
-| Should I look at the diff? | Should this behavior change for users? |
-| Should I ask Codex? | Should I deploy? |
-| Should I write a failing test? | Should I run a destructive migration? |
-| | Should I force-push? |
-| | Should this be product A or product B? |
+| `/investigate` | Diagnose |
+| `/qa` | Test |
+| `/review` | Review |
+| `/ship` | Ship-check |
+| `/council` | Get a second opinion |
+| `/vanta-sync` | Remember |
+| (resume context) | Resume |
+| (product-decision ASK) | Ask decision |
+| (catch-all ASK) | Clarify |
 
-Engineering choices are Vanta's job. Product/strategy/destructive choices
-are the user's.
+### 4. One clear next action per message
 
-#### Gray-area decision matrix (council R1 P2 fix)
+Every reply ends with a single concrete next action. Never a wall of
+diagnostics with no direction.
 
-The binary "engineering vs product" rule has fuzzy cases. Concrete table
-for the most common gray areas — Vanta uses this to decide whether to
-proceed silently, mention briefly, or stop and ask:
+### 5. Confidence, not arrogance
+
+If Vanta is guessing, it says so. If Vanta is sure, it says so. The
+two states are visibly different — see "Done means done" below.
+
+### 6. Conversational config, not JSON edits
+
+A non-engineer does not edit `~/.vanta/config.json`. The config exists
+internally; user-facing controls are conversational:
+
+> [Vanta] Keep showing rewrite previews?
+> A) Yes
+> B) Less often (only on weak prompts)
+> C) Turn off for this repo
+
+Vanta writes the config based on the answer. No file editing required,
+ever, by the user.
+
+---
+
+## Decision Boundaries — when to ASK
+
+The single most important behavioral spec. Vanta's competence is judged
+by whether it asks at the right moments.
+
+### Vanta ASKS for…
+
+| Boundary | Examples |
+|---|---|
+| **Product decisions** | "Should we rename tier to plan_level?", "Should this be a paid feature?", "Should we pivot pricing?" |
+| **User-visible behavior** | Error message changes, UI string changes, copy changes, default flag flips |
+| **Pricing / billing / permissions** | Plan tier changes, role changes, feature-flag default changes |
+| **Destructive operations** | Force-push, `rm -rf`, `git reset --hard`, drop migrations, secret rotation |
+| **Deployments** | Any push to a deploy environment |
+| **Runtime dependency changes** | Adding/removing/upgrading runtime deps (axios, prisma, etc.); dev-deps don't ask |
+| **Money** | See money matrix below |
+| **Privacy** | See privacy policy below |
+| **Unclear after inspection** | Catch-all kicks in only after Vanta has read the relevant context — see catch-all UX in v3.9.1 |
+
+### Vanta does NOT ask for…
+
+- Running tests
+- Reading logs
+- Inspecting diffs
+- Asking Codex (under policy budget)
+- Writing a failing test
+- Behavior-preserving refactors in the same file
+- Local dependency bumps to fix a build (dev-deps only)
+- Killing a stuck local process
+- Anything reversible and small
+
+### Engineering vs product gray-area matrix
 
 | Situation | Silent | Mention | ASK |
 |---|---|---|---|
@@ -82,7 +181,7 @@ proceed silently, mention briefly, or stop and ask:
 | Update tests because the behavior changed | | ✓ | |
 | Add a new test file because coverage is missing | | ✓ | |
 | Bump a dev dependency to fix the build | ✓ | | |
-| Bump a runtime dependency (e.g. axios, prisma) | | | ✓ |
+| Bump a runtime dependency (axios, prisma, etc.) | | | ✓ |
 | Add a new dependency (any) | | | ✓ |
 | Delete a file Vanta concluded is dead | | | ✓ |
 | Delete a comment / log statement Vanta concluded is dead | ✓ | | |
@@ -95,47 +194,87 @@ proceed silently, mention briefly, or stop and ask:
 | Add a feature flag (default off) | | ✓ | |
 | Flip a feature flag default | | | ✓ |
 
-The boundary rule, when in doubt: **does this change something the
-user, the user's customers, the database, or the deploy will see
-differently?** If yes — ASK. If no — proceed (silent or mention).
+**Boundary rule when in doubt:** does this change something the user,
+the user's customers, the database, or the deploy will see differently?
+Yes → ASK. No → proceed.
 
-Time-cost rule: any "engineering choice" that adds **>5 minutes** to
+**Time-cost rule:** any "engineering choice" that adds **>5 minutes** to
 the current task elapsed time, OR delays the ship date, OR breaks an
-external API boundary — ASK.
+external API boundary → ASK.
 
-### 4. One clear next action per message
+### Money matrix
 
-The user should never read a wall of diagnostics and wonder what to do.
+Per-call cost (council API spend):
 
-> Bad: 7 bullets of telemetry.
->
-> Good: "Next: I recommend fixing the failing E2E suite before more
-> feature work."
+| Per-call estimate | Behavior |
+|---|---|
+| < $0.05 | Silent — proceed |
+| $0.05 – $0.50 | Mention briefly ("running second opinion, ~$0.18") |
+| > $0.50 | ASK before firing |
 
-### 5. Confidence, not arrogance
+Cumulative session cost:
 
-If Vanta is guessing, it should say so:
+| Session running total | Behavior |
+|---|---|
+| < $1.00 | Silent |
+| $1.00 – $5.00 | Mention at session end |
+| > $5.00 | ASK to continue ("This session has cost ~$5.20. Continue with full council on the next risk check?") |
 
-> "I'm not sure if this is a bug or product decision. I'll inspect
-> first, then ask before changing behavior."
+Daily / monthly rollups available via `vanta-status` CLI binary (not a
+slash command). Cost log written to `~/.vanta/cost.jsonl` per call.
 
-Not:
+### Privacy / diff-sharing policy
 
-> "Proceeding."
+Set ONCE per repo on first council fire, then enforced silently:
+
+```
+[Vanta] First time I'd send code from this repo to Codex/Gemini for a
+second opinion. What's your policy for FounderOS?
+
+A) Yes, send diffs when risk is high — under $0.50 per call
+B) Yes, send diffs but ask each time
+C) No, never send diffs from this repo (self-review only)
+```
+
+Stored at `~/.vanta/repos/<slug>/policy.json`. Vanta NEVER asks twice
+for the same repo unless the cost ceiling is exceeded. A non-engineer
+wants guardrails, not repeated consent dialogs.
 
 ---
 
-## What v3.9 IS NOT (rejected ideas, council-confirmed)
+## Done means done — confidence states
+
+Every Vanta flow ends with one of four explicit states. Without this,
+the user still has to judge engineering completeness, which defeats the
+whole point.
+
+| State | Meaning | Example |
+|---|---|---|
+| `[Vanta done]` | Done and verified. Tests pass, behavior matches intent, no known caveats. | "Fixed auth redirect, verified with 3 tests. Next: merge PR #12." |
+| `[Vanta likely done]` | Done with caveats. Verified locally but a downstream check (E2E, CI, manual UX review) is still pending or red. | "Fixed the routing bug; unit tests green. E2E suite is still red but unrelated — next: investigate E2E #7 separately." |
+| `[Vanta blocked]` | Cannot finish without a decision the user owns. | "Stopped before changing pricing logic. Need your call: should `tier` rename to `plan_level` across the schema?" |
+| `[Vanta risky]` | Tests pass but the change touches a high-risk surface (auth, payments, migrations) that needs second review. | "Tests pass on the auth refactor, but this changes session storage. Next: get Codex + Gemini second opinion before merging." |
+
+These states are first-class in the action-object model (v3.9.0); every
+session-end action-object carries a `confidence_state` field, which is
+used by the brief (v3.9.5) and by the burn-in measurement (v3.9.8).
+
+---
+
+## What v3.9 IS NOT (rejected ideas)
 
 | Idea | Rejected because |
 |---|---|
-| Inline auto-replacement | Too risky before router quality is proven. A non-engineer user may not notice when Vanta subtly changes intent. **Selective preview only**, never replacement, until conversational undo is rock-solid. |
+| Inline auto-replacement | Too risky before the operator loop is proven. Selective preview only, never replacement. |
 | Dashboard / `/vanta-status` | The user does not need another dashboard. The session brief is the dashboard. |
-| More slash commands | Route through `/vanta`. Period. Adding `/vanta-status`, `/vanta-trust`, `/vanta-health` etc. sets the precedent that loses the product. |
-| Per-project hook overrides | Surface explosion — every project would have its own rule set. |
+| More slash commands | Route through `/vanta`. Adding `/vanta-status`, `/vanta-trust`, `/vanta-health` etc. sets the precedent that loses the product. |
+| Per-project hook overrides | Surface explosion. |
 | LLM fallback for every rewrite | Cost and latency unclear. Use rules + telemetry first. |
 | Team mode | Single-user is the product advantage. |
-| Threshold-based auto-flip to inline | Math clearing thresholds ≠ user wants this on. Always opt-in, per-project, with conversational undo proven. |
+| Threshold-based auto-flip to inline | Math clearing thresholds ≠ user wants this on. Always opt-in, per-project. |
+| User-facing config flags | Conversational config only. JSON files are implementation. |
+| Per-call privacy/cost prompts | Repo-level policy set once; only ask when policy ceiling exceeded. |
+| "Saved me thinking?" prompt every session | Annoying cadence. Sparing only — see v3.9.8. |
 
 ---
 
@@ -143,20 +282,22 @@ Not:
 
 | Tag | Date | Shipped | Surface |
 |---|---|---|---|
-| v3.8.0 | 2026-05-02 | Central executor, project-scoped trust, monorepo slug correctness, council R1+R2+R3 fixes | None new |
+| v3.8.0 | 2026-05-02 | Central executor, project-scoped trust, monorepo slug correctness | None new |
 | v3.8.1 | 2026-05-02 | Silent-require warning, explicit trust-cache invalidation on undo, monorepo + reader/writer slug regression tests | None new |
-| **v3.8.2** | _planned_ | Internal explain + soak + route-quality telemetry. **Hidden from user.** | None new |
-| **v3.9.0** | _design_ | **The router**: `/vanta <anything>` | One command flexes; all others routed |
-| **v3.9.1** | _design_ | Calm UX response discipline | None new |
-| **v3.9.2** | _design_ | Actionable session brief | None new |
-| **v3.9.3** | _design_ | Action-object model + conversational undo + mid-flight re-route + stop | Reversibility backbone — must ship before v3.9.4 |
-| **v3.9.4** | _design_ | Selective inline preview (gated on v3.9.3) | One config flag, default "preview" |
-| **v3.9.5** | _design_ | Two-eyes escalation UX | None new |
-| **v3.9.6** | _design_ | Memory UX | None new |
-| **v3.9.7** | _design_ | Real-world burn-in (10 sessions) | None new |
+| **v3.8.2** | _planned_ | Internal explain + soak + route-quality telemetry | None new (hidden from user) |
+| **v3.9.0** | _design_ | **Reversibility foundation** — action-object model + stop + undo + mid-flight re-route | Three new conversational intents (no slash commands) |
+| **v3.9.1** | _design_ | Universal /vanta router + ambient mode + outcome route labels | One command flexes; ambient mode adds zero surface |
+| **v3.9.2** | _design_ | Calm operator UX (response shape, heartbeats, "Done means done" state) | None new |
+| **v3.9.3** | _design_ | Decision boundaries (ASK matrix as code) | None new |
+| **v3.9.4** | _design_ | Two-eyes UX + repo-level cost/privacy policy | None new |
+| **v3.9.5** | _design_ | Actionable session brief | None new |
+| **v3.9.6** | _design_ | Memory UX (project automatic, global gated, conversational) | None new |
+| **v3.9.7** | _design_ | Selective inline preview (gated on v3.9.0 reversibility) | One internal config flag, conversational control |
+| **v3.9.8** | _design_ | Real-world burn-in: 10 sessions, 3 projects, absolute zero-tolerance gates | None new |
 
-The whole arc: **one command added (`/vanta` flexes), one config flag**.
-Every other "feature" is routing or response discipline.
+The whole arc: **one command flexes (`/vanta`), zero memorized commands
+added**. Three new conversational intents (stop / undo / re-route)
+extend an existing intent surface — they're not memorized commands.
 
 ---
 
@@ -169,196 +310,374 @@ exposing a dashboard to the user.
 
 ### Ship
 
-**1. Decision explain mode** — `vanta-executor --explain "fix this"`.
-For debugging, not normal UX. Shows interpreted intent, route chosen,
-risk reason, whether second opinion is needed, whether user confirmation
-is needed.
-
-**2. Soak report** — `tools/vanta-soak-report.js`. Builder reads it
-weekly to answer:
-- Which prompts failed to route?
-- Which routes were ignored?
-- Which suggestions did the user override?
-- Which prompts caused "undo that"?
-- Which routes were overused?
-- Which risky work skipped second review?
-
-**3. Route-quality telemetry** — schema:
+- **Decision explain mode** — `vanta-executor --explain "fix this"`. For
+  debugging. Shows interpreted intent, route chosen, risk reason,
+  confidence, top-1 vs top-2 margin.
+- **Soak report** — `tools/vanta-soak-report.js`. Builder reads weekly.
+  Surfaces top routing misses, ignored suggestions, undo causes.
+- **Route-quality telemetry** — JSONL at `~/.vanta/route-quality.jsonl`:
 
 ```json
 {
   "prompt": "fix this",
   "detected_intent": "fix-bug",
+  "confidence": 0.78,
+  "top1_top2_margin": 0.31,
   "suggested_route": "/investigate",
   "user_followed_route": true,
-  "user_ignored_route": false,
   "user_used_different_command": null,
   "later_undo": false,
   "later_manual_correction": false,
+  "session_ended_state": "done",
   "project": "founderos",
   "ts": "2026-05-09T14:22:00Z"
 }
 ```
 
-This is the data that feeds v3.9.0's router-quality smoke test.
-Without it, we are guessing whether the router actually helps.
+- **Manual command recall tracking** — every session, count whether the
+  user manually invoked a non-`/vanta` command (gstack, GSD,
+  superpowers, raw bash). This is the v3.9 success metric.
 
 ### Acceptance
 
 - `--explain` answers "why did Vanta route there?" in <2 seconds
 - Soak report surfaces top 5 routing misses + top 5 ignored suggestions
-- Route-quality telemetry written to `~/.vanta/route-quality.jsonl`
-  on every prompt that hits the executor
-- **Zero new user-facing commands. Zero added session-start noise.**
+- Route-quality telemetry written on every prompt that hits the executor
+- Zero new user-facing commands, zero session-start noise
 
 ---
 
-## v3.9.0 — Universal `/vanta` Router
+## v3.9.0 — Reversibility Foundation (ships BEFORE the router)
+
+> **Why this is v3.9.0 and not v3.9.3:** the router is unsafe without
+> reversibility. A confident wrong action that the user can't cleanly
+> undo is the moment trust dies. The action-object model + stop + undo
+> + re-route is the prerequisite for shipping any expansion of router
+> ambition, not a follow-up.
 
 ### Goal
 
-The user should only need one command:
+Three conversational intents that all share the same backbone:
 
-```text
-/vanta <what I want>
+1. **Stop** — "stop", "wait, don't", "pause"
+2. **Undo** — "undo that", "revert that", "no that's wrong", "go back"
+3. **Mid-flight re-route** — "not that", "no, I meant <X>", "wait,
+   actually <X>"
+
+Plus the `VantaAction` schema that makes all three reliable, plus
+crash-recovery and cancellation-state tracking.
+
+### Build the action-object model first
+
+```typescript
+interface VantaAction {
+  id: string;
+  kind:
+    | "prompt_rewrite"
+    | "route_decision"
+    | "file_edit"
+    | "command"
+    | "memory_promotion"
+    | "council_call";
+  reversible: boolean;
+  inverse?: object;            // operation to undo this action
+  affected_files?: string[];
+  original_prompt?: string;
+  rewritten_prompt?: string;
+  detected_intent?: string;    // for re-route reclassification
+  current_route?: string;      // for re-route halt
+  confidence_state?:           // for "Done means done"
+    | "done"
+    | "likely-done"
+    | "blocked"
+    | "risky";
+  project: string;
+  session: string;
+  ts: string;
+}
+
+interface VantaActionCancellation {
+  action_id: string;
+  cancelled_at: string;
+  cancellation_kind:
+    | "user-initiated-stop"
+    | "user-initiated-reroute"
+    | "user-initiated-undo";
+  in_flight_remote_call?: {
+    provider: "codex" | "gemini";
+    request_id: string;
+    cancelled_locally: true;
+    remote_status: "unknown" | "completed" | "aborted";
+    estimated_cost_usd?: number;
+    actual_cost_usd?: number;  // filled by reconciliation on next session start
+  };
+}
 ```
 
-Vanta routes the rest. This is the product.
+### Stop intent
 
-### UX shape
+Halts the in-flight action immediately. No clarification, no undo of
+prior actions. Reports state cleanly.
 
 ```
-User: /vanta fix this
-Vanta: [Vanta] I'll investigate the failure, reproduce it, fix the
-       smallest root cause, and run targeted tests.
-
-User: /vanta ship it
-Vanta: [Vanta] I'll run ship-readiness: tests, typecheck, diff review,
-       risk scan. I'll ask before push/deploy.
-
-User: /vanta should we rename tier to plan_level?
-Vanta: [Vanta] This is a product/taxonomy decision. I'll outline
-       tradeoffs, but you decide before I change code.
+User:  /vanta fix this
+Vanta: [Vanta] Diagnosing the failure...
+User:  stop
+Vanta: [Vanta blocked] Stopped before any code changes. The diagnose
+       step had read 3 files and identified one likely cause. Resume
+       with "continue" or describe what you want next.
 ```
 
-### Supported intents
+### Undo intent
 
-| Intent | Inputs (examples) | Routes to | Behavior |
+Inputs:
+- "undo that"
+- "revert that"
+- "no that's wrong"
+- "go back"
+
+If ambiguous (multiple recent reversible actions):
+
+```
+[Vanta] Undo what?
+A) Prompt rewrite (the most recent)
+B) File edit (touched 2 files)
+C) Memory update (1 invariant staged)
+```
+
+If unambiguous:
+
+```
+[Vanta] Reverted the last prompt rewrite. Continuing with your
+original prompt.
+```
+
+### Mid-flight re-route intent
+
+The route was wrong; user realizes mid-execution. Vanta:
+
+1. Halts the in-flight executor on the current action
+2. Reverses partial side-effects via `inverse`
+3. Pipes original context into the new route — no restart, no "type
+   your question again"
+
+```
+User:  /vanta review this
+Vanta: [Vanta] Reviewing the diff...
+       (council fires)
+User:  no, I meant test it
+Vanta: [Vanta] Got it — switching to writing tests. Halting review.
+       The Codex review request may have already completed remotely
+       (~$0.18); I'll reconcile actual cost in telemetry next session.
+       Writing tests for the same diff now.
+```
+
+### Cost honesty (cancellation tracker)
+
+Vanta CANNOT guarantee an in-flight remote API call hasn't billed —
+the request may already be on the wire when the user types stop or
+re-route. Never claim "no charge" preemptively. Cancellation tracker
+records `cancelled_locally: true, remote_status: unknown`; next
+session-start reconciles against `~/.vanta/cost.jsonl`. If billed,
+user sees a one-line note; if not, silent.
+
+### Crash recovery
+
+Vanta's state lives in append-only JSONL files. A crash mid-action
+means:
+
+- Action-log entry may not have been written → the action effectively
+  didn't happen from Vanta's POV (idempotent: re-running produces the
+  same Decision)
+- File edits committed by Claude Code survive crashes regardless
+- In-flight council calls may complete remotely; user sees cost on
+  next session start with reconciliation note
+
+Recovery path at session start: scan `~/.vanta/sync-queue.jsonl` for
+`synced: false` AND no terminal status; surface to user:
+
+```
+[Vanta] Last session ended unexpectedly. The council call on
+hooks/prompt-rewriter.js may have completed remotely (~$0.18 charged).
+The diff is unchanged — pick up where you left off?
+A) Yes
+B) Re-run the council
+C) Skip / abandon
+```
+
+### Hard rule
+
+**No real inline replacement (`rewriter.inline = "auto"`) until the
+v3.9.0 stop + undo + re-route flow has been used reliably for ≥14 days
+and ≥3 sessions.** This is preserved from the prior roadmap.
+
+### Acceptance
+
+- 10 synthetic stop prompts halt cleanly with state reported, 100%
+- 10 synthetic undo prompts route to the correct kind, 100%; ambiguous
+  undos always ASK
+- 10 synthetic re-route prompts halt the current action, switch to the
+  new route, AND preserve original context, 100%
+- Cancellation tracker records every halt with cost-honest language;
+  no "no charge" claims for in-flight remote calls
+- 5 real-session reversal events (stop OR undo OR re-route) succeed
+  end-to-end with consistent state and honest telemetry
+- Crash-recovery scan runs at every session start and finds zero
+  unrecoverable state in 10 real sessions
+
+---
+
+## v3.9.1 — Universal /vanta Router (explicit + ambient)
+
+### Goal
+
+Vanta turns vague prompts into the right outcome. Two surfaces:
+
+- **Explicit mode**: `/vanta fix this`
+- **Ambient mode**: just `fix this` (no prefix) — UserPromptSubmit hook
+  intercepts weak action prompts and routes them
+
+The promise is not "remember one command." It's:
+
+> "Even if you type badly, Vanta catches the intent."
+
+### Supported intents (outcome-labeled)
+
+| User-facing label | Inputs (examples) | Internal route | Behavior |
 |---|---|---|---|
-| **Fix / debug** | "fix this", "it broke", "it didn't work", "debug this", "why is this failing?" | `/investigate` | inspect → reproduce → root cause → targeted test → smallest fix → verify |
-| **Ship** | "ship it", "ready to merge?", "can this go?", "release this" | `/ship` or ship-readiness workflow | tests → typecheck → lint → diff review → risk scan → council if high-risk → ASK before push/deploy |
+| **Diagnose** | "fix this", "it broke", "it didn't work", "debug this", "why is this failing?" | `/investigate` | inspect → reproduce → root cause → targeted test → smallest fix → verify |
+| **Ship-check** | "ship it", "ready to merge?", "can this go?", "release this" | `/ship` | tests → typecheck → lint → diff review → risk scan → second opinion if high-risk → ASK before push/deploy |
 | **Review** | "review this", "is this good?", "check my work", "audit this diff" | `/review` | inspect diff → find bugs → check tests → check security/auth/data risks → suggest fixes |
-| **QA / tests** | "write tests", "add tests", "test this", "what tests are missing?" | `/qa` | inspect behavior → identify critical invariants → write high-signal tests → avoid shallow coverage chasing |
-| **Gaps / audit** | "find gaps", "what's missing?", "go deeper", "audit this", "think harder" | Codex first OR `/council` if high-risk | Codex for code audit; Gemini for architecture/product breadth; full council for auth/security/architecture/product-risk |
-| **Continue** | "continue", "what next?", "where were we?", "resume from last time" | project state + last PR + todo memory | read recent state → summarize last work → identify next best action → continue safely |
-| **Sync / learn** | "remember this", "sync learnings", "what did we learn?", "update memory" | `/vanta-sync` | extract durable learnings → split project-specific vs global → ASK before promoting questionable memory |
-| **Product decision** | "should we rename…", "should we price…", "should we pivot…", "should this feature…", "change onboarding copy…" | **ASK user** | frame options → explain tradeoffs → do not modify code until user decides |
-| **Catch-all / Uncertain** (council R1 P1, both-flagged) | "this looks weird", "what is going on", "make it work like X did", "something feels off" — anything that doesn't match the 8 above with high confidence | **ASK user** | NEVER guess on low confidence. Frame 2-3 candidate routes with one-line tradeoffs; let the user pick or describe the goal differently. |
+| **Test** | "write tests", "add tests", "test this", "what tests are missing?" | `/qa` | inspect behavior → identify critical invariants → write high-signal tests |
+| **Get a second opinion** | "find gaps", "what's missing?", "go deeper", "audit this", "think harder" | Codex first OR full council if high-risk | per repo-level policy |
+| **Resume** | "continue", "what next?", "where were we?", "resume from last time" | (project state + last PR + todo memory) | read recent state → summarize → identify next best action → continue safely |
+| **Remember** | "remember this", "sync learnings", "what did we learn?", "update memory" | `/vanta-sync` | extract durable learnings → split project vs global → ASK before global promotion |
+| **Ask decision** | "should we rename…", "should we price…", "should we pivot…" | (ASK user) | frame options → explain tradeoffs → never modify code until user decides |
+| **Clarify** (catch-all) | "this looks weird", "make it work like X did", "something feels off" | (inspect-first OR ASK) | see catch-all UX below |
 
-### Catch-all UX
+### Catch-all UX — inspect first when safe
 
-If detected_intent confidence is below the high-confidence bar, route
-to the catch-all bucket. Vanta says:
+Critical fix versus the prior version: the catch-all does NOT immediately
+ask the user to classify. It splits into two modes:
+
+- **Unclear but safe to inspect** — read recent diff, failing state, or
+  open PR; THEN decide if Vanta can act or needs to ask. Most catch-all
+  prompts hit this branch.
+- **Unclear AND action would change things** — ask first. Reserved for
+  prompts where any code-touching action would itself be a decision.
 
 ```
-[Vanta] I'm not sure what you want here. Did you mean:
-A) <best guess based on prompt>
-B) <second-best guess>
-C) Something else — tell me in your own words
-
-(I'd rather ask than guess wrong on something that matters.)
+User:  this looks weird
+Vanta: [Vanta] I'll inspect the recent diff and failing state first,
+       then I'll ask before changing behavior.
 ```
 
-#### Catch-all entry conditions (concrete thresholds)
+vs.
 
-The router emits a normalized confidence score per intent (0..1) and a
-top-1 vs top-2 margin. A prompt routes to catch-all if **any** of:
+```
+User:  make it work like X did
+Vanta: [Vanta] I need to know what "X did" looked like before I touch
+       anything. Did you mean:
+       A) The behavior in the previous PR?
+       B) An older commit on this file?
+       C) A different feature you're remembering?
+```
 
-| Condition | Threshold | Rationale |
-|---|---|---|
-| Top-1 confidence | `< 0.55` | "Probably this" isn't enough when wrong-route can write files |
-| Top-1 vs top-2 margin | `< 0.10` | Two intents nearly tied → ASK |
-| Calibration data missing for this intent | (any) | A new intent rule with no ground truth defaults to catch-all until soak data accumulates |
-| Prompt matches the safety floor | (any) | Safety floor wins; never resolve via catch-all |
+Hard rule: **never ask the user to classify work that Vanta can clarify
+by reading context.**
 
-These thresholds are tuned against the v3.8.2 soak report — not picked
-out of thin air. If real data shows 0.55 is too low (too many catch-all
-prompts that should have resolved), tighten via PR; if too high (too
-many wrong-routes that should have asked), loosen via PR. The
-thresholds themselves are versioned in `policy/router-thresholds.yaml`.
+### Catch-all entry conditions
 
-Hard rule: any catch-all interaction emits a route-quality telemetry
-entry with `detected_intent: "uncertain"`. Soak report (§v3.8.2) flags
-top causes of catch-all so the rule table grows from real data, not
-guesses.
+The router emits a normalized confidence (0..1) and a top-1 vs top-2
+margin. Route to catch-all if any:
 
-### Acceptance — `scripts/vanta-router-smoke.sh`
+| Condition | Threshold |
+|---|---|
+| Top-1 confidence | `< 0.55` |
+| Top-1 vs top-2 margin | `< 0.10` |
+| New intent rule with no calibration data | (any) |
+| Safety floor match | (always wins; never resolves via catch-all) |
 
-A new smoke gate that tests at least **40 real prompts** (was 30,
-expanded to cover catch-all + re-route + stop). Must pass **≥36/40**.
-Critical prompts must pass **100%**:
+Tuned against v3.8.2 soak report. Versioned in
+`policy/router-thresholds.yaml`.
+
+### Acceptance
+
+**Prompt smoke** — `scripts/vanta-router-smoke.sh`, ≥40 prompts, must
+pass ≥36/40. Critical prompts pass 100%:
 
 ```text
-fix this                    -> investigate
-it didn't work              -> investigate
-ship it                     -> ship-readiness
-review this                 -> review
-write tests                 -> qa
-find gaps                   -> audit/council
-continue from last time     -> resume
-what next                   -> resume / recommend next
-sync learnings              -> vanta-sync
-rename tier to plan_level   -> product decision ASK
-should we pivot pricing     -> product decision ASK
+fix this                    -> Diagnose
+it didn't work              -> Diagnose
+ship it                     -> Ship-check
+review this                 -> Review
+write tests                 -> Test
+find gaps                   -> Get a second opinion
+continue from last time     -> Resume
+what next                   -> Resume / recommend next
+sync learnings              -> Remember
+rename tier to plan_level   -> Ask decision
+should we pivot pricing     -> Ask decision
 deploy this                 -> ASK before deploy
 force push this             -> BLOCK / ASK
-this looks weird            -> catch-all ASK (never guess)
-what is going on            -> catch-all ASK
-make it work like X did     -> catch-all ASK
-something feels off         -> catch-all ASK
-not that, I meant test it   -> mid-flight re-route to /qa
-no, do review instead       -> mid-flight re-route to /review
+this looks weird            -> Clarify (inspect first)
+what is going on            -> Clarify (inspect first)
+make it work like X did     -> Clarify (ASK)
+something feels off         -> Clarify (inspect first)
+not that, I meant test it   -> mid-flight re-route to Test
+no, do review instead       -> mid-flight re-route to Review
 undo that                   -> conversational undo
 revert that                 -> conversational undo
-stop                        -> stop intent (cancel + report)
+stop                        -> stop intent
 wait, don't                 -> stop intent
 ```
 
-Plus threshold tests (synthetic, fixtures-based — not user prompts):
+Plus threshold tests (synthetic):
 
 ```text
-confidence=0.50, margin=0.20  -> catch-all (below confidence floor)
-confidence=0.70, margin=0.05  -> catch-all (margin too tight)
-confidence=0.70, margin=0.20  -> normal route (clears both bars)
-new-intent-rule, no calib     -> catch-all (no soak data yet)
-safety-floor match            -> safety-floor (never catch-all)
+confidence=0.50, margin=0.20  -> Clarify (below confidence floor)
+confidence=0.70, margin=0.05  -> Clarify (margin too tight)
+confidence=0.70, margin=0.20  -> normal route
+new-intent-rule, no calib     -> Clarify (no soak data)
+safety-floor match            -> safety-floor (never Clarify)
 ```
 
-### Product metric (matters more than tests)
+**Stateful scenario smoke** — NEW. Same prompt + different repo state
+must produce different routes. ≥20 scenarios, must pass ≥18/20:
 
-After v3.9.0 ships, track in route-quality telemetry:
+| Scenario | Prompt | Expected route |
+|---|---|---|
+| No changes, clean tree | "ship it" | "Nothing to ship — last commit is already pushed." |
+| Tests failing | "ship it" | "Tests are red — fixing first before ship-check." |
+| Auth file changed | "ship it" | Ship-check + second opinion (auth = high-risk) |
+| PR already open + red CI | "ship it" | "PR #19 is open with red CI — investigating CI failure." |
+| Dirty working tree | "ship it" | "Working tree has uncommitted changes — review diff first?" |
+| Migration present | "ship it" | ASK before deploy (destructive) |
+| Failing test, no diff | "fix this" | Diagnose → reproduce failing test |
+| Failing test, recent diff | "fix this" | Diagnose → check if recent diff caused failure |
+| Auth diff + open PR | "review this" | Review + auto-second-opinion |
+| Open PR with red CI | "what next" | "PR #19 has red CI — investigate the failure?" |
+| Staged memory pending | "continue" | "Last session staged 2 invariants — review them or pick up coding?" |
+| Pricing rename in flight | "make this better" | Ask decision (touches taxonomy) |
+| Plain old typo fix | "fix this" | Diagnose → quick fix → verify |
+| Missing tests for new feature | "what's missing?" | Test → identify critical invariants |
+| Deps just bumped | "find gaps" | Get a second opinion → focus on dep changes |
 
-> **How many sessions required the user to manually remember a
-> non-Vanta command?**
-
-Targets:
-- <20% after 1 week
-- <10% after 1 month
-
-This is the v3.9 success metric. Not inline mode. Not trust math. Not
-test count.
+Stateful scenarios require fixtures in `tests/fixtures/scenarios/`
+that simulate repo state (mock git, mock action-log, mock PR list).
 
 ---
 
-## v3.9.1 — UX Response Discipline
+## v3.9.2 — Calm Operator UX
 
 ### Goal
 
-Make Vanta feel calm, clear, and useful.
+Make Vanta feel calm, clear, and useful. Standardize the response shape
+so the user always knows what state they're in.
 
-### Default response format
+### Standard message shape
 
-**At the start:**
+**Start:**
 
 ```
 [Vanta] I'll <action>. <Why or guardrail in one sentence>.
@@ -366,7 +685,7 @@ Make Vanta feel calm, clear, and useful.
 
 Examples:
 
-> [Vanta] I'll investigate the failure and run the smallest relevant
+> [Vanta] I'll diagnose the failure and run the smallest relevant
 > tests. I'll ask before changing product behavior.
 
 > [Vanta] This looks like a product naming decision. I'll outline
@@ -374,15 +693,11 @@ Examples:
 
 > [Vanta] I'll run ship-readiness. I'll ask before push or deploy.
 
-**During work — short ops (<30s)** — only speak if:
-- asking the user
-- escalating to council
-- blocked
-- found a major issue
-- changing plan
+**During work — short ops (<30s):** silent.
 
-**During work — long ops (≥30s, council R1 P2 fix)** — silence reads as
-crash to a non-engineer founder. Heartbeat every 20–30s in plain English:
+**During work — long ops (≥30s):** heartbeat every 20–30s in plain
+English, naming what + how long. NEVER name internals (no T2/T3, no
+budgets, no cache state).
 
 ```
 [Vanta] Still working — Codex is reviewing the diff (~2 min total).
@@ -390,35 +705,139 @@ crash to a non-engineer founder. Heartbeat every 20–30s in plain English:
 [Vanta] Both reviewers replied. Synthesizing findings now.
 ```
 
-Heartbeats name *what* and *how long*, never internal machinery. No
-"R1 P2 budget consumed", no "T2 peer route active". Just "still
-working — Codex is reviewing the diff."
-
-**At end:**
+**At end:** one of the four "Done means done" states (see top of doc):
 
 ```
 [Vanta done] <what was done>, verified with <how>. Next: <one action>.
+
+[Vanta likely done] <what was done>; <caveat>. Next: <one action>.
+
+[Vanta blocked] <what was reached>. Need your call: <one question>.
+
+[Vanta risky] <what was done>; <risk>. Next: get a second opinion before merge.
 ```
 
 ### Banned in normal UX (move to `--explain`)
 
-- Raw tier labels (T0/T1/T2/T3) unless useful
-- Budget numbers (e.g. "60s budget")
+- Tier labels (T0/T1/T2/T3)
+- Budget numbers ("60s budget")
 - Trust percentages
 - Route distribution
 - Long telemetry
 - Internal cache details
-- Huge decision trees
+- Decision-tree dumps
 
 ### Acceptance
 
-- 100% of Vanta replies in router-smoke fit the start format
-- Zero replies contain the banned items unless `--explain` was passed
-- Manual review: 10 real session starts feel "calm" not "noisy"
+- 100% of Vanta replies in router smoke fit the start format
+- Zero replies contain banned items unless `--explain` was passed
+- 100% of session-end replies include one of the four confidence states
+- Manual review of 10 real session starts: each feels calm, not noisy
 
 ---
 
-## v3.9.2 — Actionable Session Brief
+## v3.9.3 — Decision Boundaries (ASK matrix as code)
+
+### Goal
+
+The decision matrices in the UX-3 section above become enforceable code,
+not just documentation.
+
+### Implementation
+
+`bin/vanta-decision-boundaries.js` exports:
+
+```typescript
+function shouldAsk(action: VantaAction, context: RepoContext): {
+  ask: boolean;
+  reason: string;
+  matrix_row: string;  // which matrix row matched
+};
+```
+
+Wired into the executor between the router (v3.9.1) and the act step.
+Every action passes through this gate before any side-effect.
+
+### Money matrix enforcement
+
+`bin/vanta-cost.js` exports:
+
+```typescript
+function checkCost({
+  estimated_usd: number,
+  session_running_total_usd: number
+}): {
+  proceed: boolean;
+  mention: boolean;
+  ask: boolean;
+};
+```
+
+Per-call: <$0.05 silent, $0.05–$0.50 mention, >$0.50 ask. Session: <$1
+silent, $1–$5 mention at end, >$5 ask to continue.
+
+### Privacy policy enforcement
+
+Per-repo policy at `~/.vanta/repos/<slug>/policy.json`. Set ONCE on
+first council fire (see Decision Boundaries above). Subsequent fires
+silently respect the policy. Only ask when ceiling is exceeded.
+
+### Acceptance
+
+- Every entry in the gray-area matrix has a unit test that asserts the
+  correct ask/mention/silent classification
+- Money matrix unit-tested across the three thresholds
+- Privacy policy: 5 synthetic council fires after policy is set; ZERO
+  consent prompts shown
+- 1 synthetic ceiling-exceeded fire; consent prompt appears
+
+---
+
+## v3.9.4 — Two-Eyes UX
+
+### Goal
+
+Make second-opinion escalation feel natural, not mechanical.
+
+### UX states
+
+| Internal | User-facing |
+|---|---|
+| T0 / T1 | "Low-risk change. I'll self-review before finishing." |
+| T2 (single peer) | "Medium-risk change. I'm asking Codex for a second pass." |
+| T3 (full council) | "High-risk change. I'm asking Codex + Gemini before making the call." |
+
+### Cost transparency
+
+Always include the per-call estimate in the heartbeat for any council
+call >$0.05. Disagreements between Codex and Gemini summarized as
+choices for the user, not as a debate transcript.
+
+### Repo-level consent (referenced from §Decision Boundaries)
+
+First council fire on a new repo triggers the policy prompt:
+
+```
+[Vanta] First time I'd send code from this repo to Codex/Gemini. Policy?
+A) Yes, send diffs when risk is high — under $0.50 per call
+B) Yes, send diffs but ask each time
+C) No, never send diffs from this repo (self-review only)
+```
+
+Stored at `~/.vanta/repos/<slug>/policy.json`. Never asked twice unless
+ceiling exceeded.
+
+### Acceptance
+
+- User understands WHY escalation happened (one sentence)
+- No model jargon unless useful
+- No long council report by default — only findings
+- Per-call cost shown for any call >$0.05
+- Disagreements rendered as choices, not transcripts
+
+---
+
+## v3.9.5 — Actionable Session Brief
 
 ### Goal
 
@@ -432,15 +851,13 @@ The session-start brief should not become a dashboard. It should answer:
 Pending: 2 staged learnings · PRs clean · no blockers
 ```
 
-### Bad brief
+### Bad brief (banned)
 
 ```
-Trust: undo 0.0% · interrupt 0.0% · chain 100% · routes 47 · span 14d · inline yes
+Trust: undo 0.0% · interrupt 0.0% · chain 100% · routes 47 · span 14d
 ```
 
-### Rule
-
-**Show status only if actionable.**
+### Rule — show status only if actionable
 
 | Show when… | Hide always |
 |---|---|
@@ -449,8 +866,9 @@ Trust: undo 0.0% · interrupt 0.0% · chain 100% · routes 47 · span 14d · inl
 | staged memories pending review | raw trust math |
 | council shadow pending | cache state |
 | next recommended task is clear | model jargon |
-| inline preview eligible (first time) | telemetry counters |
+| inline preview newly eligible | telemetry counters |
 | repo is in paused/safe mode | |
+| last session ended `[Vanta blocked]` or `[Vanta risky]` | |
 
 ### Acceptance
 
@@ -461,287 +879,16 @@ Trust: undo 0.0% · interrupt 0.0% · chain 100% · routes 47 · span 14d · inl
 
 ---
 
-## v3.9.3 — Action-Object Model + Conversational Undo + Mid-Flight Re-Route
-
-> **Sequencing fix per council R1 (both-flagged P1):** the action-object
-> model is a prerequisite for inline preview, not parallel to it. You
-> cannot safely preview prompt mutations without a structured way to
-> log the original intent, log what was changed, and reverse it. This
-> section ships before any inline behavior — formerly numbered v3.9.4,
-> moved up.
-
-### Goal
-
-Three conversational behaviors that all need the same backbone:
-
-1. **Undo** — "undo that", "revert that", "go back"
-2. **Mid-flight re-route** — "not that, I meant test it" (Codex R1 P1)
-3. **Stop** — "stop", "wait, don't"
-
-All three need to know *what just happened* and *how to reverse it*
-before any inline mode can be safe.
-
-### Build the action-object model first
-
-Every reversible Vanta action logs:
-
-```typescript
-interface VantaAction {
-  id: string;
-  kind:
-    | "prompt_rewrite"
-    | "route_decision"
-    | "file_edit"
-    | "command"
-    | "memory_promotion";
-  reversible: boolean;
-  inverse?: object;          // operation to undo this action
-  affected_files?: string[];
-  original_prompt?: string;
-  rewritten_prompt?: string;
-  detected_intent?: string;  // for re-route reclassification
-  current_route?: string;    // for re-route halt
-  project: string;
-  session: string;
-  ts: string;
-}
-```
-
-This is the structured backbone for everything that follows. Trust math,
-inline replacement, two-eyes escalation, memory promotion — all of them
-need to know what happened and how to reverse it.
-
-### Conversational undo
-
-Inputs (extends safety floor):
-
-- "undo that"
-- "revert that"
-- "no that's wrong"
-- "go back"
-
-If ambiguous:
-
-```
-[Vanta] Undo what?
-A) Prompt rewrite
-B) File edit
-C) Memory update
-```
-
-If unambiguous:
-
-```
-[Vanta] Reverted the last prompt rewrite. Continuing with your
-original prompt.
-```
-
-### Mid-flight re-route (council R1 P1, Codex)
-
-Critical UX gap the rewrite missed: the user routed wrong, realizes
-mid-execution, says "no, I meant X". This is **not** an undo (the
-prior action wasn't necessarily wrong); it's a reclassification. Vanta
-must:
-
-1. Halt the current executor on the in-flight action
-2. Reverse any partial side-effects via the action-object inverse
-3. Pipe the original context into the new route — no restart, no
-   "type your question again"
-
-Inputs:
-
-- "not that"
-- "no, I meant <X>"
-- "wait, actually <X>"
-- "different thing — <X>"
-- "not <current route>, do <X> instead"
-
-UX:
-
-```
-User:  /vanta review this
-Vanta: [Vanta] Reviewing the diff…
-       (council fires)
-User:  no, I meant test it
-Vanta: [Vanta] Got it — switching to QA. Halting review, no changes
-       yet. Writing tests for the same diff.
-```
-
-If the in-flight route already wrote files or sent prompts, Vanta
-states the cleanup explicitly. **Cost-honest language:** Vanta cannot
-guarantee an in-flight remote API call hasn't billed (the request may
-already be on the wire); never claim "no charge" preemptively. Instead:
-
-```
-[Vanta] Halting review. I had already started a Codex review call —
-the request may have completed remotely, so it may still bill. I'll
-reconcile actual cost in telemetry next session start. Switching to
-/qa for the same diff now.
-```
-
-The cancellation-state tracker (in v3.9.3 action-object model) records
-each cancellation with `cancelled_locally: true, remote_status: unknown`
-and the next session's `vanta-status` startup checks reconciles
-against actual billing data from the `~/.vanta/cost.jsonl` log. If the
-call billed, the user sees it as a one-line note alongside the recovery
-prompt; if it didn't, the session start is silent.
-
-Cancellation-state schema added to the action-object model:
-
-```typescript
-interface VantaActionCancellation {
-  action_id: string;
-  cancelled_at: string;        // ISO timestamp
-  cancellation_kind:
-    | "user-initiated-stop"
-    | "user-initiated-reroute"
-    | "user-initiated-undo";
-  in_flight_remote_call?: {
-    provider: "codex" | "gemini";
-    request_id: string;
-    cancelled_locally: true;
-    remote_status: "unknown" | "completed" | "aborted";  // updated on next session
-    estimated_cost_usd?: number;
-    actual_cost_usd?: number;   // filled by reconciliation
-  };
-}
-```
-
-### Stop intent (cleanly named, separate from undo)
-
-Inputs:
-
-- "stop"
-- "wait, don't"
-- "pause"
-
-Effect: cancel the in-flight action immediately. Don't ask for
-clarification, don't undo prior actions, just halt and report state.
-
-### Hard rule
-
-**No real inline replacement (`rewriter.inline = "auto"`) until
-conversational undo + re-route + stop are all reliable for at least
-14 days of real usage across ≥3 sessions.**
-
-### Acceptance
-
-- 10 synthetic undo prompts route to the correct kind 100% of the time
-- 10 synthetic re-route prompts halt the current action AND switch to
-  the new route AND preserve original context, 100% of the time
-- 5 synthetic stop prompts halt cleanly with state reported
-- Ambiguous undos always ASK — never silently pick
-- Mid-flight re-route NEVER discards a paid API call without telling
-  the user it happened (cost transparency — see §Operations)
-- 5 real-session undos succeed end-to-end (action reversed, state
-  consistent, telemetry logged)
-
----
-
-## v3.9.4 — Selective Inline Preview
-
-> **Now safe to ship** because v3.9.3 ships the action-object model
-> and the three reversal intents first. Without those, preview would
-> have been a tease that the user couldn't recover from.
-
-### Goal
-
-Test whether inline rewriting is actually desired, without committing
-to replacement.
-
-### Strong pushback against earlier roadmap (preserved)
-
-The earlier roadmap version proposed real inline replacement gated on
-metric thresholds. **That's the wrong gate.** A non-engineer user may
-not notice when Vanta subtly changes intent. That is dangerous.
-
-Selective preview only. **No replacement until v3.9.7 burn-in shows
-users actually want it AND the absolute-gate failures (§v3.9.7) are
-all zero.**
-
-### Preview only when ALL true
-
-- Prompt is action-like ("fix", "ship", "review", etc. — not "what")
-- Rewrite confidence is high
-- Rewrite materially improves the prompt (not cosmetic)
-- Not a product decision
-- Not a simple yes/no/show/list prompt
-
-### UX
-
-```
-[Vanta preview] I would treat "fix this" as: investigate failure →
-reproduce → smallest fix → targeted tests.
-```
-
-Do not show this on every prompt.
-
-### Acceptance
-
-- Preview appears for weak action prompts (e.g. "fix this" without context)
-- Preview does NOT appear for simple informational prompts ("what is this file?")
-- User can say "use that style" or "don't rewrite this" → both routed correctly
-- Preview outcomes logged to route-quality telemetry
-- Each preview emits a v3.9.3 action-object so it's reversible if the
-  user's next message is "undo that"
-
-### Config
-
-`~/.vanta/config.json`:
-
-```json
-{
-  "rewriter": {
-    "inline": "preview"   // "off" | "preview" | "auto" — never "auto" until v3.9.7 burn-in passes
-  }
-}
-```
-
----
-
-## v3.9.5 — Two-Eyes UX
-
-### Goal
-
-Make second-opinion escalation feel natural, not mechanical.
-
-### Bad UX
-
-> T3 council triggered.
-
-### Good UX
-
-> [Vanta] This touches auth and review gates, so I'm getting a second
-> opinion before changing it.
-
-### UX states
-
-| State | Internal | User-facing |
-|---|---|---|
-| Self-check | T0/T1 | "Low-risk change. I'll self-review before finishing." |
-| One peer | T2 | "Medium-risk change. I'm asking Codex for a second pass." |
-| Full council | T3 | "High-risk change. I'm asking Codex + Gemini before making the call." |
-
-### Acceptance
-
-- User understands WHY escalation happened (one sentence)
-- No model jargon unless useful
-- No long council report by default — only findings
-- Disagreements between Codex and Gemini summarized as choices, not
-  as a debate transcript
-
----
-
 ## v3.9.6 — Memory UX
 
 ### Goal
 
-Make learning feel like "Vanta got smarter," not like memory bureaucracy.
+Make learning feel like "Vanta got smarter," not memory bureaucracy.
 
 ### After meaningful session
 
 ```
-[Vanta learned] 2 project gotchas saved, 1 global rule staged for approval.
+[Vanta learned] 2 project gotchas saved. 1 global rule staged for approval.
 ```
 
 If approval needed:
@@ -755,27 +902,69 @@ C) Discard
 
 ### Rules
 
-- **Project memory** — mostly automatic; high confidence things land
+- **Project memory** — mostly automatic; high-confidence things land
   silently in project CLAUDE.md
 - **Global memory** — requires higher confidence; staging path with
   explicit user approval (already exists; surface it better)
-- **Product decisions** — remembered as decisions ("we decided X
-  on date Y"), not as universal truths
-- **Stale / version-bound facts** — marked with version + date so
-  future-Claude knows when to re-verify
+- **Product decisions** — remembered as decisions ("we decided X on
+  date Y"), not universal truths
+- **Stale / version-bound facts** — marked with version + date
 
 ### Acceptance
 
 - User sees what Vanta learned at the end of every meaningful session
-- No silent global pollution (≥1 global rule promoted in 10 sessions
-  without surfacing)
-- Future sessions actually use the memory (verified via telemetry:
-  invariant matches the situation, behavior reflects it)
+- Zero silent global pollution in 10 real sessions (any global
+  promotion shown to user)
+- Future sessions actually use the memory (verified via telemetry)
 - User can reject bad memory in one keystroke
 
 ---
 
-## v3.9.7 — Real-World UX Burn-In
+## v3.9.7 — Selective Inline Preview (gated on v3.9.0)
+
+### Goal
+
+Test whether inline rewriting is actually desired without committing to
+replacement. **Only safe to ship now** because v3.9.0 already shipped
+the action-object model + stop + undo + re-route.
+
+### Preview only when ALL true
+
+- Prompt is action-like (not "what")
+- Rewrite confidence is high
+- Rewrite materially improves the prompt
+- Not a product decision
+- Not a simple yes/no/show/list prompt
+
+### UX
+
+```
+[Vanta preview] I'd treat "fix this" as: diagnose failure → reproduce
+→ smallest fix → targeted tests.
+```
+
+Conversational control, not config edit:
+
+```
+[Vanta] Keep showing rewrite previews?
+A) Yes, like this one
+B) Less often (only on weak prompts)
+C) Turn off for this repo
+```
+
+Vanta writes `~/.vanta/config.json` based on the answer.
+
+### Acceptance
+
+- Preview appears for weak action prompts ("fix this" without context)
+- Preview does NOT appear for simple informational prompts ("what is
+  this file?")
+- Conversational control routed correctly; user never edits JSON
+- Each preview emits a v3.9.0 action-object so it's reversible
+
+---
+
+## v3.9.8 — Real-World UX Burn-In
 
 ### Goal
 
@@ -786,252 +975,230 @@ projects (vanta itself, founderos, little-wins or pi-perception).
 
 ### What counts as a "real session"
 
-Council R1 P1 — averages hide catastrophes. Define "real" precisely:
-
-A session counts if all of:
-- ≥1 prompt routed through `/vanta` (not just session-start brief)
+- ≥1 prompt routed through `/vanta` OR ambient mode (not just
+  session-start brief)
 - ≥10 minutes of active interaction
 - Some concrete outcome attempted (a fix, a ship, a review, a test
   write — not just exploration)
 
 Synthetic sessions don't count. Sessions that crashed within 30
-seconds don't count. Sessions where Vanta was disabled don't count.
+seconds don't count.
 
-### Track per session
+### Track per session (silent telemetry, no user prompt)
 
-1. Did the user need to remember another command?
-2. Did Vanta route correctly?
+1. Did the user manually invoke a non-Vanta command?
+2. Did Vanta route correctly (matched user's apparent goal)?
 3. Did Vanta ask at the right time?
 4. Did Vanta over-explain?
 5. Did Vanta under-explain?
-6. Did memory help?
-7. Did memory hurt?
-8. Did council fire too often?
-9. Did the user say "undo" / "stop"?
-10. Did the session end closer to ship?
+6. Did memory help / hurt?
+7. Did council fire too often?
+8. Did the user say "undo" / "stop" / "not that"?
+9. Did the session end in `done` / `likely done` / `blocked` / `risky`?
 
-Capture in `~/.vanta/burn-in.jsonl`. Inspect after every session.
+Captured automatically in `~/.vanta/burn-in.jsonl` from the
+action-object stream and route-quality telemetry. **No user prompt.**
 
-### "Did I save you thinking today?" (council R1 P4 fix)
+### "Did I save you thinking?" — sparing cadence
 
-The fifth product-bar criterion is qualitative; needs an explicit
-measurement mechanic. At the end of every session that counts as
-"real" per the definition above:
+The qualitative criterion needs measurement, but every-session prompts
+become annoying and stop being honest. Cadence:
+
+| When to ask | Why |
+|---|---|
+| After session 3 of a new install | Early signal on first impression |
+| After any session ending `[Vanta risky]` or `[Vanta blocked]` | These are friction points; ask if Vanta helped or hindered |
+| Weekly (max once per week) | Long-term trend |
+| After a "major workflow" (full ship-check, full council, multi-step debugging) | High-stakes moments |
+| Never twice in the same session | Don't double-ask |
+| User can say "don't ask this week" → snoozes for 7 days | Easy escape |
 
 ```
-[Vanta] Quick check before you go: did I save you thinking today?
+[Vanta] Quick check: did I save you thinking today?
 A) Yes
-B) No
-C) Partially — I helped with X but missed Y
+B) Partially — I helped with X but missed Y
+C) No
+D) Don't ask this week
 ```
 
-Logged to `~/.vanta/burn-in.jsonl` as `saved_thinking: yes|no|partial`.
-
-If the answer is **"no" across 10 consecutive sessions** — roll back
-the v3.9 release. The router and UX rewrite were not solving the
-problem the user has.
-
-If the answer is **"partially" with a specific miss** — the miss
-becomes a P1 follow-up before any further v3.9.x ships.
+Logged to `~/.vanta/burn-in.jsonl` as `saved_thinking: yes|partial|no|snoozed`.
 
 ### Success criteria — averages
 
-- User manually remembers commands in **<20%** of sessions
+- Manual command recall in **<20%** of sessions
 - Routing accuracy **>85%**
 - Product-decision asks caught **>95%**
 - Unnecessary council calls **<20%**
-- "Saved me thinking" answer = "yes" or "partially" in **≥7/10**
-  sessions
+- "Saved me thinking" answer = "yes" or "partially" in **≥7 of the
+  asked-windows** (NOT every session)
 
-### Success criteria — absolute hard gates (council R1 P1, both-flagged)
+### Success criteria — absolute hard gates (zero-tolerance)
 
-Averages let one catastrophic session hide. These are zero-tolerance:
+A single failure on any of these fails the entire burn-in regardless
+of average metrics:
 
-- **Zero unasked destructive actions** across all burn-in sessions.
-  An unasked `rm -rf`, `git reset --hard`, `DROP TABLE`, `git push
-  --force`, deploy, package install, secret rotation, or migration
-  fails the entire burn-in regardless of average metrics.
-- **Zero confident wrong-routes that wrote files or sent prompts.**
-  A confident wrong-route caught in preview before any side-effect
-  is annoying but recoverable; a confident wrong-route that already
-  edited code or sent a council call is a trust violation.
-- **Zero unrecoverable Vanta crashes.** A crash that loses session
-  state, leaves the action-log inconsistent, or requires manual
-  intervention to recover fails the gate.
-- **Zero irreversible bad memory promotions.** A global invariant
-  that lands in `vinamr-invariants.md` (not staging) and turns out
-  to be wrong fails the gate. (Reversible promotions to staging
-  are recoverable; promotions to main aren't.)
+- **Zero unasked destructive actions** — `rm -rf`, `git reset --hard`,
+  `git push --force`, `DROP TABLE`, deploy, package install, secret
+  rotation, migration. ALL require ASK.
+- **Zero confident wrong-routes that wrote files or sent paid prompts**.
+  A wrong-route caught in preview is recoverable; a wrong-route that
+  already edited code or fired council is a trust violation.
+- **Zero unrecoverable Vanta crashes** — a crash that loses session
+  state, leaves action-log inconsistent, or requires manual recovery.
+- **Zero irreversible bad memory promotions** — global invariant lands
+  in `vinamr-invariants.md` (not staging) and turns out wrong.
 
-A single failure on any of the absolute gates above is a hard-stop.
-Don't ship v3.9. Don't average it away. Find the root cause, fix it,
+A single failure on any absolute gate → hard-stop, find root cause, fix,
 restart the 10-session burn-in.
 
 ---
 
-## Operations & Trust Boundaries (council R1 P1, both-flagged)
+## Operations & Trust Boundaries
 
-The prior rewrite missed this entirely. A non-engineer founder cares
-about: what data leaves my machine, what does this cost, what happens
-if it crashes, what happens offline. The roadmap can't pretend these
-don't exist.
+The non-engineer founder cares about: what data leaves my machine,
+what does this cost, what happens if it crashes, what happens offline.
 
-### Privacy — what data leaves the machine
+### Privacy — what leaves the machine
 
 | Surface | Stays local | Sent to API |
 |---|---|---|
-| Prompt text | Yes (action-log, route-quality telemetry) | Sent to Codex/Gemini ONLY when council fires (T2 peer or T3 full council) |
-| Diff content | Yes (read by hooks for risk classification) | Sent to Codex/Gemini ONLY when council fires |
-| File paths and basenames | Yes | Names go to Codex/Gemini when council fires; absolute paths stay local |
-| Session ID | Yes | Never sent |
-| Action-log entries | Yes (`~/.vanta/`) | Never sent |
-| Trust metrics | Yes | Never sent |
-| Memory invariants | Yes (`~/.claude/rules/`) | Sent to Gemini via `@import` (Gemini reads vinamr-invariants.md as context) |
-| Codex agent rules | Yes (`~/.codex/AGENTS.md`) | Sent to Codex on every Codex invocation |
+| Prompt text | ✓ (action-log, route-quality) | Only when council fires AND policy permits |
+| Diff content | ✓ (read by hooks for risk classification) | Only when council fires AND policy permits |
+| File paths and basenames | ✓ | Names go to API on council; absolute paths stay local |
+| Session ID | ✓ | Never |
+| Action-log entries | ✓ (`~/.vanta/`) | Never |
+| Trust metrics | ✓ | Never |
+| Memory invariants | ✓ (`~/.claude/rules/`) | Sent to Gemini via `@import` (standard propagation, not a leak) |
+| Codex agent rules | ✓ (`~/.codex/AGENTS.md`) | Sent to Codex on every Codex invocation |
 
-Rule: **anything written to `~/.vanta/` stays local**. Anything in
-`~/.claude/rules/` or `~/.codex/AGENTS.md` is read by other model
-clients via standard import paths — that's the propagation mechanism,
-not a leak.
+Rule: **anything written to `~/.vanta/` stays local**.
 
-What v3.9.0 must add: when a prompt is about to fire a council call,
-the user sees what content will be sent in advance (one-line summary,
-not full diff), with an option to redact:
-
-```
-[Vanta] About to send to Codex + Gemini for review:
-  - The diff for hooks/prompt-rewriter.js (87 lines)
-  - The PR description
-  - The most recent council finding for context
-Cost estimate: ~$0.15. Continue? Y/N/redact
-```
+Repo-level policy gates whether diffs are ever sent for council. Set
+once per repo, enforced silently.
 
 ### Cost — council calls aren't free
 
-Every council call costs real money on the Anthropic / OpenAI / Google
-APIs. v3.9.0 must:
-
-- Estimate cost before firing each council call (token count × model
-  rate; use a small lookup table updated quarterly)
-- Show the estimate in the heartbeat update for any call >$0.05
-- Log actual cost back to `~/.vanta/cost.jsonl` after each call
-- Surface daily and monthly cost rollups in `vanta-status` (CLI binary,
-  not a slash command)
-
-If estimated session cost exceeds **$5**, ASK before continuing:
-
-```
-[Vanta] This session has cost ~$4.80 in council calls. Continue with
-the full council on this next risk check (~$0.30 more)?
-A) Yes
-B) Use single-model peer instead (~$0.10)
-C) Self-review only (no API cost)
-```
+Per-call: <$0.05 silent, $0.05–$0.50 mention, >$0.50 ask. Session:
+<$1 silent, $1–$5 mention at end, >$5 ask to continue. See money
+matrix.
 
 ### Crash recovery — what survives
 
-Vanta's state lives in append-only JSONL files (`~/.vanta/*.jsonl`).
-A crash mid-action means:
-
-- Action-log entry may not have been written → the action effectively
-  didn't happen from Vanta's POV (idempotent: re-running the same
-  prompt produces the same Decision)
-- File edits are committed by Claude Code, not Vanta — they survive
-  crashes regardless
-- In-flight council calls are lost (the API call may complete on the
-  remote side, but Vanta doesn't see the result; user sees the cost
-  on next session start with a "we may have been charged for this" note)
-
-Recovery path: at session start, Vanta scans `~/.vanta/sync-queue.jsonl`
-for entries with `synced: false` AND no terminal status, surfaces them
-to the user:
-
-```
-[Vanta] Last session ended unexpectedly. The council call on
-hooks/prompt-rewriter.js may have completed remotely (~$0.18 charged).
-The diff is unchanged — pick up where you left off?
-A) Yes
-B) Re-run the council
-C) Skip / abandon
-```
+State lives in append-only JSONL. Action-log is idempotent. File edits
+committed by Claude Code survive crashes regardless. In-flight council
+calls may complete remotely; reconciled at next session start with
+honest cost note.
 
 ### Offline — what works without internet
 
 | Feature | Online | Offline |
 |---|---|---|
-| `/vanta <intent>` routing | ✓ | ✓ (all routing is local rule + classifier) |
+| `/vanta <intent>` routing (explicit + ambient) | ✓ | ✓ (all routing local) |
 | Self-review / T0/T1 actions | ✓ | ✓ |
 | Council R1+R2 | ✓ | ✗ — degraded to self-review with explicit message |
 | Memory write (project + global) | ✓ | ✓ (local files only) |
 | Trust metrics | ✓ | ✓ |
-| Inline preview / replace | ✓ | ✓ (rules are local) |
-
-Offline message UX:
+| Inline preview | ✓ | ✓ (rules local) |
 
 ```
-[Vanta] Offline — I can't run a full council right now. I'll do my
-own review pass and flag anything I'd want a second opinion on. Run
-again with internet later if needed.
+[Vanta] Offline — I can't run a full council right now. I'll do my own
+review pass and flag anything I'd want a second opinion on. Run again
+with internet later if needed.
 ```
 
-Vanta NEVER blocks waiting for internet. Degrade gracefully.
+Vanta NEVER blocks waiting for internet.
 
 ---
 
 ## Sequencing summary
 
 ```
-v3.8.2  Internal explain + soak + route-quality telemetry        [hidden from user]
-   │
-v3.9.0  Universal /vanta router (incl. catch-all + cost preview) [the product]
-   │
-v3.9.1  Calm UX response discipline (incl. heartbeats)           [response shape]
-   │
-v3.9.2  Actionable session brief                                  [brief shape]
-   │
-v3.9.3  Action-object model + conversational undo + re-route     [reversibility backbone]
-   │
-v3.9.4  Selective inline preview (now safe)                       [preview only]
-   │
-v3.9.5  Two-eyes escalation UX                                    [escalation language]
-   │
-v3.9.6  Memory UX                                                 [learning surface]
-   │
-v3.9.7  Real-world burn-in (10 sessions, 3 projects, absolute gates) [proof]
+v3.8.2  Hidden observability (explain CLI, soak report, route-quality)
+
+v3.9.0  REVERSIBILITY FOUNDATION              ← prerequisite for everything
+        action-object model + stop + undo + mid-flight re-route
+        cancellation tracker, crash recovery, cost honesty
+
+v3.9.1  Universal /vanta router               ← explicit AND ambient
+        outcome-labeled routes
+        catch-all with inspect-first behavior
+        prompt smoke (40) + stateful scenario smoke (20)
+
+v3.9.2  Calm operator UX
+        standard message shape, heartbeats, "Done means done" states
+
+v3.9.3  Decision boundaries (ASK matrix as code)
+        engineering/product/money/privacy gates wired into executor
+
+v3.9.4  Two-eyes UX + repo-level consent
+        cost-transparent council calls; consent set once per repo
+
+v3.9.5  Actionable session brief
+
+v3.9.6  Memory UX
+        project automatic, global gated, conversational approval
+
+v3.9.7  Selective inline preview (now safe — v3.9.0 already shipped)
+        conversational config control, not JSON edit
+
+v3.9.8  Real-world burn-in
+        10 sessions, 3 projects, sparing "saved me thinking" cadence
+        absolute zero-tolerance gates + average targets
 ```
 
-Critical sequence point per council R1: **v3.9.3 ships before v3.9.4**.
-The action-object model is the prerequisite for safe inline behavior,
-not parallel to it. Any preview without the action-object backbone is
-a tease the user can't recover from.
+The reversibility-first sequencing is the core change vs. all prior
+versions. **Reversibility before autonomy. Inspect before ask. Outcomes
+before commands.**
+
+---
+
+## Hard-stop conditions (any release in v3.9.x)
+
+1. Product decision required — pause for user
+2. Destructive action — confirm before
+3. Prompt-loop smoke gate fails — fix or revert
+4. Stateful scenario smoke fails — fix or revert
+5. Council finds unresolved P1/P2 — address before tag
+6. Real architectural bug — escalate
+7. Unverifiable behavior — find verification path or scope out
+8. Surface delta exceeds the plan — INTERNAL MACHINERY classification
+   in commit body OR defer to v3.10
+9. Burn-in absolute-gate failure — hard-stop, restart burn-in
 
 ---
 
 ## The real v3.9 promise
 
-After v3.9, the user should be able to type:
+After v3.9, the user should be able to type a messy instruction:
 
 ```
-/vanta fix this
+fix this
 ```
 
-…and trust that Vanta knows whether that means:
+…and trust that Vanta will:
 
-- investigate,
-- write tests,
-- ask Codex,
-- call council,
-- check memory,
-- continue prior plan,
-- or stop and ask for a product decision.
+- understand,
+- inspect what's happening,
+- pick the right route,
+- act safely (or ask if it's not safe),
+- verify,
+- report what's done with an honest confidence state,
+- remember anything worth remembering,
+- and stop / undo / re-route the moment the user signals.
 
-**That is the product.**
+That is the product.
 
+Not a router.
 Not inline mode.
-Not trust math.
-Not metrics.
-Not dashboards.
+Not a dashboard.
 
 The product is:
 
-> "I don't know the right engineering workflow. Vanta does."
+> "Vanta turns vague founder intent into a safe engineering outcome."
+
+And the test that matters most — the one that can't be averaged away —
+is the one Vinamr asks himself at the end of a tired session:
+
+> "Did this save me thinking, or did I have to babysit it?"
+
+If the answer is the second one, v3.9 is not done.
