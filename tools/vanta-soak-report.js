@@ -297,6 +297,61 @@ function buildReport({ windowDays = DEFAULT_WINDOW_DAYS } = {}) {
   }
   lines.push('');
 
+  // ── 10. /vanta-sync extraction health (v3.11 commit 5 — MANDATORY per C-7)
+  // Without this section, silent extract regressions are invisible:
+  // a buggy extract bin would silently fall back to transcript scan
+  // (or produce zero candidates), and the user wouldn't know /vanta-sync
+  // had quietly degraded back to the 1M-context wall it was meant to fix.
+  //
+  // Three metrics per the v3.11 done-definition:
+  //   (a) extract success rate (target ≥99%)
+  //   (b) transcript_fallback rate (target <20%)
+  //   (c) standard-context completion proxy (target ≥95%)
+  //       — proxied by extract runs that emit ≥1 candidate without hint
+  const extractEvents = _loadJsonl('sync-extract-events.jsonl').filter(e => _withinWindow(e, sinceMs));
+  lines.push('## 10. /vanta-sync extraction health (v3.11)');
+  lines.push('');
+  if (extractEvents.length === 0) {
+    lines.push('_No /vanta-sync runs in window._');
+    lines.push('');
+  } else {
+    const total = extractEvents.length;
+    const ok = extractEvents.filter(e => e.success !== false).length;
+    const successRate = Math.round(100 * ok / total);
+    const withHint = extractEvents.filter(e => e.transcript_hint_emitted === true).length;
+    const fallbackRate = Math.round(100 * withHint / total);
+    const standardOk = extractEvents.filter(e =>
+      e.success !== false && (e.candidate_count > 0 || e.transcript_hint_emitted !== true)
+    ).length;
+    const standardRate = Math.round(100 * standardOk / total);
+    const zeroCandidate = extractEvents.filter(e => (e.candidate_count || 0) === 0).length;
+    const zeroRate = Math.round(100 * zeroCandidate / total);
+    const avgDuration = Math.round(
+      extractEvents.reduce((s, e) => s + (e.duration_ms || 0), 0) / total
+    );
+
+    const flag = (rate, target, dir) => {
+      if (dir === 'gte' && rate < target) return ' ⚠';
+      if (dir === 'lte' && rate > target) return ' ⚠';
+      return '';
+    };
+    lines.push(`- Total /vanta-sync extract runs: **${total}**`);
+    lines.push(`- Extract success rate: **${successRate}%** (target ≥99%)${flag(successRate, 99, 'gte')}`);
+    lines.push(`- Standard-context completion: **${standardRate}%** (target ≥95%)${flag(standardRate, 95, 'gte')}`);
+    lines.push(`- Transcript-fallback rate: **${fallbackRate}%** (target <20%)${flag(fallbackRate, 20, 'lte')}`);
+    lines.push(`- Zero-candidate runs: **${zeroRate}%** (high may indicate extract regression)`);
+    lines.push(`- Avg duration: **${avgDuration}ms**`);
+    if (zeroRate > 50) {
+      lines.push('');
+      lines.push('  > ⚠ More than half of runs produce zero candidates. Check `~/.vanta/episodes.jsonl` is being written by the Stop hook.');
+    }
+    if (fallbackRate > 20) {
+      lines.push('');
+      lines.push('  > ⚠ Transcript fallback rate above 20% target. The structured-telemetry path is missing signals — investigate auto-sync.js Stop hook.');
+    }
+    lines.push('');
+  }
+
   // ── 9. Missed-Intent Clusters (v3.10 commit 5) ─────────────────────
   // Better than topN by exact-string: clusters semantically-similar
   // missed prompts together so the operator can see "5 prompts about
