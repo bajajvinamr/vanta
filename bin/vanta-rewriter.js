@@ -35,12 +35,143 @@
 //     construct rewrite chains. v3.6.18 prompt-injection guard.
 
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 
 let _safetyFloor;
 function safetyFloor() {
   if (_safetyFloor) return _safetyFloor;
   try { _safetyFloor = require('./vanta-safety-floor'); } catch {}
   return _safetyFloor;
+}
+
+// v3.10 commit 3 — quarantine state loader with mtime revalidation
+// (council C-6 fix: no process-local TTL; revalidate on file mtime each
+// decide() call so multi-tab readers see the same authoritative state).
+//
+// State source: ~/.vanta/rule-effectiveness.jsonl. Latest entry per
+// rule_id (max status_seq tiebreaker — C-8) determines current status.
+// `quarantined` rules are skipped during rule matching; the rewriter
+// behaves as if they don't exist for the purpose of intent dispatch.
+//
+// Auto-rehab: if a quarantined rule's current content hash (extracted
+// from THIS file at runtime) differs from the hash recorded at quarantine
+// time, the rule was edited. The rewriter does NOT auto-write the
+// rehab — that's the rule-tune CLI's job; we just skip the quarantine
+// check and let the rule fire. Persisting the rehab state is the
+// CLI's concern; this hot-path stays read-only.
+const _quarantineState = {
+  cacheKey: '',  // composite of mtimeMs + size (R2 council Gemini P2)
+  quarantinedRuleIds: new Set(),
+  blockHashesAtQuarantine: new Map(),  // rule_id -> hash recorded at quarantine
+  lastFile: null,
+};
+function _vantaDir() {
+  return process.env.VANTA_DIR_OVERRIDE || path.join(os.homedir(), '.vanta');
+}
+function _ruleEffectivenessFile() {
+  return path.join(_vantaDir(), 'rule-effectiveness.jsonl');
+}
+function _refreshQuarantineState() {
+  const file = _ruleEffectivenessFile();
+  // R2 council fix (Gemini P2): mtime alone is unreliable on coarse-
+  // resolution filesystems — same-tick rapid CLI writes can leave
+  // mtime unchanged and the rewriter would serve stale quarantine
+  // state. Composite mtime + size catches append-only writes which
+  // ALWAYS bump file size.
+  let cacheKey = '0:0';
+  try {
+    const st = fs.statSync(file);
+    cacheKey = `${st.mtimeMs}:${st.size}`;
+  } catch { /* file may not exist yet */ }
+  if (cacheKey === _quarantineState.cacheKey && file === _quarantineState.lastFile) return;
+  _quarantineState.cacheKey = cacheKey;
+  _quarantineState.lastFile = file;
+  const mtime = parseFloat(cacheKey.split(':')[0]) || 0;
+  _quarantineState.quarantinedRuleIds = new Set();
+  _quarantineState.blockHashesAtQuarantine = new Map();
+  if (mtime === 0) return;  // no file → no quarantines
+
+  // Read live file only (C-11). Fold by rule_id, max(status_seq) wins.
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return; }
+  const byRule = new Map();
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let e; try { e = JSON.parse(t); } catch { continue; }
+    if (!e || !e.rule_id) continue;
+    const prior = byRule.get(e.rule_id);
+    if (!prior) { byRule.set(e.rule_id, e); continue; }
+    if ((e.status_seq || 0) > (prior.status_seq || 0)) {
+      byRule.set(e.rule_id, e);
+    } else if ((e.status_seq || 0) === (prior.status_seq || 0) && (e.ts || '') >= (prior.ts || '')) {
+      byRule.set(e.rule_id, e);
+    }
+  }
+  for (const [ruleId, entry] of byRule) {
+    if (entry.status === 'quarantined') {
+      _quarantineState.quarantinedRuleIds.add(ruleId);
+      if (entry.rule_content_hash) {
+        _quarantineState.blockHashesAtQuarantine.set(ruleId, entry.rule_content_hash);
+      }
+    }
+  }
+}
+
+// Per-rule auto-rehab check (C-3): when a rule's current content hash
+// differs from the one recorded at quarantine time, the rule was edited
+// and should be considered active again. We compute current hashes
+// lazily — only when at least one rule is quarantined.
+let _currentBlockHashes = null;
+let _currentBlockHashesCacheKey = 0;
+function _computeCurrentBlockHashes() {
+  // Use this file's own composite (mtime + size) as the cache key.
+  // The rewriter's RULES array is in this very file, so any rule edit
+  // bumps mtime AND size. Composite key — R2 council fix (Gemini P2).
+  // R2 council fix (Codex P3): realpath canonicalization so symlinks /
+  // npm-link / monorepo dupes converge to one identifier.
+  let cacheKey = '0:0';
+  let myFile = __filename;
+  try { myFile = fs.realpathSync(__filename); } catch { myFile = __filename; }
+  try {
+    const st = fs.statSync(myFile);
+    cacheKey = `${myFile}:${st.mtimeMs}:${st.size}`;
+  } catch {}
+  if (_currentBlockHashes && cacheKey === _currentBlockHashesCacheKey) return _currentBlockHashes;
+
+  // Lazy-load the extractor from vanta-rule-effectiveness.js. Best-
+  // effort — if missing (older install), auto-rehab is unavailable
+  // and quarantine persists until manual rehab via rule-tune CLI.
+  let extractor = null;
+  for (const p of [
+    path.join(__dirname, 'vanta-rule-effectiveness.js'),
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-rule-effectiveness.js'),
+  ]) {
+    try { const m = require(p); if (m.extractRuleBlockHashes) { extractor = m.extractRuleBlockHashes; break; } }
+    catch (_) { /* try next */ }
+  }
+  if (!extractor) { _currentBlockHashes = new Map(); _currentBlockHashesCacheKey = cacheKey; return _currentBlockHashes; }
+
+  let source = null;
+  try { source = fs.readFileSync(myFile, 'utf8'); } catch {}
+  _currentBlockHashes = source ? extractor(source) : new Map();
+  _currentBlockHashesCacheKey = cacheKey;
+  return _currentBlockHashes;
+}
+
+function _isQuarantined(ruleId) {
+  _refreshQuarantineState();
+  if (!_quarantineState.quarantinedRuleIds.has(ruleId)) return false;
+  // Auto-rehab check (C-3): if current hash differs from quarantine-time
+  // hash, the rule was edited. Treat as not-quarantined for THIS call.
+  // (CLI persists the actual rehab.)
+  const recordedHash = _quarantineState.blockHashesAtQuarantine.get(ruleId);
+  if (!recordedHash) return true;  // no hash recorded → can't auto-rehab → stays quarantined
+  const current = _computeCurrentBlockHashes();
+  const currentHash = current.get(ruleId);
+  if (!currentHash) return true;
+  return currentHash === recordedHash;  // unchanged → still quarantined
 }
 
 let _killSwitch;
@@ -315,6 +446,13 @@ function rewrite(prompt, context = {}) {
 
   // 4. Rule-based templates.
   for (const r of RULES) {
+    // v3.10 commit 3 — skip quarantined rules. The rewriter behaves as
+    // if the rule doesn't exist; the next matching rule (if any) takes
+    // priority. Auto-rehab fires inside _isQuarantined when the rule's
+    // content hash has changed since quarantine. Best-effort: if the
+    // quarantine state can't be loaded (older install, missing file),
+    // _isQuarantined returns false and the rewriter behaves as v3.9.x.
+    if (_isQuarantined(r.id)) continue;
     if (r.rx.test(prompt)) {
       // Some rules emit `ask` mode for product/irreversible decisions.
       // The hook surfaces "/<route> recommended · T3 ASK" instead of
@@ -375,6 +513,11 @@ function candidatesFor(prompt) {
   if (!prompt || typeof prompt !== 'string') return [];
   const matches = [];
   for (const r of RULES) {
+    // v3.10 commit 3 — quarantined rules are invisible to telemetry too.
+    // If we counted them in n_candidates, top1_top2_margin would shrink
+    // for prompts that match a quarantined rule, falsely flagging the
+    // route as ambiguous in the soak report.
+    if (_isQuarantined(r.id)) continue;
     if (r.rx.test(prompt)) matches.push({ id: r.id, intent: r.intent });
   }
   return matches;

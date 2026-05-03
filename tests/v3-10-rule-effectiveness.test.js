@@ -240,17 +240,20 @@ test('quarantineEligible — threshold logic', async (t) => {
 });
 
 test('snapshot + readLatestStatus — C-8 monotonic seq + dedup', async (t) => {
-  await t.test('writes snapshot entries with monotonic per-rule seq', () => {
+  await t.test('snapshot observes at seq=prior (no bump) — R1 council fix', () => {
+    // Post-R1 council fix (Codex P1 + Gemini P1): snapshot is OBSERVATION
+    // and must NOT bump status_seq, otherwise concurrent setStatus calls
+    // get stomped. Only setStatus (manual policy) increments seq.
     _reset();
     const r1 = { rule_id: 'r1', fires: 10, unscorable: 0, proceeded: 8, recalled: 0, undone: 1, rerouted: 1, stopped: 0, success_rate: 0.8, ci_lower: 0.5, last_50_window_rate: 0.8 };
     const w1 = re.snapshot([r1]);
     assert.equal(w1.length, 1);
-    assert.ok(w1[0].status_seq >= 1);
+    assert.equal(w1[0].status_seq, 0, 'first snapshot at seq=0 (prior was null)');
     const w2 = re.snapshot([r1]);
-    assert.ok(w2[0].status_seq > w1[0].status_seq, 'seq increases across snapshots');
+    assert.equal(w2[0].status_seq, 0, 'subsequent snapshots stay at seq=0 — no bump');
   });
 
-  await t.test('readLatestStatus returns the highest-seq entry per rule', () => {
+  await t.test('readLatestStatus returns latest snapshot by ts when seqs tie', () => {
     _reset();
     const r1 = { rule_id: 'r1', fires: 5, unscorable: 0, proceeded: 5, recalled: 0, undone: 0, rerouted: 0, stopped: 0, success_rate: 1.0, ci_lower: 0.5, last_50_window_rate: 1.0 };
     re.snapshot([r1]);
@@ -259,9 +262,19 @@ test('snapshot + readLatestStatus — C-8 monotonic seq + dedup', async (t) => {
     const status = re.readLatestStatus();
     assert.ok(status.has('r1'));
     const last = status.get('r1');
-    assert.ok(last.status_seq > 0);
-    // Verify it's the LATEST (file should have 3 entries; reader returns 1)
-    assert.equal(status.size, 1);
+    // All three snapshot entries share seq=0; ts breaks tie.
+    assert.equal(status.size, 1, 'only one entry returned per rule');
+  });
+
+  await t.test('setStatus seq=1 dominates any snapshot (which stays at seq=0)', () => {
+    _reset();
+    const r1 = { rule_id: 'rd', fires: 5, unscorable: 0, proceeded: 5, recalled: 0, undone: 0, rerouted: 0, stopped: 0, success_rate: 1.0, ci_lower: 0.5, last_50_window_rate: 1.0 };
+    re.snapshot([r1]);  // seq=0
+    re.setStatus('rd', 'quarantined', { reason: 'manual' });  // seq=1
+    re.snapshot([r1]);  // seq=0 again — must not stomp
+    const last = re.readLatestStatus().get('rd');
+    assert.equal(last.status, 'quarantined', 'manual decision sticks');
+    assert.equal(last.status_seq, 1, 'setStatus seq=1 beats snapshot seq=0');
   });
 
   await t.test('flagged status set when snapshot crosses threshold', () => {

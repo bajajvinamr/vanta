@@ -128,17 +128,7 @@ function extractRuleBlockHashes(rewriterSource) {
       if (ch === '}') break;
     }
     if (openPos === -1) continue;
-    // Brace-count forward to find the matching `}`.
-    let depth = 0;
-    let closePos = -1;
-    for (let j = openPos; j < rewriterSource.length; j++) {
-      const ch = rewriterSource[j];
-      if (ch === '{') depth++;
-      else if (ch === '}') {
-        depth--;
-        if (depth === 0) { closePos = j; break; }
-      }
-    }
+    const closePos = _findMatchingBrace(rewriterSource, openPos);
     if (closePos === -1) continue;
     const block = rewriterSource.slice(openPos, closePos + 1);
     out.set(ruleId, crypto.createHash('sha256').update(block).digest('hex'));
@@ -146,13 +136,145 @@ function extractRuleBlockHashes(rewriterSource) {
   return out;
 }
 
-// Read the raw rewriter source (deployed location preferred, repo fallback).
+// v3.10 commit 3 R1 council fix (Gemini P1): naive brace counting
+// breaks on literal `{` or `}` inside regex literals (`rx: /[{}]/`),
+// strings, template literals, or comments. The current corpus is
+// internally balanced (`{0,80}`) but a future rule like `rx: /[}]/`
+// would corrupt depth. Tokenizer skips:
+//   - line comments  (// ... \n)
+//   - block comments (/* ... */)
+//   - single-quoted strings ('...' with \\ escape)
+//   - double-quoted strings ("..." with \\ escape)
+//   - template literals (`...` with ${} interpolation, recurses on braces)
+//   - regex literals (/.../ with [...] char-class awareness)
+// Returns the position of the matching `}` for the `{` at openPos, or
+// -1 if unbalanced.
+function _findMatchingBrace(src, openPos) {
+  let depth = 0;
+  let i = openPos;
+  // Stack tracks template-literal nesting so ${} interpolation can recurse.
+  const tmplStack = [];
+  while (i < src.length) {
+    const ch = src[i];
+    const next = src[i + 1];
+    // Line comment
+    if (ch === '/' && next === '/') {
+      i = src.indexOf('\n', i);
+      if (i === -1) return -1;
+      i++;
+      continue;
+    }
+    // Block comment
+    if (ch === '/' && next === '*') {
+      const end = src.indexOf('*/', i + 2);
+      if (end === -1) return -1;
+      i = end + 2;
+      continue;
+    }
+    // Single-quoted string
+    if (ch === "'") {
+      i++;
+      while (i < src.length && src[i] !== "'") {
+        if (src[i] === '\\') i += 2; else i++;
+      }
+      i++;
+      continue;
+    }
+    // Double-quoted string
+    if (ch === '"') {
+      i++;
+      while (i < src.length && src[i] !== '"') {
+        if (src[i] === '\\') i += 2; else i++;
+      }
+      i++;
+      continue;
+    }
+    // Template literal
+    if (ch === '`') {
+      i++;
+      while (i < src.length && src[i] !== '`') {
+        if (src[i] === '\\') { i += 2; continue; }
+        if (src[i] === '$' && src[i + 1] === '{') {
+          // Recurse on the interpolation: count braces inside, return
+          // here when depth balances.
+          const innerOpen = i + 1;
+          const innerClose = _findMatchingBrace(src, innerOpen);
+          if (innerClose === -1) return -1;
+          i = innerClose + 1;
+          continue;
+        }
+        i++;
+      }
+      i++;
+      continue;
+    }
+    // Regex literal — only when context permits (after `=`, `(`, `,`, `:`, `[`, `!`, `&`, `|`, `?`, `;`, `{`, return, etc.)
+    if (ch === '/' && _canStartRegex(src, i)) {
+      i++;
+      let inClass = false;
+      while (i < src.length) {
+        const c = src[i];
+        if (c === '\\') { i += 2; continue; }
+        if (c === '[') { inClass = true; i++; continue; }
+        if (c === ']') { inClass = false; i++; continue; }
+        if (c === '/' && !inClass) { i++; break; }
+        if (c === '\n') break;  // unterminated — bail
+        i++;
+      }
+      // Skip regex flags
+      while (i < src.length && /[gimsuy]/.test(src[i])) i++;
+      continue;
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return i;
+    }
+    i++;
+  }
+  return -1;
+}
+
+// Heuristic: a `/` starts a regex literal if the previous non-whitespace
+// char is one that allows a regex in JS grammar (operators, openers,
+// keywords). Otherwise it's division.
+function _canStartRegex(src, slashPos) {
+  for (let k = slashPos - 1; k >= 0; k--) {
+    const c = src[k];
+    if (/\s/.test(c)) continue;
+    if (/[=([,:!&|?;{+\-*%^~<>]/.test(c)) return true;
+    // Word context: check if the trailing word is a keyword that allows regex
+    if (/\w/.test(c)) {
+      let end = k + 1;
+      while (k >= 0 && /\w/.test(src[k])) k--;
+      const word = src.slice(k + 1, end);
+      return /^(return|typeof|in|of|instanceof|new|delete|void|throw|case|do|else|yield|await)$/.test(word);
+    }
+    return false;
+  }
+  return true;  // start of file
+}
+
+// Read the raw rewriter source. v3.10 commit 3 R1 council fix
+// (Codex P1 + Gemini P2): the rewriter uses __filename to compute its
+// OWN content hash. If we prefer ~/.claude/bin/vanta-rewriter.js here
+// while the live rewriter is running from the repo (dev), the hashes
+// will diverge → instant auto-rehab on every quarantined rule. Always
+// prefer the file ADJACENT to this module (i.e., the rewriter that
+// shipped together with us in the same install location). This keeps
+// CLI quarantine and runtime check evaluating the same source.
 function readRewriterSource() {
+  // R2 council fix (Codex P3): canonicalize via realpath so symlinks,
+  // npm-link, and monorepo duplicate installs converge to one path.
+  // The rewriter ALSO realpath()s its own __filename — they must agree.
   for (const p of [
-    path.join(os.homedir(), '.claude', 'bin', 'vanta-rewriter.js'),
     path.join(__dirname, 'vanta-rewriter.js'),
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-rewriter.js'),
   ]) {
-    try { return fs.readFileSync(p, 'utf8'); } catch (_) { /* try next */ }
+    try {
+      const real = fs.realpathSync(p);
+      return fs.readFileSync(real, 'utf8');
+    } catch (_) { /* try next */ }
   }
   return null;
 }
@@ -370,14 +492,17 @@ function snapshot(scoredRules, { reason = null } = {}) {
   const file = _effectivenessFile();
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const now = new Date().toISOString();
-  const priorStatus = readLatestStatus();
   const written = [];
   for (const rule of scoredRules) {
-    const prior = priorStatus.get(rule.rule_id);
-    const seq = (prior?.status_seq || 0) + 1 + Math.floor(Math.random() * 1000);
-    // Keep status semantically aligned with what compute() observed; the
-    // rule-tune CLI overrides via separate writes when manually
-    // quarantining/rehabilitating.
+    // v3.10 commit 3 R1 council fix (Codex P1 + Gemini P1):
+    // Re-read status per-rule so we never overwrite a manual setStatus()
+    // that landed during this snapshot batch. snapshot() is OBSERVATION,
+    // not policy — it must NOT increment status_seq, otherwise a
+    // concurrent setStatus(quarantined) gets stomped by the next
+    // snapshot's higher-seq entry. Manual decisions (setStatus +1) always
+    // dominate; snapshots tie on seq and lose to any newer setStatus.
+    const prior = readLatestStatus().get(rule.rule_id);
+    const seq = (prior?.status_seq || 0);  // observe — do NOT bump
     const elig = quarantineEligible(rule);
     let status = prior?.status || 'active';
     let statusReason = prior?.status_reason || null;
@@ -449,6 +574,67 @@ function readLatestStatus({ allHistory = false } = {}) {
   return byRule;
 }
 
+// ─── Status change writer ───────────────────────────────────────────
+//
+// Used by the rule-tune CLI to persist quarantine / rehabilitate
+// decisions. Distinct from snapshot() in two ways:
+//   - kind: 'status_change' (vs 'snapshot') — soak report can filter
+//     human-driven changes from auto-flagging observations.
+//   - On rehabilitate, scoring_epoch_start_ts is reset to `now` (C-5)
+//     so subsequent scoring ignores pre-rehab fires.
+//
+// Returns the entry written (for tests / CLI confirm output). Throws
+// on an unknown status. The caller is responsible for confirming
+// rule_id exists in the corpus — we don't validate that here so the
+// CLI can tear-down rules that were removed from the rewriter.
+const VALID_STATUSES = Object.freeze(['active', 'flagged', 'quarantined']);
+function setStatus(ruleId, newStatus, { reason = null, contentHash = null } = {}) {
+  if (!ruleId || typeof ruleId !== 'string') throw new Error('setStatus: rule_id required');
+  if (!VALID_STATUSES.includes(newStatus)) {
+    throw new Error(`setStatus: status must be one of ${VALID_STATUSES.join('|')}, got ${newStatus}`);
+  }
+  const file = _effectivenessFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const now = new Date().toISOString();
+  const priorStatus = readLatestStatus();
+  const prior = priorStatus.get(ruleId);
+  const seq = (prior?.status_seq || 0) + 1;
+  // On rehabilitate (status flipping back to active from quarantined),
+  // open a new scoring epoch so prior fires don't pull the rule back
+  // into quarantine immediately. C-5 fix.
+  let scoringEpochStartTs = prior?.scoring_epoch_start_ts || null;
+  if (newStatus === 'active' && prior?.status === 'quarantined') {
+    scoringEpochStartTs = now;
+  }
+  // If quarantining and no contentHash provided, try to extract from
+  // current rewriter source. Required for auto-rehab to work later.
+  let resolvedHash = contentHash;
+  if (newStatus === 'quarantined' && !resolvedHash) {
+    const source = readRewriterSource();
+    if (source) {
+      const hashes = extractRuleBlockHashes(source);
+      resolvedHash = hashes.get(ruleId) || null;
+    }
+  }
+  if (!resolvedHash && prior?.rule_content_hash) {
+    resolvedHash = prior.rule_content_hash;
+  }
+  const entry = {
+    ts: now,
+    rule_id: ruleId,
+    kind: 'status_change',
+    status: newStatus,
+    status_reason: reason,
+    status_changed_at: now,
+    status_seq: seq,
+    rule_content_hash: resolvedHash || null,
+    scoring_epoch_start_ts: scoringEpochStartTs,
+    prior_status: prior?.status || null,
+  };
+  jsonl().appendJsonlLine(file, entry);
+  return entry;
+}
+
 // Convenience: list of rule_ids currently in `quarantined` status.
 function listQuarantined() {
   const status = readLatestStatus();
@@ -466,6 +652,8 @@ module.exports = {
   buildOutcomeMap,
   quarantineEligible,
   snapshot,
+  setStatus,
+  VALID_STATUSES,
   readLatestStatus,
   listQuarantined,
   extractRuleBlockHashes,
