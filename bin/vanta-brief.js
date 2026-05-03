@@ -173,6 +173,28 @@ function stalePRs(cwd, days = 3) {
 }
 
 // ─── Compose brief ──────────────────────────────────────────────────────────
+// v3.9.0 — surface stale/pending action state from the v3.9 ledger so
+// the user sees crash-recovery context at session start before doing
+// anything else. Returns the structured renderBrief() payload (or null
+// when nothing to surface or the module isn't deployed yet).
+function crashRecovery(slug) {
+  try {
+    for (const p of [
+      path.join(os.homedir(), '.claude', 'bin', 'vanta-crash-recovery.js'),
+      path.join(__dirname, 'vanta-crash-recovery.js'),
+    ]) {
+      if (!fs.existsSync(p)) continue;
+      const cr = require(p);
+      if (cr && typeof cr.renderBrief === 'function') {
+        const r = cr.renderBrief({ project: slug });
+        if (r && r.show) return r;
+      }
+      return null;
+    }
+  } catch (_) { /* never break the brief on recovery errors */ }
+  return null;
+}
+
 function compose({ cwd }) {
   const slug = getProjectSlug(cwd);
   const project = path.basename(cwd);
@@ -188,6 +210,7 @@ function compose({ cwd }) {
     unsynced: unsyncedSessions(cwd),
     routing_misses: recentMisses(),
     stale_prs: stalePRs(cwd),
+    crash_recovery: crashRecovery(slug),
   };
 
   const lines = [];
@@ -208,6 +231,23 @@ function compose({ cwd }) {
 
   // Line 3 — stale signals (cap at 2 — don't overwhelm)
   const stale = [];
+  // v3.9.0 — crash-recovery brief comes FIRST when present. Stale
+  // pending actions / cancellations to reconcile are higher-priority
+  // than the routine signals below; the user picks an option (accept /
+  // re-run / skip) before continuing.
+  // renderBrief() returns { show, lines, options, scan_result } — the
+  // human summary lives at scan_result.summary; in safe mode the
+  // re-run option is hidden, so the prompt list is conditional.
+  if (signals.crash_recovery && signals.crash_recovery.show) {
+    const summary = signals.crash_recovery.scan_result
+      && signals.crash_recovery.scan_result.summary;
+    if (summary) {
+      const opts = signals.crash_recovery.safe_mode_active
+        ? '"accept" or "skip"'
+        : '"accept", "re-run", or "skip"';
+      stale.push(`🛟 ${summary} — say ${opts}`);
+    }
+  }
   if (signals.shadow_pending > 0) stale.push(`🌑 ${signals.shadow_pending} plan(s) flagged — /council before implementing`);
   if (signals.stale_decisions.length) {
     stale.push(`Decision ${signals.stale_decisions[0].date} expires in ${signals.stale_decisions[0].expires_in}d`);

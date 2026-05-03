@@ -108,6 +108,17 @@ When resuming:
    If CODEMAP_STALE: suggest "Codebase changed since last index. Run `/codemap` to refresh?"
 4. Continue from exact stopping point — do NOT ask the user to re-explain context
 
+## Conversational Intents (v3.9.0 — handled by prompt-rewriter hook)
+
+Before routing, know that the prompt-rewriter hook already handles four conversational intents BEFORE this skill is invoked. If the user typed one of these phrases, the hook short-circuited with a `[Vanta]` shadow injection and `Skill("vanta-run")` will not fire. Do not duplicate the work:
+
+- **Stop** — "stop", "pause", "halt", "abort", "nevermind", "cancel that" → halts pending action
+- **Undo** — "undo that", "revert that", "roll back" → applies inverse on most recent reversible action
+- **Re-route** — "actually X", "wait, X instead", "no, X" → halts in-flight, pivots to new intent
+- **Safe mode** — "be careful", "safe mode", "back to normal" → toggles top-level masking flag
+
+If for any reason the hook missed (e.g., loaded module failed silently) and the user clearly intended one of these, prefer reporting "Vanta intent handler didn't fire — try restating: stop / undo / safe mode / actually X" rather than re-implementing the intent. The handlers live in `bin/vanta-intent-{stop,undo,reroute}.js` + `bin/vanta-safe-mode.js` and own the lifecycle CAS protocol.
+
 ## Intent Routing (pre-check before state 4)
 
 Before treating an argument as a generic intent, match it against the routing table.

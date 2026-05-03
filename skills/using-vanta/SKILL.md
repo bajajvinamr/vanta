@@ -52,6 +52,32 @@ Omit the Decisions line if `~/.gstack/projects/<slug>/decisions.md` doesn't exis
 | `/vanta-sync` | `Skill("vanta-sync")` | After "done", "shipped", "merged", "that's working" / after `/gsd-ship` |
 | `/council` | `Skill("vanta-council")` | Before arch decisions, auth/payments/security, hard-to-reverse refactor |
 
+## Conversational Intents (v3.9.0 — internal machinery)
+
+Four extra intents fire automatically from natural language — the user types them inline, no slash command. They are wired into the prompt-rewriter hook and run BEFORE the executor; each short-circuits and returns a `[Vanta]` shadow injection. **No new surface — three commands still hold.**
+
+| Intent | Trigger phrases (regex-matched) | What happens |
+|---|---|---|
+| **Stop** | "stop", "pause", "halt", "abort", "nevermind", "cancel that" | Halts the most recent `pending` action via two-phase CAS claim. Cost-honest about possibly-billed remote council calls; reconciles next session. |
+| **Undo** | "undo", "undo that", "revert that", "roll back" | Finds reversible actions in last 30min. Single candidate → applies inverse. Multiple within 5min → asks user A/B/C. |
+| **Re-route** | "actually X", "wait, X instead", "no, X" (where X = test/review/ship/qa/council/investigate/undo) | Halts in-flight, pivots to new intent on the same context. Original prompt is read-time redacted before re-use. |
+| **Safe mode** | Engage: "be careful", "safe mode", "safe mode on", "don't auto", "stop suggesting things", "conservative mode". Exit: "back to normal", "exit safe mode", "safe mode off" | Top-level masking flag (does NOT clobber preferences). Forces ambient/council/memory_promotion/inline_preview to "off" until exit. |
+
+When a user says one of these phrases, do **not** also fire the rewriter or invoke a skill — the hook handles it. Confirm what happened conversationally, then continue.
+
+**Crash-recovery brief at session start:** if the prior session left `pending` actions or cancellations needing reconciliation, the session brief surfaces a `🛟` line:
+```
+🛟 N stale action(s) from a prior session — say "accept", "re-run", or "skip"
+```
+Wait for the user's choice. "accept" finalizes pending → applied; "re-run" leaves them and the executor re-fires on next prompt (idempotent); "skip" marks them rollback_failed with reason `crash-recovery:skip`. In safe mode the "re-run" option is hidden — accept and skip remain.
+
+## Hidden Observability (v3.8.2 — for builders, not surface)
+
+These exist for debugging Vanta itself; never expose to the user as commands:
+- `node bin/vanta-executor.js --explain "<prompt>"` — show the full Decision (rule_id, confidence, top1_top2_margin, n_candidates, skill_route, tier).
+- `node tools/vanta-soak-report.js --window 7` — markdown report of route quality, recall events, action lifecycle, and missed intents over the last N days.
+- Telemetry streams (read-only, secret-redacted): `~/.vanta/route-quality.jsonl`, `~/.vanta/manual-recalls.jsonl`, `~/.vanta/actions.jsonl`, `~/.vanta/cancellations.jsonl`.
+
 ## Proactive Trigger Rules
 
 **Suggest /vanta when:**

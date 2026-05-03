@@ -59,6 +59,37 @@ function _empty() {
   process.exit(0);
 }
 
+// v3.9.0 — emit a structured shadow injection and exit. Used by the
+// intent-handler chain (safe-mode, stop, undo, reroute) which short-
+// circuit the rewriter when they detect their trigger phrases.
+function _emit(additionalContext) {
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'UserPromptSubmit',
+      additionalContext: additionalContext || '',
+    },
+  }));
+  process.exit(0);
+}
+
+// Best-effort require helper for v3.9.0 intent modules. Distinguishes
+// MODULE_NOT_FOUND (degraded mode is OK) from runtime errors (loud
+// warning so a syntax error in a handler doesn't silently revert the
+// hook to old behavior). Mirrors the executor + projects-load pattern.
+function _tryLoad(name) {
+  const p = _resolveBin(name);
+  if (!p) return null;
+  try { return require(p); }
+  catch (err) {
+    if (err && err.code !== 'MODULE_NOT_FOUND') {
+      try { vlog().warn(`prompt-rewriter.${name}-load`,
+        `${p}: ${err && err.message ? err.message : String(err)}`); }
+      catch (_) { /* never let logging break the hook */ }
+    }
+    return null;
+  }
+}
+
 let stdinBuf = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', c => stdinBuf += c);
@@ -112,6 +143,69 @@ process.stdin.on('end', () => {
     }
   }
   if (!project) project = path.basename(cwd);
+
+  // v3.9.0 intent-handler chain — short-circuits BEFORE the rewriter.
+  // Order is precedence (safe-mode is outermost because it's a toggle,
+  // not an action consumer; stop/undo/reroute all relate to in-flight
+  // state and should bypass the rewriter entirely when they fire).
+  // Each handler is wrapped in its own try/catch so a runtime error in
+  // one handler doesn't cascade into the others or break the rewriter.
+  //
+  // Surface Impact Discipline: this adds NO new commands. The user's
+  // natural language ("be careful", "stop", "undo that", "actually X")
+  // is detected and routed; the three-command promise is preserved.
+
+  // 1. Safe mode — toggle. detectEngage / detectExit fire on tight
+  //    patterns ("safe mode on", "back to normal"). When fired, we
+  //    inject the message and short-circuit. When the prompt does not
+  //    match either pattern, handle() returns kind='noop' and we fall
+  //    through to the next layer.
+  try {
+    const safe = _tryLoad('vanta-safe-mode.js');
+    if (safe && typeof safe.handle === 'function') {
+      const sm = safe.handle({ project, prompt });
+      if (sm && (sm.kind === 'engaged' || sm.kind === 'exited')) {
+        return _emit(sm.message);
+      }
+    }
+  } catch (err) { try { vlog().warn('prompt-rewriter.safe-mode', err && err.message ? err.message : String(err)); } catch (_) {} }
+
+  // 2. Stop — "stop", "halt", "abort", "nevermind". Halts the most
+  //    recent pending action (two-phase claim → finalize). Any detect()
+  //    hit short-circuits — even if nothing is in flight, we still tell
+  //    the user we caught the signal.
+  try {
+    const stop = _tryLoad('vanta-intent-stop.js');
+    if (stop && typeof stop.detect === 'function' && stop.detect(prompt)) {
+      const r = stop.handle({ project, session: sessionId, prompt });
+      return _emit((r && r.message) || '[Vanta blocked] Stopped.');
+    }
+  } catch (err) { try { vlog().warn('prompt-rewriter.stop', err && err.message ? err.message : String(err)); } catch (_) {} }
+
+  // 3. Undo — "undo", "revert that", "roll back". Finds reversible
+  //    actions in the last 30min and either applies the inverse (single
+  //    candidate) or asks (multiple within 5min ambiguity window).
+  try {
+    const undo = _tryLoad('vanta-intent-undo.js');
+    if (undo && typeof undo.detect === 'function' && undo.detect(prompt)) {
+      const r = undo.handle({ project, session: sessionId, prompt });
+      let msg = '[Vanta] Undo handled.';
+      if (r && r.message) msg = r.message;
+      else if (r && r.kind === 'apply' && r.result && r.result.message) msg = r.result.message;
+      return _emit(msg);
+    }
+  } catch (err) { try { vlog().warn('prompt-rewriter.undo', err && err.message ? err.message : String(err)); } catch (_) {} }
+
+  // 4. Re-route — "actually X", "wait X instead", "no, X". Halts the
+  //    in-flight action and pivots to the new intent. Falls through if
+  //    the replacement doesn't match a known route (handler ASKs).
+  try {
+    const reroute = _tryLoad('vanta-intent-reroute.js');
+    if (reroute && typeof reroute.detect === 'function' && reroute.detect(prompt)) {
+      const r = reroute.handle({ project, session: sessionId, prompt });
+      return _emit((r && r.message) || '[Vanta] Switching route.');
+    }
+  } catch (err) { try { vlog().warn('prompt-rewriter.reroute', err && err.message ? err.message : String(err)); } catch (_) {} }
 
   // Resolve executor bin and call it directly (in-process).
   const executorPath = _resolveBin('vanta-executor.js');
