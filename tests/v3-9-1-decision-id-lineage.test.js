@@ -234,6 +234,45 @@ test('v3.9.1 — vanta-jsonl readMergedJsonl includeBaks flag', async (t) => {
   });
 });
 
+// ─── Final-council fix: action-log persists decision_id ─────────────
+
+test('Final-council fix: action-log persists decision_id top-level', async (t) => {
+  await t.test('action-log.record persists decision_id field', () => {
+    _reset();
+    const al = require('../bin/vanta-action-log.js');
+    const written = al.record({
+      action: 'rewrite',
+      session_id: 'sess-1',
+      project: 'test',
+      decision: 'auto',
+      decision_id: 'dec-from-rewriter-123',
+      undo_hint: { kind: 'rewriter-shadow', payload: { decision_id: 'dec-from-rewriter-123' } },
+    });
+    assert.ok(written, 'record() returned non-null');
+    assert.equal(written.decision_id, 'dec-from-rewriter-123',
+      'decision_id is persisted top-level');
+
+    // Read back from disk to confirm
+    const file = path.join(VANTA_TMP, 'actions.jsonl');
+    const raw = fs.readFileSync(file, 'utf8').trim();
+    const entry = JSON.parse(raw.split('\n')[0]);
+    assert.equal(entry.decision_id, 'dec-from-rewriter-123',
+      'on-disk entry has decision_id');
+  });
+
+  await t.test('action-log.record handles entries without decision_id (back-compat)', () => {
+    _reset();
+    const al = require('../bin/vanta-action-log.js');
+    const written = al.record({
+      action: 'rewrite-skip',
+      session_id: 'sess-1',
+      project: 'test',
+    });
+    assert.ok(written);
+    assert.equal(written.decision_id, null);
+  });
+});
+
 test.after(() => {
   try { fs.rmSync(VANTA_TMP, { recursive: true, force: true }); } catch {}
 });

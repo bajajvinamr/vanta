@@ -281,9 +281,28 @@ function createAction({
 // across crashes; the existing action-log + sync-queue pattern uses
 // append-on-state-change which is crash-safe. Storage cost is bounded
 // by rotation (action-log already rotates at 5MB).
+// v3.10 final-council R2 fix (Codex P2 + Gemini P2): actions.jsonl
+// must rotate or it grows unbounded. Mirrors vanta-action-log.js
+// rotation: rename to .bak.<ts> at 5MB, let appendFileSync recreate
+// the live file. Reapers (auto-sync.js reapStaleBaks) keep last N.
+const ACTIONS_MAX_BYTES = 5_000_000;
+function _maybeRotateActions(file) {
+  try {
+    if (!fs.existsSync(file)) return;
+    const st = fs.statSync(file);
+    if (st.size <= ACTIONS_MAX_BYTES) return;
+    const ts = Date.now() + '.' + process.pid;
+    const target = `${file}.bak.${ts}`;
+    let st2; try { st2 = fs.statSync(file); } catch { return; }
+    if (!st2 || st2.ino !== st.ino || st2.size <= ACTIONS_MAX_BYTES) return;
+    fs.renameSync(file, target);
+  } catch (_) { /* never let rotation fail a write */ }
+}
+
 function persistAction(action) {
   const validated = validateAction(action);
   fs.mkdirSync(_vantaDir(), { recursive: true });
+  _maybeRotateActions(_actionsFile());
   jsonl().appendJsonlLine(_actionsFile(), validated);
   return validated;
 }

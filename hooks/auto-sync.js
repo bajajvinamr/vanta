@@ -424,6 +424,8 @@ process.stdin.on('end', () => {
             'episodes.jsonl',
             'interactions.jsonl',
             'query-log.jsonl',
+            'recent-failures.jsonl',  // v3.10 final-council Gemini P2
+            'actions.jsonl',           // v3.10 final-council R2 P2
           ], 10);
         }
         try { fs.writeFileSync(reapMarker, ''); } catch {}

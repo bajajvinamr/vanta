@@ -295,6 +295,72 @@ function _readJsonlLive(file) {
   } catch (_) { return []; }
 }
 
+// v3.10 final-council Codex P2 + Gemini P2: scoring is OFFLINE batch
+// (called by rule-tune CLI / soak report); it can afford the merged
+// read across bak siblings. Without this, route-quality.jsonl rotation
+// every 5MB drops historical fires and quarantine threshold (50 fires)
+// becomes unreachable on busy installs. C-11 OOM concern only applies
+// to the per-prompt hot-path reader (rewriter._refreshQuarantineState),
+// not to scoring.
+// v3.10 final-council R2 fix (Codex P2 + Gemini P2): cap memory.
+// readMergedJsonl loads the entire bak history into one string. With
+// 10 baks × 5MB each = 50MB, V8 heap overhead is ~150MB. Stream
+// per-file via line-buffered readline to keep RSS bounded. Each entry
+// is parsed and either kept or discarded; we never hold the full text
+// in memory.
+const MAX_PARSE_BYTES_TOTAL = 100 * 1024 * 1024;  // 100MB hard cap
+function _readJsonlMerged(file) {
+  const out = [];
+  // Discover candidate files: live + bak siblings.
+  const candidates = [];
+  try {
+    const dir = path.dirname(file);
+    const base = path.basename(file);
+    if (fs.existsSync(dir)) {
+      const baks = fs.readdirSync(dir)
+        .filter(n => n.startsWith(base + '.bak.'))
+        .sort()  // chronological-ish via timestamp suffix
+        .map(n => path.join(dir, n));
+      candidates.push(...baks);
+    }
+  } catch { /* dir missing — fine */ }
+  if (fs.existsSync(file)) candidates.push(file);
+  let totalRead = 0;
+  for (const fp of candidates) {
+    if (totalRead >= MAX_PARSE_BYTES_TOTAL) break;
+    let st;
+    try { st = fs.statSync(fp); } catch { continue; }
+    if (st.size === 0) continue;
+    // For bounded files (< 5MB by rotation) we can readFileSync; the
+    // total cap above limits the cumulative footprint. For one
+    // anomalously large file (e.g. corruption, missing rotation), use
+    // partial read of the LATEST bytes to preserve recency over history.
+    let raw;
+    try {
+      if (st.size <= 8 * 1024 * 1024) {
+        raw = fs.readFileSync(fp, 'utf8');
+      } else {
+        const fd = fs.openSync(fp, 'r');
+        const cap = Math.min(st.size, 8 * 1024 * 1024);
+        const buf = Buffer.alloc(cap);
+        fs.readSync(fd, buf, 0, cap, st.size - cap);
+        fs.closeSync(fd);
+        raw = buf.toString('utf8');
+        // First (potentially partial) line may be torn; drop it.
+        const firstNl = raw.indexOf('\n');
+        if (firstNl !== -1) raw = raw.slice(firstNl + 1);
+      }
+    } catch { continue; }
+    totalRead += raw.length;
+    for (const line of raw.split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+      try { out.push(JSON.parse(t)); } catch { /* torn — skip */ }
+    }
+  }
+  return out;
+}
+
 // ─── Score one rule from telemetry ───────────────────────────────────
 //
 // Inputs: routeEntries (rule fires from route-quality), outcomes
@@ -395,7 +461,7 @@ function scoreRule(ruleId, routeEntries, outcomesByDecision, recalls, epochStart
 function buildOutcomeMap() {
   const out = new Map();
   // Cancellations (v3.9.0 stream) carry decision_id post-v3.9.1.
-  const cancellations = _readJsonlLive(_cancellationsFile());
+  const cancellations = _readJsonlMerged(_cancellationsFile());
   for (const c of cancellations) {
     if (!c.decision_id) continue;
     const ts = c.cancelled_at || c.ts;
@@ -409,8 +475,25 @@ function buildOutcomeMap() {
     // Latest cancellation per decision_id wins (in case the same decision
     // had multiple cancellations recorded — shouldn't happen, but defensive).
     const prior = out.get(c.decision_id);
-    if (!prior || (ts || '') > (prior.ts || '')) {
+    if (!prior || (ts || '') >= (prior.ts || '')) {
       out.set(c.decision_id, { kind, ts });
+    }
+  }
+  // v3.10 final-council Gemini P1: also fold rolled_back lifecycle from
+  // actions.jsonl. The cancellation stream covers user-initiated
+  // intents (stop/undo/reroute), but VantaAction lifecycle transitions
+  // to 'rolled_back' via _completeRollback() do not write to
+  // cancellations.jsonl. Without this, the scorer sees rollbacks as
+  // 'proceeded'.
+  const actionsFile = path.join(_vantaDir(), 'actions.jsonl');
+  for (const a of _readJsonlMerged(actionsFile)) {
+    if (!a || !a.decision_id) continue;
+    if (a.lifecycle !== 'rolled_back') continue;
+    // Use lifecycle transition ts; fall back to created_at, then ts.
+    const ts = a.rolled_back_at || a.completed_at || a.ts || a.created_at;
+    const prior = out.get(a.decision_id);
+    if (!prior || (ts || '') >= (prior.ts || '')) {
+      out.set(a.decision_id, { kind: 'undone', ts });
     }
   }
   return out;
@@ -422,9 +505,9 @@ function buildOutcomeMap() {
 // Caller (commit 3 — rule-tune CLI / rewriter) decides whether to
 // snapshot, quarantine, or rehabilitate based on these.
 function compute({ project = null, ruleIds = null } = {}) {
-  const routeEntries = _readJsonlLive(_routeQualityFile())
+  const routeEntries = _readJsonlMerged(_routeQualityFile())
     .filter(e => !project || e.project === project);
-  const recalls = _readJsonlLive(_recallsFile())
+  const recalls = _readJsonlMerged(_recallsFile())
     .filter(e => !project || e.project === project);
   const outcomes = buildOutcomeMap();
 

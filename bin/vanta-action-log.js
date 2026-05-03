@@ -99,6 +99,11 @@ function record(entry) {
       trust: entry.trust || 'trusted',
       tier: entry.tier || null,
       decision: entry.decision || 'auto',
+      // v3.10 final-council Codex P1 + Gemini P1: persist decision_id
+      // root field. Without this, the rewriter's action-log entry drops
+      // decision_id and the lineage chain (rewriter → action → outcome)
+      // breaks in production despite tests passing.
+      decision_id: entry.decision_id || null,
     };
     appendJsonlLine(file, full);
     return full;

@@ -86,10 +86,13 @@ function _safeInt(v) {
 // the writer). Matchers are mutually exclusive: first match wins.
 // Order matters — most specific first.
 
-const TEST_COMMAND_RX = /(?:^|\s)(node\s+--test|npm\s+test|npx\s+vitest|bun\s+test|yarn\s+test|npx\s+jest|pytest)\b/;
-const TYPE_COMMAND_RX = /(?:^|\s)(npx\s+tsc|tsc\s|--noEmit\b)/;
-const LINT_COMMAND_RX = /(?:^|\s)(eslint|npx\s+eslint|npm\s+run\s+lint)\b/;
-const BUILD_COMMAND_RX = /(?:^|\s)(npm\s+run\s+build|next\s+build|vite\s+build|webpack|bun\s+build|tsc\s+--build|cargo\s+build|go\s+build)\b/;
+// v3.10 final-council Codex P3 + Gemini P3: broaden to cover real
+// invocations seen in the wild (pnpm/yarn/bare/jest, vitest run, npm
+// run typecheck, etc.). Mirror hooks/test-failure-advisor.js coverage.
+const TEST_COMMAND_RX = /(?:^|\s)(node\s+--test|(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+test|npx\s+vitest|vitest(?:\s+run)?|npx\s+jest|jest|bun\s+test|pytest)\b/;
+const TYPE_COMMAND_RX = /(?:^|\s)(npx\s+tsc|tsc\b|--noEmit\b|(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+typecheck)\b/;
+const LINT_COMMAND_RX = /(?:^|\s)(eslint|npx\s+eslint|(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+lint)\b/;
+const BUILD_COMMAND_RX = /(?:^|\s)((?:npm|pnpm|yarn|bun)(?:\s+run)?\s+build|next\s+build|vite\s+build|webpack|bun\s+build|tsc\s+--build|cargo\s+build|go\s+build)\b/;
 
 // node --test / vitest output:
 //   ✖ test name (123ms)
@@ -232,6 +235,28 @@ function validateFailure(f) {
     } else if (k === 'ts' || k === 'project' || k === 'session_id' || k === 'kind' || k === 'tool_name' || k === 'file' || k === 'test_name' || k === 'signal') {
       if (typeof v !== 'string') throw new Error(`failure: ${k} must be string`);
     }
+  }
+  // v3.10 final-council R2 (Codex P1 + Gemini P3): re-sanitize string
+  // content on read, not just type-check. A forged file written
+  // directly to recent-failures.jsonl can have ANSI escape sequences,
+  // control characters, or path-leak content in test_name/file even if
+  // it passes type validation. Mutate IN PLACE so callers receive the
+  // sanitized object.
+  if (typeof f.test_name === 'string') {
+    const cleaned = _safeString(f.test_name, 80);
+    f.test_name = cleaned;  // null if all-control-chars, else stripped
+  }
+  if (typeof f.file === 'string') {
+    f.file = _safeFileBasename(f.file, 64);
+  }
+  if (typeof f.tool_name === 'string') {
+    f.tool_name = _safeString(f.tool_name, 32);
+  }
+  if (typeof f.project === 'string') {
+    f.project = _safeString(f.project, 64);
+  }
+  if (typeof f.session_id === 'string') {
+    f.session_id = _safeString(f.session_id, 64);
   }
   return f;
 }

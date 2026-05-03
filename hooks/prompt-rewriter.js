@@ -272,7 +272,8 @@ process.stdin.on('end', () => {
     const ask = `[Vanta] ${route} recommended · ${decision.tier} ASK · ${why}`;
     _logAction({ session_id: sessionId, cwd, project, action: 'rewrite-ask',
       decision: 'ask', why: decision.why || ('ask:' + (decision.intent || decision.source)),
-      subject: prompt.slice(0, 80), tier: decision.tier });
+      subject: prompt.slice(0, 80), tier: decision.tier,
+      decision_id: decision.decision_id });  // v3.10 final-council fix
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'UserPromptSubmit',
@@ -300,6 +301,7 @@ process.stdin.on('end', () => {
     _logAction({ session_id: sessionId, cwd, project, action: 'rewrite',
       decision: 'auto', why: decision.why || ('intent=' + decision.intent),
       subject: prompt.slice(0, 80), tier: decision.tier,
+      decision_id: decision.decision_id,  // v3.10 final-council fix: top-level lineage
       undo_hint: { kind: 'rewriter-shadow', payload: {
         decision_id: decision.decision_id,
         rule_id: decision.rule_id || null,
@@ -317,7 +319,8 @@ process.stdin.on('end', () => {
   // ── 3. Auto / passthrough — log silently, inject nothing.
   _logAction({ session_id: sessionId, cwd, project, action: 'rewrite-skip',
     decision: decision.decision, why: decision.why || decision.intent || 'passthrough',
-    subject: prompt.slice(0, 80), tier: decision.tier });
+    subject: prompt.slice(0, 80), tier: decision.tier,
+    decision_id: decision.decision_id });  // v3.10 final-council fix
   return _empty();
 });
 

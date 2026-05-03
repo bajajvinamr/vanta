@@ -339,6 +339,114 @@ test('compute — end-to-end scoring against real rewriter', async (t) => {
   });
 });
 
+test('Final-council fix: buildOutcomeMap reads actions.jsonl rolled_back', async (t) => {
+  await t.test('rolled_back lifecycle from actions.jsonl folds as undone', () => {
+    _reset();
+    // Write a VantaAction-shaped entry with lifecycle=rolled_back and a
+    // decision_id. buildOutcomeMap MUST pick it up (without this fix,
+    // the scorer was blind to lifecycle rollbacks).
+    const file = path.join(VANTA_TMP, 'actions.jsonl');
+    fs.writeFileSync(file, JSON.stringify({
+      ts: '2026-04-01T00:00:00.000Z',
+      decision_id: 'dec-rolled-back',
+      kind: 'file_edit',
+      lifecycle: 'rolled_back',
+      rolled_back_at: '2026-04-01T00:01:00.000Z',
+    }) + '\n');
+    const outcomes = re.buildOutcomeMap();
+    assert.ok(outcomes.has('dec-rolled-back'), 'rolled_back action surfaced');
+    assert.equal(outcomes.get('dec-rolled-back').kind, 'undone');
+  });
+
+  await t.test('cancellations.jsonl entries still surface (back-compat)', () => {
+    _reset();
+    const file = path.join(VANTA_TMP, 'cancellations.jsonl');
+    fs.writeFileSync(file, JSON.stringify({
+      ts: '2026-04-01T00:00:00.000Z',
+      decision_id: 'dec-stopped',
+      cancellation_kind: 'user-initiated-stop',
+      cancelled_at: '2026-04-01T00:00:30.000Z',
+    }) + '\n');
+    const outcomes = re.buildOutcomeMap();
+    assert.equal(outcomes.get('dec-stopped').kind, 'stopped');
+  });
+
+  await t.test('newer ts wins when both streams reference same decision', () => {
+    _reset();
+    fs.writeFileSync(path.join(VANTA_TMP, 'cancellations.jsonl'),
+      JSON.stringify({
+        decision_id: 'dec-both',
+        cancellation_kind: 'user-initiated-stop',
+        ts: '2026-04-01T00:00:00.000Z',
+      }) + '\n',
+    );
+    fs.writeFileSync(path.join(VANTA_TMP, 'actions.jsonl'),
+      JSON.stringify({
+        decision_id: 'dec-both',
+        lifecycle: 'rolled_back',
+        rolled_back_at: '2026-04-01T00:05:00.000Z',  // later
+      }) + '\n',
+    );
+    const outcomes = re.buildOutcomeMap();
+    assert.equal(outcomes.get('dec-both').kind, 'undone',
+      'later rolled_back ts wins over earlier stop');
+  });
+});
+
+test('Final-council R2 fix: _readJsonlMerged caps memory at 100MB total', async (t) => {
+  await t.test('still reads small live file + baks correctly', () => {
+    _reset();
+    const file = path.join(VANTA_TMP, 'route-quality.jsonl');
+    // Use a real corpus rule so compute() scores it.
+    fs.writeFileSync(path.join(VANTA_TMP, 'route-quality.jsonl.bak.111'),
+      JSON.stringify({ ts: '2026-03-01T00:00:00.000Z', rule_id: 'fix-broken', skill_route: '/investigate', decision_id: 'd1' }) + '\n');
+    fs.writeFileSync(file,
+      JSON.stringify({ ts: '2026-04-01T00:00:00.000Z', rule_id: 'fix-broken', skill_route: '/investigate', decision_id: 'd2' }) + '\n');
+    const { rules } = re.compute({});
+    const found = rules.find(r => r.rule_id === 'fix-broken');
+    assert.ok(found);
+    assert.equal(found.fires, 2, 'both bak + live entries counted');
+  });
+});
+
+test('Final-council fix: scoring reads merged history (rotation amnesia fix)', async (t) => {
+  await t.test('compute reads bak-rotated route-quality entries', () => {
+    _reset();
+    const file = path.join(VANTA_TMP, 'route-quality.jsonl');
+    const bakFile = path.join(VANTA_TMP, 'route-quality.jsonl.bak.123.456');
+    // Write 30 entries to a bak (simulating post-rotation), 25 to live.
+    const bakLines = [];
+    const liveLines = [];
+    for (let i = 0; i < 30; i++) {
+      bakLines.push(JSON.stringify({
+        ts: `2026-03-01T00:${String(i).padStart(2, '0')}:00.000Z`,
+        rule_id: 'fix-broken',
+        skill_route: '/investigate',
+        decision_id: `dec-bak-${i}`,
+        project: 'test',
+      }));
+    }
+    for (let i = 0; i < 25; i++) {
+      liveLines.push(JSON.stringify({
+        ts: `2026-04-01T00:${String(i).padStart(2, '0')}:00.000Z`,
+        rule_id: 'fix-broken',
+        skill_route: '/investigate',
+        decision_id: `dec-live-${i}`,
+        project: 'test',
+      }));
+    }
+    fs.writeFileSync(bakFile, bakLines.join('\n') + '\n');
+    fs.writeFileSync(file, liveLines.join('\n') + '\n');
+
+    const { rules } = re.compute({ project: 'test' });
+    const fixBroken = rules.find(r => r.rule_id === 'fix-broken');
+    // Without the merge fix: only 25 live fires visible.
+    // With the fix: 25 + 30 = 55 fires (above quarantine threshold of 50).
+    assert.ok(fixBroken, 'fix-broken in scored rules');
+    assert.ok(fixBroken.fires >= 50, `expected ≥50 fires (live+bak), got ${fixBroken.fires}`);
+  });
+});
+
 test('listQuarantined integration', async (t) => {
   await t.test('returns empty when no rule has been quarantined', () => {
     _reset();

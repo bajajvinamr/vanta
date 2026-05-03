@@ -184,13 +184,29 @@ function recentFailures({ project = null, hours = 24, topK = 3 } = {}) {
   } catch {
     entries = readJsonl(file);
   }
+  // v3.10 final-council Codex P1 + Gemini P1: re-validate every entry
+  // at READ time. validateFailure runs at write time in auto-sync.js,
+  // but an attacker who writes the file directly bypasses it. Defense
+  // in depth: re-validate; discard anything that throws.
+  let validate = null;
+  try {
+    const ex = require('./vanta-failure-extract');
+    validate = ex.validateFailure;
+  } catch { /* extract module not deployed — fall through with key-only check */ }
   const cutoff = new Date(Date.now() - hours * 3600000).toISOString();
   // Dedupe by (kind, file, test_name) — recent occurrences trump older
   const byKey = new Map();
   for (const e of entries) {
     if (!e || !e.kind) continue;
     if ((e.ts || '') < cutoff) continue;
-    if (project && e.project && e.project !== project) continue;
+    // Project filter — strict equality. If a forged entry omits project,
+    // it WILL be excluded when a project-scoped brief is built.
+    if (project) {
+      if (e.project !== project) continue;
+    }
+    if (validate) {
+      try { validate(e); } catch { continue; }
+    }
     const key = `${e.kind}|${e.file || ''}|${e.test_name || ''}`;
     const prior = byKey.get(key);
     if (!prior || (e.ts || '') > (prior.ts || '')) {
