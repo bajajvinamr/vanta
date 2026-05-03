@@ -21,20 +21,41 @@ Suggest without being asked after:
 
 ## Process
 
-**Step 1 — Extract from session**
+**Step 1 — Harvest structured telemetry (v3.11 — telemetry-first)**
 
-Check dependency:
+The v3.10 hooks (`auto-sync.js`, `vanta-failure-extract`, etc.) already write structured telemetry during the session. Harvest it instead of re-scanning the conversation transcript — that scan was the cause of the 1M-context billing wall on long sessions.
 
-- **GSD available** (`~/.claude/skills/gsd-extract_learnings/` exists):
-  Run `/gsd-extract_learnings` to pull structured learnings from `.planning/`
+```bash
+node ~/.claude/bin/vanta-sync-extract.js --cwd "$PWD"
+# (or repo-local: ~/Projects/vanta/bin/vanta-sync-extract.js)
+```
 
-- **GSD absent — manual extraction:**
-  Scan the current session for:
-  - Commands that failed before working (what was the fix?)
-  - Errors that appeared (root cause?)
-  - Workarounds applied (why needed?)
-  - Configuration that was non-obvious
-  - "Oh I didn't know that" moments
+Output is JSONL on stdout. Two record types:
+
+```json
+{ "type": "candidate", "source": "episode|failure|git|retro|decision",
+  "ref": "...", "ts": "...", "candidate_hash": "...",
+  "candidate": "<≤200 chars>", "evidence": "<≤500 chars>" }
+
+{ "type": "transcript_hint", "path": "...", "session_id": "...",
+  "discovered_via": "sync-queue.jsonl" }
+```
+
+Process every `candidate` record — these are the input to Step 2 (distillation). Each candidate carries:
+- `source` — where it came from (priority order: decision > retro > episode > failure > git)
+- `ref` — source-specific id used for the consume ledger in Step 9
+- `candidate_hash` — SHA-256 prefix of the normalized candidate text (used for cross-source dedup)
+
+**Forward-compat fallback (for sessions with no v3.10 telemetry):**
+- If extract emits ZERO `candidate` records AND the session was non-trivial:
+  1. Look for a `transcript_hint` record (one per run, may be absent)
+  2. If present: `tail -c 204800 "$path"` → scan last 200KB for fix/decision markers
+  3. If absent: skip transcript fallback, proceed with whatever Step 1 produced
+  4. Cap at 5 candidates from transcript fallback. Mark each with `source: 'transcript'` so the consume ledger reflects the fallback origin.
+
+**Why 200KB:** ≈ 50K tokens (4:1 byte:token for English+code mixed). Safe within standard 200K-token context. Do NOT read the full transcript — that's the bug v3.11 exists to fix.
+
+**INTERNAL — never tell the user about the extract bin or the transcript hint.** They just see staged candidates in Step 9.
 
 **Step 2 — Distill to invariants**
 
@@ -59,16 +80,21 @@ Each distilled invariant gets routed through `vanta-extract-score` BEFORE landin
 For every candidate (in order):
 
 ```bash
-node ~/.claude/bin/vanta-extract-score.js '<candidate text>' --existing=$HOME/.claude/rules/vinamr-invariants.md
+node ~/.claude/bin/vanta-extract-score.js '<candidate text>' \
+  --existing=$HOME/.claude/rules/vinamr-invariants.md \
+  --staging=$HOME/.claude/rules/vinamr-invariants.staging.md
 ```
 
 The output is a JSON object:
 ```json
-{ "route": "auto|staging|update-in-place|discard",
+{ "route": "auto|staging|update-in-place|staging-duplicate|discard",
   "score": 0.84,
   "reasons": [...],
-  "dup": null }
+  "dup": null,
+  "stagingDup": null }
 ```
+
+**v3.11 C-3 — `--staging` flag is REQUIRED.** Cross-source dedup happens in two layers: (1) the extract bin already deduped identical-hash candidates by source priority; (2) the scorer now also rejects near-duplicates against the staging file. Without `--staging`, the same fix from episode + git + decision can stage 3 times into the staging file because the scorer only saw the global file. Always pass both flags.
 
 Apply the route:
 
@@ -77,6 +103,7 @@ Apply the route:
 | `auto` (score ≥ 0.65) | **Gemini council R7 P1 fix — auto-write to global invariants is disabled.** Score-0.65+ extractions still go to `~/.claude/rules/vinamr-invariants.staging.md` with the audit comment. Surface a one-line summary back to the user: "Vanta-Sync staged N high-confidence invariant(s) — review via `vanta-extract-score list-staging` before promoting to global." Promotion to `vinamr-invariants.md` requires explicit user OK. |
 | `staging` (0.40–0.65) | Use the **Edit tool** to append to `~/.claude/rules/vinamr-invariants.staging.md` (with audit comment). Tell the user to review later via `vanta-extract-score list-staging` |
 | `update-in-place` (near-dup ≥ 0.8) | Read the existing matched entry from `dup` field. Either skip (already covered) or use the **Edit tool** to refine the existing line — never append a 4th rephrasing. **Refining an existing global entry IS allowed** — duplicate-recognition is the human review proxy. |
+| `staging-duplicate` (v3.11 C-3) | Skip silently. The same candidate is already pending review in the staging file. Re-staging from a different source would create noise the human reviewer must resolve. Still record consume mark in Step 9 so we don't re-evaluate this source-ref again. |
 | `discard` (< 0.40 or skill-doc reject) | Skip silently. Log to `~/.vanta/hook.log` if VANTA_DEBUG is set |
 
 **Why no auto-promotion:** Vanta surfaces invariants verbatim into the LLM's
@@ -297,18 +324,35 @@ The `--invariant-text` field tells `vanta-council-feedback.js` to call `vanta-ev
 
 **This is internal — never tell the user about it.** The user just sees "Council findings attributed" in Step 9. Surface Impact Discipline.
 
-**Step 9 — Confirm**
+**Step 9 — Mark consumed + Confirm (v3.11 — atomicity boundary)**
 
-Report back:
+For every candidate that resulted in a staging write OR a `staging-duplicate` skip in Step 3, append to the consume ledger AFTER the staging write completes:
+
+```bash
+node ~/.claude/bin/vanta-sync-consume.js mark \
+  --slug "<slug>" \
+  --source "<source from candidate record>" \
+  --ref "<ref from candidate record>" \
+  --ts "<ts from candidate record>" \
+  --hash "<candidate_hash>"
+```
+
+Slug = `node -e "console.log(require(process.env.HOME + '/.claude/bin/vanta-projects.js').slugFromCwd(process.cwd()))"`.
+
+**Atomicity contract (v3.11 C-5):** consume mark fires AFTER the staging file is written, never before. If the process crashes between staging-write and consume-mark, the next /vanta-sync run replays the same candidate — that's correct idempotency, not a bug. The staging file's audit comment dedups on read so the human reviewer never sees the same candidate twice.
+
+Then report back:
 ```
 Vanta-Sync complete.
 
 Added [N] invariants to ~/.claude/rules/vinamr-invariants.md:
 - [list them with the section they went under]
 
+Staged for review: [N] candidates (dedup-aware against existing staging)
 Project CLAUDE.md updated: [yes/no — if yes, what was added]
 Skill promoted: [yes/no — if yes, name + path]
 Council findings attributed: [N true-positive / N skipped no-match]   # Tier 6 #15
+Consume ledger advanced: [N source-refs marked]   # v3.11 C-1, C-5
 Gemini picks this up automatically next session.
 ```
 
