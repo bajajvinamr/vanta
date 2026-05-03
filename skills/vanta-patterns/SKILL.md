@@ -217,3 +217,27 @@ A healthy Vanta produces reports with:
 - **Outcomes skew resolved over blocked**: progress is being made
 
 A report that's mostly empty means vanta isn't being used heavily yet — that's fine, just informational.
+
+## v3.10 — Self-Improving Loop Surfaces
+
+After v3.10, vanta-patterns has three additional telemetry streams to consult. These are read-only signals from the self-improving loop; the skill does NOT mutate any of them. They feed `tools/vanta-soak-report.js` — run that for the rendered view.
+
+| Stream | Path | Producer | Surface |
+|---|---|---|---|
+| Rule effectiveness | `~/.vanta/rule-effectiveness.jsonl` | `vanta-rewriter.js` decisions joined to actions/cancellations | Soak §7. Wilson CI lower bound + rolling-window rate per rule. Quarantined rules are skipped at runtime. |
+| Invariant evidence | `~/.vanta/invariant-evidence.jsonl` | `vanta-resolve.js` (origin=user-prompt) + `vanta-council-feedback.js` (council_tp mirror) | Soak §8. Top-cited and cold (30d unused) invariants. C-7 default-deny: only user-prompt origin counts. |
+| Recent failures | `~/.vanta/recent-failures.jsonl` | `auto-sync.js` Stop hook → `vanta-failure-extract.js` parser | Brief surfacing (24h window, top 3 distinct). C-2 hardened: structured allowlisted fields ONLY — never freeform output. |
+
+If any of these files don't exist yet on the operator's box, `tools/vanta-soak-report.js` shows a "_not deployed_" stub for the section. Run `setup.sh` from `~/Projects/vanta` to install the bins.
+
+### Operator escape hatch
+
+For rule-effectiveness specifically, `bin/vanta-rule-tune.js` is the human override surface. **Operator only — never expose to the user**:
+- `vanta-rule-tune list` — every rule with current scores
+- `vanta-rule-tune status <rule>` — JSON detail
+- `vanta-rule-tune compute` — recompute scores, snapshot
+- `vanta-rule-tune quarantine <rule>` — manual skip
+- `vanta-rule-tune rehabilitate <rule>` — flip back active, open new scoring epoch
+- `vanta-rule-tune auto-quarantine [--dry-run]` — quarantine every eligible rule
+
+Manual `setStatus` calls always have higher status_seq than concurrent snapshots, so operator decisions are never stomped (R1 council fix). Auto-rehab fires automatically when a rule's source content hash changes.

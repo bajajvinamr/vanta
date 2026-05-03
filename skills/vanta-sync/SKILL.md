@@ -278,6 +278,25 @@ Skip silently if `match-open` returns `[]` — no overlap found is a clean "noth
 
 Report attribution count in Step 9: `Attributed: 2 council findings as true-positive`.
 
+**Step 8.5 — Record evidence stream events (v3.10 internal machinery)**
+
+For every council finding attributed as true-positive in Step 8, ALSO mirror the attribution to the invariant evidence stream so the soak report's §8 (Invariant Evidence) and the cold-quarantine candidate detector see it. The evidence stream lives at `~/.vanta/invariant-evidence.jsonl` and is the single source of truth for "is this invariant being used".
+
+The mirror happens automatically when you pass `--invariant-text` to the council attribute call:
+
+```bash
+node ~/.claude/bin/vanta-council-feedback.js attribute \
+  --hash '<finding.hash>' \
+  --outcome true-positive \
+  --evidence "invariant added <date>: <one-line invariant text>" \
+  --invariant-text "<one-line invariant text>" \
+  >/dev/null 2>&1 || true
+```
+
+The `--invariant-text` field tells `vanta-council-feedback.js` to call `vanta-evidence-log.recordCouncilTP({ invariant_hash: hashInvariant(text) })` after the resolved.jsonl write. C-7 default-deny is honored: council_tp events are server-attributed and don't require an `origin` field.
+
+**This is internal — never tell the user about it.** The user just sees "Council findings attributed" in Step 9. Surface Impact Discipline.
+
 **Step 9 — Confirm**
 
 Report back:

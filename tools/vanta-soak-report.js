@@ -215,10 +215,195 @@ function buildReport({ windowDays = DEFAULT_WINDOW_DAYS } = {}) {
   }
   lines.push('');
 
+  // ── 7. Rule Effectiveness (v3.10 commit 5) ─────────────────────────
+  // Reads rule-effectiveness.jsonl + uses vanta-rule-effectiveness.js
+  // to compute current per-rule scores against the live telemetry.
+  // Surfaces: top fired, lowest CI, currently quarantined.
+  lines.push('## 7. Rule Effectiveness (v3.10)');
+  lines.push('');
+  try {
+    const re = _loadRuleEffectiveness();
+    if (!re) {
+      lines.push('_vanta-rule-effectiveness.js not deployed — install bin then re-run._');
+    } else {
+      const { rules } = re.compute({});
+      const status = re.readLatestStatus();
+      if (rules.length === 0) {
+        lines.push('_No rules visible in current telemetry window._');
+      } else {
+        // Sort by total signal (fires + recalls)
+        const sorted = [...rules].sort((a, b) =>
+          (b.fires + b.recalled) - (a.fires + a.recalled),
+        );
+        lines.push('### Top fired (with success rate / Wilson CI lower)');
+        for (const r of sorted.slice(0, 5)) {
+          const st = status.get(r.rule_id)?.status || 'active';
+          const success = (r.success_rate * 100).toFixed(0) + '%';
+          const ci = r.ci_lower.toFixed(3);
+          lines.push(`- ${r.rule_id}: fires=${r.fires}, success=${success}, ci_lower=${ci}, status=${st}`);
+        }
+        const flaggedOrQuar = sorted.filter(r => {
+          const st = status.get(r.rule_id)?.status;
+          return st === 'flagged' || st === 'quarantined';
+        });
+        if (flaggedOrQuar.length > 0) {
+          lines.push('');
+          lines.push('### Flagged / Quarantined');
+          for (const r of flaggedOrQuar) {
+            const entry = status.get(r.rule_id);
+            const reason = entry.status_reason || '(no reason)';
+            lines.push(`- ${r.rule_id}: ${entry.status} — ${reason}`);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    lines.push(`_Rule effectiveness section error: ${e.message}_`);
+  }
+  lines.push('');
+
+  // ── 8. Invariant Evidence (v3.10 commit 5) ─────────────────────────
+  // Reads invariant-evidence.jsonl. Surfaces top-cited and cold (no
+  // user-prompt retrieval in window) invariants.
+  lines.push('## 8. Invariant Evidence (v3.10)');
+  lines.push('');
+  try {
+    const evid = _loadEvidenceLog();
+    if (!evid) {
+      lines.push('_vanta-evidence-log.js not deployed — install bin then re-run._');
+    } else {
+      const { top, cold } = evid.topAndBottomCited({ topK: 5, bottomK: 5 });
+      if (top.length === 0 && cold.length === 0) {
+        lines.push('_No invariant evidence recorded yet._');
+      } else {
+        if (top.length > 0) {
+          lines.push('### Top-cited (user-prompt retrievals + council TPs)');
+          for (const s of top) {
+            const total = s.retrieved_count + s.council_tp_count;
+            lines.push(`- ${s.invariant_hash}: ${total} citations (retrieved=${s.retrieved_count}, council_tp=${s.council_tp_count})`);
+          }
+        }
+        if (cold.length > 0) {
+          lines.push('');
+          lines.push('### Cold (no user-prompt retrieval in 30d — quarantine candidates)');
+          for (const s of cold) {
+            lines.push(`- ${s.invariant_hash}: 0 retrievals in window`);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    lines.push(`_Invariant evidence section error: ${e.message}_`);
+  }
+  lines.push('');
+
+  // ── 9. Missed-Intent Clusters (v3.10 commit 5) ─────────────────────
+  // Better than topN by exact-string: clusters semantically-similar
+  // missed prompts together so the operator can see "5 prompts about
+  // X" rather than 5 separate entries.
+  lines.push('## 9. Missed-Intent Clusters (v3.10)');
+  lines.push('');
+  if (missed.length === 0) {
+    lines.push('_No missed intents recorded in window._');
+  } else {
+    const clusters = clusterMissedIntents(missed, { topK: 5 });
+    if (clusters.length === 0) {
+      lines.push('_All missed intents were unique (no cluster threshold met)._');
+    } else {
+      for (const c of clusters) {
+        lines.push(`- "${c.label}" — ${c.size} prompts (top tokens: ${c.tokens.slice(0, 4).join(', ')})`);
+      }
+    }
+  }
+  lines.push('');
+
   return lines.join('\n');
 }
 
-module.exports = { buildReport, _loadJsonl };
+// ─── v3.10 commit 5 helpers ─────────────────────────────────────────
+
+function _loadRuleEffectiveness() {
+  for (const p of [
+    path.join(__dirname, '..', 'bin', 'vanta-rule-effectiveness.js'),
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-rule-effectiveness.js'),
+  ]) {
+    try { return require(p); } catch (_) { /* try next */ }
+  }
+  return null;
+}
+
+function _loadEvidenceLog() {
+  for (const p of [
+    path.join(__dirname, '..', 'bin', 'vanta-evidence-log.js'),
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-evidence-log.js'),
+  ]) {
+    try { return require(p); } catch (_) { /* try next */ }
+  }
+  return null;
+}
+
+// Cluster missed intents by token-set similarity (Jaccard). Greedy:
+// pick the most-frequent token, group all prompts containing it, label
+// the cluster by the most-distinctive shared token.
+//
+// This is a simple-on-purpose clusterer — soak report runs once a
+// week, doesn't need k-means or LDA. The point is to surface "5
+// prompts about deploying" instead of 5 distinct strings.
+function clusterMissedIntents(missed, { topK = 5, minClusterSize = 2 } = {}) {
+  if (!Array.isArray(missed) || missed.length === 0) return [];
+  // Normalize: prompts → token-sets (lowercased, length>=4, deduped)
+  const STOPWORDS = new Set(['this','that','what','when','where','with','from','have','will','would','should','could','about','which','please','could','make','just','need','want','help','really']);
+  const docs = [];
+  for (const e of missed) {
+    const text = String(e.prompt || '').toLowerCase();
+    const tokens = new Set();
+    for (const m of text.match(/[a-z][a-z0-9-]{3,}/g) || []) {
+      if (!STOPWORDS.has(m)) tokens.add(m);
+    }
+    if (tokens.size > 0) docs.push({ prompt: e.prompt, tokens });
+  }
+  if (docs.length === 0) return [];
+  // Token frequency across corpus
+  const tokenFreq = new Map();
+  for (const d of docs) {
+    for (const tok of d.tokens) tokenFreq.set(tok, (tokenFreq.get(tok) || 0) + 1);
+  }
+  const sortedTokens = [...tokenFreq.entries()].sort((a, b) => b[1] - a[1]);
+  const clusters = [];
+  const claimed = new Set();
+  for (const [pivot, _freq] of sortedTokens) {
+    if (clusters.length >= topK) break;
+    const members = [];
+    for (let i = 0; i < docs.length; i++) {
+      if (claimed.has(i)) continue;
+      if (docs[i].tokens.has(pivot)) members.push(i);
+    }
+    if (members.length < minClusterSize) continue;
+    // Compute the cluster's distinctive tokens: those appearing in
+    // ≥50% of cluster members.
+    const memberTokenCounts = new Map();
+    for (const idx of members) {
+      for (const tok of docs[idx].tokens) {
+        memberTokenCounts.set(tok, (memberTokenCounts.get(tok) || 0) + 1);
+      }
+    }
+    const tokenScore = [...memberTokenCounts.entries()]
+      .filter(([_, c]) => c >= Math.max(2, Math.ceil(members.length / 2)))
+      .sort((a, b) => b[1] - a[1])
+      .map(([t]) => t);
+    // Use a representative prompt as the label (truncated)
+    const labelPrompt = docs[members[0]].prompt.slice(0, 60);
+    clusters.push({
+      label: labelPrompt,
+      size: members.length,
+      tokens: tokenScore,
+    });
+    for (const idx of members) claimed.add(idx);
+  }
+  return clusters;
+}
+
+module.exports = { buildReport, _loadJsonl, clusterMissedIntents };
 
 if (require.main === module) {
   const args = process.argv.slice(2);
