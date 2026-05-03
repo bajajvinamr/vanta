@@ -159,6 +159,72 @@ function recentMisses(days = 7) {
   return entries.filter(e => (e.ts || '') >= cutoff).length;
 }
 
+// v3.10 commit 4 — recent failures surfacing.
+//
+// C-2 council fix: only structured fields reach the brief. The brief
+// renderer NEVER includes a freeform message field. The format is
+// "kind × N (file)" where file is the basename only. If the failure
+// log was tampered with at write-time, validateFailure already
+// rejected it; if it slips past, the renderer below ignores any
+// non-allowlisted key.
+//
+// Window: last 24h. Older failures aren't actionable for the current
+// session — they belong in the soak report instead.
+function recentFailures({ project = null, hours = 24, topK = 3 } = {}) {
+  const file = path.join(os.homedir(), '.vanta', 'recent-failures.jsonl');
+  // Read across rotated bak siblings — failures are append-only with
+  // size-based rotation in the Stop hook.
+  let entries;
+  try {
+    const { readMergedJsonl } = require('./vanta-jsonl');
+    const raw = readMergedJsonl(file);
+    entries = raw.split('\n').filter(Boolean)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+  } catch {
+    entries = readJsonl(file);
+  }
+  const cutoff = new Date(Date.now() - hours * 3600000).toISOString();
+  // Dedupe by (kind, file, test_name) — recent occurrences trump older
+  const byKey = new Map();
+  for (const e of entries) {
+    if (!e || !e.kind) continue;
+    if ((e.ts || '') < cutoff) continue;
+    if (project && e.project && e.project !== project) continue;
+    const key = `${e.kind}|${e.file || ''}|${e.test_name || ''}`;
+    const prior = byKey.get(key);
+    if (!prior || (e.ts || '') > (prior.ts || '')) {
+      byKey.set(key, e);
+    }
+  }
+  // Sort by recency desc, take topK
+  const sorted = [...byKey.values()].sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  return sorted.slice(0, topK);
+}
+
+// Format a failure as a brief-safe label. NO freeform output: every
+// field is structured; the renderer constructs the display string from
+// allowlisted keys only.
+function _formatFailureLabel(f) {
+  // kind shorthand
+  const kindLabel = {
+    test_failure: 'test',
+    type_failure: 'type',
+    lint_failure: 'lint',
+    build_failure: 'build',
+  }[f.kind] || f.kind;
+  let where = '';
+  if (f.file) {
+    where = f.line ? `${f.file}:${f.line}` : f.file;
+  } else if (f.test_name) {
+    // test_name is already truncated to 80 in the extractor; further
+    // limit display to 32 chars to keep the brief compact.
+    where = String(f.test_name).slice(0, 32);
+  }
+  const countSuffix = (f.count && f.count > 1) ? `×${f.count}` : '';
+  return where ? `${kindLabel}${countSuffix} (${where})` : `${kindLabel}${countSuffix}`;
+}
+
 function stalePRs(cwd, days = 3) {
   try {
     const out = execSync('gh pr list --state open --json number,title,createdAt 2>/dev/null', {
@@ -211,6 +277,8 @@ function compose({ cwd }) {
     routing_misses: recentMisses(),
     stale_prs: stalePRs(cwd),
     crash_recovery: crashRecovery(slug),
+    // v3.10 commit 4 — recent failures (24h window, dedup, top 3).
+    recent_failures: recentFailures({ project: slug }),
   };
 
   const lines = [];
@@ -259,7 +327,14 @@ function compose({ cwd }) {
   if (signals.routing_misses >= 3) {
     stale.push(`${signals.routing_misses} routing misses this week`);
   }
-  for (const s of stale.slice(0, 2)) lines.push(s);
+  // v3.10 commit 4 — recent failures. Surfaced as one line with the
+  // top 3 distinct failure signatures from the last 24h. NEVER includes
+  // a freeform error message — the structured-fields-only contract.
+  if (signals.recent_failures && signals.recent_failures.length > 0) {
+    const labels = signals.recent_failures.map(_formatFailureLabel);
+    stale.push(`⚠️ Recent failures: ${labels.join(', ')}`);
+  }
+  for (const s of stale.slice(0, 3)) lines.push(s);
 
   // Line 4 — routes hint (always last)
   lines.push('Routes: ship · review · debug · write tests · what do I know about X · checkpoint · what\'s next');
@@ -293,4 +368,4 @@ function main() {
 }
 
 if (require.main === module) main();
-module.exports = { compose };
+module.exports = { compose, recentFailures, _formatFailureLabel };

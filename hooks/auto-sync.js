@@ -34,6 +34,23 @@ function _vantaDir() {
 }
 function _queuePath()    { return path.join(_vantaDir(), 'sync-queue.jsonl'); }
 function _episodesPath() { return path.join(_vantaDir(), 'episodes.jsonl'); }
+function _failuresPath() { return path.join(_vantaDir(), 'recent-failures.jsonl'); }
+
+// v3.10 commit 4 — lazy-load the failure extractor. Returns null if
+// the bin isn't deployed (older install) — we degrade silently rather
+// than break the Stop hook on missing modules.
+let _failExtractor = null;
+function _failureExtractor() {
+  if (_failExtractor !== null) return _failExtractor;
+  for (const p of [
+    path.join(__dirname, '..', 'bin', 'vanta-failure-extract.js'),
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-failure-extract.js'),
+  ]) {
+    try { _failExtractor = require(p); return _failExtractor; } catch (_) { /* try next */ }
+  }
+  _failExtractor = false;  // mark as searched
+  return null;
+}
 const MAX_BYTES = 5_000_000;
 const TOOL_CALL_THRESHOLD = 5;
 const DECISION_MARKERS = /\b(root cause|fixed it|decided to|shipped|merged|landed|figured out|the bug was)\b/i;
@@ -264,7 +281,103 @@ process.stdin.on('end', () => {
       synced: false,
     });
 
-    // 2. Episode (durable, time-aware memory) — only if decision-marker session
+    // 2a. v3.10 commit 4 — recent failures pipeline.
+    //
+    // C-2 council fix (hardened): structured allowlisted fields ONLY.
+    // The failure extractor (bin/vanta-failure-extract.js) is a pure
+    // regex parser; it returns null for any output shape it doesn't
+    // recognize. We dedupe within this session by (kind, file,
+    // test_name, tool_name) and only persist DISTINCT failure
+    // signatures, with `count` reflecting occurrences. This prevents a
+    // single noisy command from drowning the brief.
+    try {
+      const ex = _failureExtractor();
+      if (ex && typeof ex.extractFailure === 'function') {
+        // Scan transcript for tool_use (Bash) + their tool_use_result
+        // pairs. Transcript JSONL format: each line is a message; each
+        // message contains a content array; tool_use blocks have
+        // `tool_use_id`, `name`, `input.command`; tool_results carry
+        // `tool_use_id`, `content` (often {type:'text',text:...}) and
+        // an `is_error` flag. We do a best-effort line-by-line walk
+        // — full JSONL parse would be too slow on a multi-MB transcript.
+        const failuresThisSession = new Map();  // key → entry
+        const lines = transcript.split('\n');
+        // Build a tool_use_id → command map first
+        const toolUses = new Map();
+        for (const line of lines) {
+          if (!line.includes('"tool_use"') && !line.includes('"name":"Bash"')) continue;
+          let parsed;
+          try { parsed = JSON.parse(line); } catch { continue; }
+          const content = parsed?.message?.content || parsed?.content;
+          if (!Array.isArray(content)) continue;
+          for (const block of content) {
+            if (block?.type === 'tool_use' && block.name === 'Bash' && block.id) {
+              const cmd = block.input?.command || '';
+              toolUses.set(block.id, cmd);
+            }
+          }
+        }
+        // Now match results
+        for (const line of lines) {
+          if (!line.includes('"tool_result"')) continue;
+          let parsed;
+          try { parsed = JSON.parse(line); } catch { continue; }
+          const content = parsed?.message?.content || parsed?.content;
+          if (!Array.isArray(content)) continue;
+          for (const block of content) {
+            if (block?.type !== 'tool_result' || !block.tool_use_id) continue;
+            const cmd = toolUses.get(block.tool_use_id);
+            if (cmd == null) continue;  // not a Bash result
+            // Extract text from content (can be string or [{type:text,text}])
+            let text = '';
+            if (typeof block.content === 'string') text = block.content;
+            else if (Array.isArray(block.content)) {
+              for (const c of block.content) {
+                if (typeof c?.text === 'string') text += c.text + '\n';
+              }
+            }
+            // Heuristic: stderr is typically embedded; we treat the
+            // whole tool_result as 'stderr' for matching purposes, and
+            // pass an exit_code of 1 when is_error is set.
+            const exitCode = block.is_error ? 1 : 0;
+            if (exitCode === 0) continue;
+            const failure = ex.extractFailure({
+              tool_name: 'Bash',
+              command: cmd,
+              exit_code: exitCode,
+              stderr: text.slice(0, 32 * 1024),  // cap input size
+              stdout: '',
+            });
+            if (!failure) continue;
+            const key = `${failure.kind}|${failure.file || ''}|${failure.test_name || ''}|${failure.tool_name || ''}`;
+            const prior = failuresThisSession.get(key);
+            if (prior) { prior.count = (prior.count || 1) + 1; continue; }
+            failuresThisSession.set(key, { ...failure, count: 1 });
+          }
+        }
+        // Persist distinct failures with allowlist validation.
+        for (const f of failuresThisSession.values()) {
+          const entry = {
+            ts,
+            project: slug,
+            session_id: sid,
+            ...f,
+            signal: f.count > 1 ? 'recurring' : 'first_seen',
+          };
+          try {
+            ex.validateFailure(entry);
+            appendJsonl(_failuresPath(), entry);
+          } catch (e) {
+            // C-2 hard gate — never write if validation fails.
+            vlog().error('auto-sync.failures', `validation rejected: ${e.message}`);
+          }
+        }
+      }
+    } catch (e) {
+      vlog().error('auto-sync.failures', e.message || String(e));
+    }
+
+    // 2b. Episode (durable, time-aware memory) — only if decision-marker session
     if (hasDecisionMarker) {
       const topics = topTopics(transcript);
       const decision = extractDecision(transcript);
