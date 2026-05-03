@@ -1,6 +1,6 @@
 ---
 name: vanta-sync
-description: End-of-milestone learning extraction. Pulls what was learned this session, distills into permanent invariants, writes directly to vinamr-invariants.md using the Edit tool. Run after every shipped milestone.
+description: End-of-milestone learning extraction. Harvests structured telemetry written by v3.10 hooks during the session, distills candidates, scores them via vanta-extract-score, then STAGES to vinamr-invariants.staging.md for human review. Promotion to vinamr-invariants.md requires explicit user OK (R7 P1 — invariants are @import context, never auto-write).
 argument-hint: ""
 user-invocable: true
 model: sonnet

@@ -155,14 +155,22 @@ function scanEpisodes({ slug, lookbackTs, consumed, max }) {
   const lookbackMs = Date.parse(lookbackTs);
   for (const e of entries) {
     if (!e || typeof e !== 'object') continue;
-    if (e.project !== slug) continue;
+    // Council R2 P1 (both-confirmed) — auto-sync.js writes `slug` for
+    // episodes; legacy/test fixtures may use `project`. Read both for
+    // forward-compat. Without this, scanEpisodes silently emits zero
+    // candidates in production despite a populated episodes.jsonl.
+    const projField = e.slug || e.project;
+    if (projField !== slug) continue;
     const ts = e.ts || e.date;
     if (!ts) continue;
     const t = Date.parse(ts);
     if (isNaN(t) || t < lookbackMs) continue;
     const ref = e.session_id || `episode-${_hash16(JSON.stringify(e))}`;
     if (consumed.has('episode|' + ref)) continue;
-    const decisionText = e.decision || e.outcome || '';
+    // Council R2 P2 — only use `decision` (free-text). `outcome` is an
+    // enum (resolved|blocked|decided|in-progress) per auto-sync.js, and
+    // surfacing the enum literal as candidate text produces noise.
+    const decisionText = e.decision || '';
     if (!decisionText || String(decisionText).trim().length < 10) continue;
     const candidate = String(decisionText).trim().slice(0, 200);
     out.push({
@@ -184,9 +192,16 @@ function scanFailures({ slug, lookbackTs, consumed, max }) {
   const lookbackMs = Date.parse(lookbackTs);
   for (const e of entries) {
     if (!e || typeof e !== 'object') continue;
-    if (e.project !== slug) continue;
-    // Per plan: emit only resolved failures (the resolution is the learning).
-    if (e.outcome !== 'resolved') continue;
+    // Council R2 P1 (Gemini single, confirmed by inspection) — auto-sync.js
+    // never writes `outcome` to recent-failures.jsonl (only signal/kind/
+    // tool_name/file/line/test_name). The original `outcome === 'resolved'`
+    // filter was a plan misread of the schema and skipped every failure.
+    // Filter on `signal === 'recurring'` instead (the writer's actual
+    // high-signal indicator: failure occurred >1x in same session, much
+    // stronger candidate than a one-off first_seen).
+    const projField = e.project || e.slug;
+    if (projField !== slug) continue;
+    if (e.signal !== 'recurring') continue;
     const ts = e.ts;
     if (!ts) continue;
     const t = Date.parse(ts);
@@ -257,40 +272,55 @@ function scanGit({ cwd, lookbackTs, consumed, max }) {
       { stdio: ['ignore', 'pipe', 'ignore'], timeout: 1000 });
   } catch { return []; }
 
-  let raw = '';
+  // Council R2 P2 (Codex single, Gemini agreed) — in-band record
+  // separators (\x1f, \x1e) embedded in `--pretty=format` are not
+  // delimiter-safe: a real commit body containing a literal 0x1f or
+  // 0x1e byte (rare but possible from imported/automated repos)
+  // mis-splits the stream and silently drops/corrupts records.
+  // Two-pass approach: enumerate hashes via `git log --format=%H`
+  // (one byte field per line, no embedded delimiter risk), then fetch
+  // subject + body per commit via `git show`. Slower than a single
+  // log call but byte-safe.
+  let hashRaw = '';
   try {
-    raw = child.execFileSync('git',
-      ['-C', cwd, 'log', `--since=${lookbackTs}`, '--no-merges',
-       '--pretty=format:%H%x1f%s%x1f%b%x1e'],
-      { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, maxBuffer: 16 * 1024 * 1024 },
+    hashRaw = child.execFileSync('git',
+      ['-C', cwd, 'log', `--since=${lookbackTs}`, '--no-merges', '--format=%H'],
+      { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
     ).toString();
   } catch { return []; }
+  const hashes = hashRaw.split('\n').map(s => s.trim()).filter(Boolean);
 
   const out = [];
-  for (const rec of raw.split('\x1e')) {
-    if (!rec.trim()) continue;
-    const parts = rec.split('\x1f');
-    if (parts.length < 2) continue;
-    // Git's --pretty=format:%H... emits records joined by \x1e; the first
-    // record has no leading separator but subsequent records start with
-    // a newline left over from the prior record's body. Trim it off the
-    // hash so the consume ledger ref matches `git log -1 --format=%H`.
-    const hash = (parts[0] || '').trim();
-    const subjStr = (parts[1] || '').trim();
-    const body = (parts[2] || '').trim();
-    if (!hash || !subjStr) continue;
-    if (!ALLOWED_COMMIT_TYPES.test(subjStr)) continue;
+  for (const hash of hashes) {
+    if (out.length >= max) break;
     if (consumed.has('git|' + hash)) continue;
-    // Subject is the candidate; body (sanitized) is evidence.
+    let subjStr = '';
+    let body = '';
+    try {
+      // %s%n%n%b: subject, blank line, body. We split on the first \n\n
+      // pair to recover the two-part structure. No in-band separators.
+      const showRaw = child.execFileSync('git',
+        ['-C', cwd, 'show', '--no-patch', '--format=%s%n%n%b', hash],
+        { stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000, maxBuffer: 4 * 1024 * 1024 },
+      ).toString();
+      const idx = showRaw.indexOf('\n\n');
+      if (idx >= 0) {
+        subjStr = showRaw.slice(0, idx).trim();
+        body = showRaw.slice(idx + 2).trim();
+      } else {
+        subjStr = showRaw.trim();
+      }
+    } catch { continue; }
+    if (!subjStr) continue;
+    if (!ALLOWED_COMMIT_TYPES.test(subjStr)) continue;
     const evidence = _stripCouncilProse(body || '').slice(0, 500);
     out.push({
       source: 'git',
       ref: hash,
-      ts: '',  // populated below from `git log -1 --format=%cI`
+      ts: '',  // populated below
       candidate: subjStr.slice(0, 200),
       evidence,
     });
-    if (out.length >= max) break;
   }
   // Fill in committer-iso timestamps in a single batch call.
   if (out.length > 0) {

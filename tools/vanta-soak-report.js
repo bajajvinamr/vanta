@@ -318,10 +318,19 @@ function buildReport({ windowDays = DEFAULT_WINDOW_DAYS } = {}) {
     const total = extractEvents.length;
     const ok = extractEvents.filter(e => e.success !== false).length;
     const successRate = Math.round(100 * ok / total);
-    const withHint = extractEvents.filter(e => e.transcript_hint_emitted === true).length;
-    const fallbackRate = Math.round(100 * withHint / total);
+    // Council R2 P2 (both-confirmed) — `transcript_hint_emitted === true`
+    // is the wrong signal. The hint is always emitted when sync-queue
+    // has unsynced entries, regardless of whether the SKILL.md actually
+    // tails the transcript. The true "fallback used" proxy is:
+    //   hint emitted AND zero structured candidates produced
+    // (i.e., extract had nothing to give and the SKILL.md will fall
+    // back to the transcript path it received).
+    const withFallback = extractEvents.filter(e =>
+      e.transcript_hint_emitted === true && (e.candidate_count || 0) === 0
+    ).length;
+    const fallbackRate = Math.round(100 * withFallback / total);
     const standardOk = extractEvents.filter(e =>
-      e.success !== false && (e.candidate_count > 0 || e.transcript_hint_emitted !== true)
+      e.success !== false && (e.candidate_count || 0) > 0
     ).length;
     const standardRate = Math.round(100 * standardOk / total);
     const zeroCandidate = extractEvents.filter(e => (e.candidate_count || 0) === 0).length;

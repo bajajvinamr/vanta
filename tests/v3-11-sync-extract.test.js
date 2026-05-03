@@ -117,18 +117,22 @@ test('3. reads bak siblings AND live file, dedupes by session_id', () => {
   assert.ok(refs.has('s2'));
 });
 
-test('4. failure source emits only outcome=resolved', () => {
+test('4. failure source emits only signal=recurring (matches auto-sync.js writer schema)', () => {
   _reset();
+  // Schema matches hooks/auto-sync.js failure writer (council R2 P1 fix):
+  // `signal: f.count > 1 ? 'recurring' : 'first_seen'` — only recurring
+  // is high-signal enough for invariant extraction. No `outcome` field
+  // is ever written by the producer.
   _writeJsonl('recent-failures.jsonl', [
-    { session_id: 'f1', project: 'testproj-4', ts: _isoDaysAgo(1), kind: 'test_failure', tool_name: 'npm', outcome: 'resolved', test_name: 'auth.spec' },
-    { session_id: 'f2', project: 'testproj-4', ts: _isoDaysAgo(1), kind: 'build_failure', tool_name: 'tsc', outcome: 'pending' },
-    { session_id: 'f3', project: 'testproj-4', ts: _isoDaysAgo(1), kind: 'lint_failure', tool_name: 'eslint', outcome: 'resolved' },
+    { session_id: 'f1', project: 'testproj-4', ts: _isoDaysAgo(1), kind: 'test_failure', tool_name: 'npm', signal: 'recurring', test_name: 'auth.spec' },
+    { session_id: 'f2', project: 'testproj-4', ts: _isoDaysAgo(1), kind: 'build_failure', tool_name: 'tsc', signal: 'first_seen' },
+    { session_id: 'f3', project: 'testproj-4', ts: _isoDaysAgo(1), kind: 'lint_failure', tool_name: 'eslint', signal: 'recurring' },
   ]);
   const repo = _initGitRepo(REPO_TMP, 'testproj-4');
   const ext = _loadExtract();
   const r = ext.extract({ cwd: repo });
   const fails = r.records.filter(c => c.source === 'failure');
-  assert.equal(fails.length, 2, 'only the 2 resolved entries emit');
+  assert.equal(fails.length, 2, 'only the 2 recurring entries emit');
 });
 
 test('5. git source: candidate=subject, body trailers stripped from evidence', () => {
@@ -477,6 +481,46 @@ test('21. bounded read: large file uses 8MB tail', () => {
   const eps = r.records.filter(c => c.source === 'episode');
   assert.ok(eps.length > 0, 'tail-read still produces candidates');
   assert.ok(eps.length <= 5, 'max=5 respected');
+});
+
+test('R2-P1a. episode source matches auto-sync.js writer schema (slug field)', () => {
+  // Council R2 P1 — auto-sync.js writes `{ ts, slug, branch, ... }`
+  // for episodes (not `project`). Reader must filter by e.slug primarily.
+  _reset();
+  _writeJsonl('episodes.jsonl', [
+    // Real production schema — slug field per hooks/auto-sync.js:387
+    { session_id: 's1', slug: 'testproj-r2a', ts: _isoDaysAgo(1),
+      decision: 'always validate webhook signatures before processing payloads' },
+  ]);
+  const repo = _initGitRepo(REPO_TMP, 'testproj-r2a');
+  const ext = _loadExtract();
+  const r = ext.extract({ cwd: repo });
+  const eps = r.records.filter(c => c.source === 'episode');
+  assert.equal(eps.length, 1, 'episode with `slug` field must be picked up');
+});
+
+test('R2-P2. episode candidate uses `decision`, never `outcome` enum', () => {
+  // Council R2 P2 — `outcome` is enum (resolved|blocked|decided|in-progress).
+  // Old code: candidate = e.decision || e.outcome → "in-progress" string
+  // would leak into staging when decision was null. Now: skip if decision absent.
+  _reset();
+  _writeJsonl('episodes.jsonl', [
+    // No decision field — should be SKIPPED (not fall back to outcome)
+    { session_id: 's1', slug: 'testproj-r2b', ts: _isoDaysAgo(1),
+      decision: null, outcome: 'in-progress', topics: ['test'] },
+    // With real decision text — should EMIT
+    { session_id: 's2', slug: 'testproj-r2b', ts: _isoDaysAgo(1),
+      decision: 'a real learning that should be emitted as a candidate',
+      outcome: 'resolved' },
+  ]);
+  const repo = _initGitRepo(REPO_TMP, 'testproj-r2b');
+  const ext = _loadExtract();
+  const r = ext.extract({ cwd: repo });
+  const eps = r.records.filter(c => c.source === 'episode');
+  assert.equal(eps.length, 1);
+  assert.ok(!eps[0].candidate.includes('in-progress'),
+    'enum literal must never leak into candidate text');
+  assert.equal(eps[0].ref, 's2');
 });
 
 test('22. _stripCouncilProse helper isolates body sanitization', () => {
