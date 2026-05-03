@@ -93,6 +93,12 @@ function record(entry) {
     cancelled_at: ts,
     cancellation_kind: entry.cancellation_kind,
     in_flight_remote_call: null,
+    // v3.10 council C-1 (both-confirmed P1): propagate decision_id from
+    // the upstream rule fire so rule-effectiveness scoring can attribute
+    // this cancellation to the right rule. Optional: legacy callers and
+    // pre-v3.10 cancellations read as null and are scored `unscorable`
+    // by the rule scorer rather than misattributed.
+    decision_id: typeof entry.decision_id === 'string' ? entry.decision_id : null,
   };
   if (entry.in_flight_remote_call) {
     const inflight = entry.in_flight_remote_call;

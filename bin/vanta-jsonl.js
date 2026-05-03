@@ -20,23 +20,34 @@ const path = require('path');
 // Order matters for dedup-by-key: the LATEST entry wins, so the live file
 // (most recent) must come AFTER older rotations. Our `Date.now()`-suffixed
 // names sort lexicographically by age, so we can sort the bak list.
-function readMergedJsonl(file) {
+// Council v3.10 R2 C-11 (Gemini, NEW): historical default of always reading
+// every .bak.<ts> sibling synchronously into a single string is an OOM
+// risk on hot-path readers (rule-effectiveness scorer, intent handlers,
+// crash-recovery scan) once a long-running install accumulates >5MB
+// rotations across multiple ledgers. New optional `includeBaks` flag —
+// defaults to `true` for back-compat with all existing callers (sync-queue
+// + soak-report explicitly want full history). New v3.10+ hot-path
+// readers should pass `{ includeBaks: false }` to bound memory at the
+// active file size.
+function readMergedJsonl(file, { includeBaks = true } = {}) {
   const dir = path.dirname(file);
   const base = path.basename(file);
   const bakPrefix = base + '.bak.';
   const parts = [];
 
-  // Older rotations first.
-  let baks = [];
-  try {
-    baks = fs.readdirSync(dir)
-      .filter(n => n.startsWith(bakPrefix))
-      .sort();  // string sort = numeric-ish for `Date.now()` prefix
-  } catch { /* dir missing — fine, return empty */ }
+  if (includeBaks) {
+    // Older rotations first.
+    let baks = [];
+    try {
+      baks = fs.readdirSync(dir)
+        .filter(n => n.startsWith(bakPrefix))
+        .sort();  // string sort = numeric-ish for `Date.now()` prefix
+    } catch { /* dir missing — fine, return empty */ }
 
-  for (const b of baks) {
-    const bp = path.join(dir, b);
-    try { parts.push(fs.readFileSync(bp, 'utf8')); } catch { /* skip unreadable */ }
+    for (const b of baks) {
+      const bp = path.join(dir, b);
+      try { parts.push(fs.readFileSync(bp, 'utf8')); } catch { /* skip unreadable */ }
+    }
   }
 
   // Live file last (newest).

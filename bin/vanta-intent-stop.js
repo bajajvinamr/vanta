@@ -145,6 +145,10 @@ function handle({ project, session, prompt }) {
     const ok = c.record({
       action_id: inflight.id,
       cancellation_kind: 'user-initiated-stop',
+      // v3.10 council C-1: propagate the upstream rule-fire lineage
+      // so rule-effectiveness scoring can mark this cancellation as
+      // a `stopped` outcome for the rule that produced inflight.
+      decision_id: inflight.decision_id || null,
       in_flight_remote_call: {
         provider: _providerFromAction(inflight) || 'codex',
         request_id: inv.request_id,

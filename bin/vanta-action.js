@@ -156,6 +156,16 @@ function validateAction(a) {
   }
   if (!a.id || typeof a.id !== 'string') throw new Error('action.id: required string');
   if (!a.ts || typeof a.ts !== 'string') throw new Error('action.ts: required ISO-8601');
+  // v3.10 council C-1 (both-confirmed P1): decision_id lineage from the
+  // upstream rule fire (route-quality.jsonl entry) to this VantaAction.
+  // Optional: legacy entries created before the schema migration read as
+  // null, and downstream rule-effectiveness scoring marks those events
+  // `unscorable` rather than misattributing them. New v3.10+ writers
+  // SHOULD pass decision_id; absence is tolerated for forward-compat
+  // but not for new lineage-aware code paths.
+  if (a.decision_id != null && typeof a.decision_id !== 'string') {
+    throw new Error('action.decision_id: must be string|null');
+  }
   return a;
 }
 
@@ -233,6 +243,7 @@ function createAction({
   project,
   session,
   why,
+  decision_id,   // v3.10 council C-1: upstream rule-fire lineage
 }) {
   // Council R1 P2 fix (both-confirmed): redact secrets in
   // PromptRewriteInverse.original_prompt before persisting. Mutate a
@@ -257,6 +268,7 @@ function createAction({
     session: session || null,
     ts: new Date().toISOString(),
     why: why || null,
+    decision_id: decision_id || null,
   };
   return validateAction(a);
 }
@@ -276,16 +288,23 @@ function persistAction(action) {
   return validated;
 }
 
-// Read all actions across the live file + .bak.<ts> siblings, dedupe
-// by id (latest line wins), and apply optional filters.
+// Read all actions across the live file (and optionally .bak.<ts>
+// siblings), dedupe by id (latest line wins), and apply optional
+// filters.
 //
 // Note: readMergedJsonl returns the concatenated raw STRING, not
 // parsed entries. We parse line-by-line with torn-line tolerance
 // (matching the soak-report reader pattern).
-function readActions({ project = null, lifecycle = null, kind = null, since = null } = {}) {
+//
+// v3.10 council C-11 (Gemini, NEW R2): historical default loaded every
+// .bak.<ts> sibling synchronously into one string — OOM risk on hot-
+// path readers (rule-effectiveness scorer, intent handlers, crash-
+// recovery scan). New default: live file only. Pass `allHistory: true`
+// when you genuinely need the full ledger (soak-report, audit, debug).
+function readActions({ project = null, lifecycle = null, kind = null, since = null, allHistory = false } = {}) {
   const file = _actionsFile();
   if (!fs.existsSync(file) && !_anyBakFor(file)) return [];
-  const raw = jsonl().readMergedJsonl(file);
+  const raw = jsonl().readMergedJsonl(file, { includeBaks: allHistory });
   const byId = new Map();
   // Dedup tiebreaker: when two entries for the same id have identical
   // ts (sub-millisecond writes via updateLifecycle), prefer the LATER

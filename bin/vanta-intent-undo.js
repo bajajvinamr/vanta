@@ -356,6 +356,9 @@ function _undoCouncilCall(act) {
   c.record({
     action_id: act.id,
     cancellation_kind: 'user-initiated-undo',
+    // v3.10 council C-1: lineage from upstream rule fire so the
+    // rule-effectiveness scorer sees this undo as the rule's outcome.
+    decision_id: act.decision_id || null,
     in_flight_remote_call: {
       provider: _providerFromAction(act) || 'codex',
       request_id: inv.request_id,
