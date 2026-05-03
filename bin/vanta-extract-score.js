@@ -173,11 +173,24 @@ function scoreCandidate(text, opts = {}) {
     }
   }
 
+  // v3.11 C-3 — staging dup check. Same near-dup threshold as global
+  // (0.8). Caller routes 'staging-duplicate' so a candidate that's
+  // already pending review doesn't get re-staged from a different source.
+  let stagingDup = null;
+  if (Array.isArray(opts.staging) && opts.staging.length > 0) {
+    const sim = bestSimilarity(text, opts.staging);
+    if (sim.similarity >= 0.8) {
+      reasons.push(`staging-dup index=${sim.index} sim=${sim.similarity.toFixed(2)}`);
+      stagingDup = sim;
+    }
+  }
+
   score = Math.max(0, Math.min(1, score));
   return {
     score: Math.round(score * 100) / 100,
     reasons,
     dup,
+    stagingDup,
   };
 }
 
@@ -191,6 +204,10 @@ function routeCandidate(text, opts = {}) {
   const sc = scoreCandidate(text, opts);
   let route;
   if (sc.hardReject)         route = 'discard';
+  // v3.11 C-3 — staging hit takes precedence over global hit. The same
+  // candidate already pending human review should NOT be re-staged from
+  // a different source on a subsequent /vanta-sync run.
+  else if (sc.stagingDup)    route = 'staging-duplicate';
   else if (sc.dup)           route = 'update-in-place';
   else if (sc.score >= 0.65) route = 'auto';
   else if (sc.score >= 0.40) route = 'staging';
@@ -200,6 +217,7 @@ function routeCandidate(text, opts = {}) {
     score: sc.score,
     reasons: sc.reasons,
     dup: sc.dup,
+    stagingDup: sc.stagingDup,
     hardReject: sc.hardReject || false,
   };
 }
@@ -275,7 +293,15 @@ function cli() {
   const existingArg = argv.find(a => a.startsWith('--existing='));
   const file = existingArg ? existingArg.slice('--existing='.length) : INVARIANTS_FILE;
   const existing = readInvariantBullets(file);
-  const r = routeCandidate(candidate, { existing });
+  // v3.11 C-3 — optional staging dedup. When present, candidates that
+  // are already pending review in the staging file route as
+  // 'staging-duplicate' (no write). Backward-compat: absent flag = old
+  // behavior (no staging check).
+  const stagingArg = argv.find(a => a.startsWith('--staging='));
+  const staging = stagingArg
+    ? readInvariantBullets(stagingArg.slice('--staging='.length))
+    : [];
+  const r = routeCandidate(candidate, { existing, staging });
   console.log(JSON.stringify(r, null, 2));
 }
 
