@@ -114,7 +114,7 @@ function record({ topic, slug, councilRun, findingText, priority, model, round =
   return entry;
 }
 
-function attribute({ hash, outcome, evidence }) {
+function attribute({ hash, outcome, evidence, invariant_text = null }) {
   if (!hash || !outcome) throw new Error('attribute() requires: hash, outcome');
   const valid = ['true-positive', 'false-positive', 'unverified'];
   if (!valid.includes(outcome)) throw new Error('outcome must be one of: ' + valid.join(', '));
@@ -125,7 +125,51 @@ function attribute({ hash, outcome, evidence }) {
     evidence: evidence || null,
   };
   _appendLine(_resolvedFile(), entry);
+
+  // v3.10 commit 2 — when a council finding is attributed as true-positive
+  // by an invariant addition, mirror that into the evidence stream so the
+  // invariant accumulates citation credit. The evidence stream is the
+  // side-channel; vinamr-invariants.md itself stays human-edited (R7 P1
+  // boundary preserved). Best-effort: load failure is non-fatal — the
+  // attribution still records correctly in resolved.jsonl.
+  if (outcome === 'true-positive' && invariant_text) {
+    try {
+      const evid = _evidenceLog();
+      if (evid) {
+        const invHash = evid.hashInvariant(invariant_text);
+        if (invHash) {
+          evid.recordCouncilTP({
+            invariant_hash: invHash,
+            project: null,  // attribution is council-scope, not project-scope
+          });
+        }
+      }
+    } catch (_) { /* never let evidence logging fail attribute() */ }
+  }
+
   return entry;
+}
+
+// v3.10 commit 2 — lazy-loaded evidence-log (degrades gracefully).
+let _evidence = null;
+let _evidenceTried = false;
+function _evidenceLog() {
+  if (_evidence !== null) return _evidence;
+  if (_evidenceTried) return null;
+  _evidenceTried = true;
+  for (const p of [
+    path.join(__dirname, 'vanta-evidence-log.js'),
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-evidence-log.js'),
+  ]) {
+    try { _evidence = require(p); return _evidence; }
+    catch (err) {
+      if (err && err.code !== 'MODULE_NOT_FOUND') {
+        try { process.stderr.write(`[vanta-council-feedback] WARN: evidence-log load failed: ${err.message}\n`); } catch {}
+      }
+    }
+  }
+  _evidence = null;
+  return null;
 }
 
 // Find open findings (raised but not yet attributed) that an incoming

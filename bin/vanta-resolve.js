@@ -582,6 +582,32 @@ function _shapeTopic(t) {
   return crypto.createHash('sha256').update(String(t)).digest('hex').slice(0, 8);
 }
 
+// v3.10 commit 2 — lazy-loaded vanta-evidence-log. Resolved at first
+// call; if the module isn't deployed yet (older Vanta install), we
+// degrade gracefully — resolve() still returns results, just without
+// evidence logging. Distinguishing MODULE_NOT_FOUND from runtime errors
+// matches the executor + projects-load hardening pattern.
+let _evidence = null;
+let _evidenceTried = false;
+function _evidenceLog() {
+  if (_evidence !== null) return _evidence;
+  if (_evidenceTried) return null;
+  _evidenceTried = true;
+  for (const p of [
+    path.join(__dirname, 'vanta-evidence-log.js'),
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-evidence-log.js'),
+  ]) {
+    try { _evidence = require(p); return _evidence; }
+    catch (err) {
+      if (err && err.code !== 'MODULE_NOT_FOUND') {
+        try { process.stderr.write(`[vanta-resolve] WARN: evidence-log load failed: ${err.message}\n`); } catch {}
+      }
+    }
+  }
+  _evidence = null;
+  return null;
+}
+
 function _logQuery(entry) {
   try {
     const file = _queryLogFile();
@@ -768,11 +794,20 @@ function _cacheSet(key, value, ctx) {
 
 function clearCache() { _resolveCache.clear(); _readCache.clear(); }
 
-function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = false }) {
+function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = false, origin = null }) {
   if (!topic) return { topic: null, results: [], error: 'topic required' };
-  // Cache key: include `log` so cached calls don't accidentally suppress
-  // logging when a logged caller hits a no-log cache entry.
-  const cacheKey = `${topic}|${project || ''}|${cwd || ''}|${max}|${includeForeign}|${log}`;
+  // v3.10 council C-7: `origin` declares whether this resolve() came
+  // from a user prompt or from internal Vanta machinery. Default-deny
+  // for evidence logging — when origin is missing OR not 'user-prompt',
+  // we still resolve and return results, but invariant retrievals
+  // are NOT counted toward citation totals. This makes self-citation
+  // by machinery loops (soak-report scanning, session-start brief
+  // composition) structurally unable to inflate evidence scores.
+  const evidenceOrigin = origin === 'user-prompt' ? 'user-prompt' : 'internal';
+  // Cache key: include `log` AND `origin` so cached calls don't
+  // accidentally suppress logging or evidence when a different-origin
+  // caller hits a cache entry.
+  const cacheKey = `${topic}|${project || ''}|${cwd || ''}|${max}|${includeForeign}|${log}|${evidenceOrigin}`;
   const cacheCtx = { project, cwd };
   const cached = _cacheGet(cacheKey, cacheCtx);
   if (cached) return cached;
@@ -820,6 +855,26 @@ function resolve({ topic, project, cwd, max = 5, includeForeign = false, log = f
       })),
     });
   }
+  // v3.10 commit 2 — log evidence for invariant retrievals. Default-deny:
+  // only when origin === 'user-prompt' do we credit the invariant. Internal
+  // origin still resolves and returns results but does NOT inflate citation.
+  // Best-effort: never let evidence-log failures break resolve().
+  try {
+    const evidence = _evidenceLog();
+    if (evidence) {
+      for (const r of out.results) {
+        if (r.source !== 'invariants') continue;
+        const text = r.body || r.preview || r.title || '';
+        const hash = evidence.hashInvariant(text);
+        if (!hash) continue;
+        evidence.recordRetrieval({
+          invariant_hash: hash,
+          origin: evidenceOrigin,
+          project: project || null,
+        });
+      }
+    }
+  } catch (_) { /* never break resolve on logging failure */ }
   _cacheSet(cacheKey, out, cacheCtx);
   return out;
 }
