@@ -111,12 +111,38 @@ function _hasRecentHookErrors() {
   } catch { return false; }
 }
 
+// v3.12 — count auto-staged candidates pending review.
+//
+// Reads ~/.claude/rules/vinamr-invariants.staging.md and counts audit
+// blocks with `auto=true` flag. Distinct from ⚡N (sync-queue backlog)
+// and ❗ (hook errors).
+//
+// Performance: bounded read (cap 256KB tail), single regex scan, no
+// network or subprocess. <5ms typical.
+const STAGING_FILE = path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.staging.md');
+function _autoStagedCount() {
+  const st = _safeStat(STAGING_FILE);
+  if (!st || st.size === 0) return 0;
+  try {
+    const cap = Math.min(st.size, 256 * 1024);
+    const fd = fs.openSync(STAGING_FILE, 'r');
+    const buf = Buffer.alloc(cap);
+    fs.readSync(fd, buf, 0, cap, st.size - cap);
+    fs.closeSync(fd);
+    const tail = buf.toString('utf8');
+    const matches = tail.match(/<!-- vanta-sync:[^>]*\bauto=true\b[^>]*-->/g);
+    return matches ? matches.length : 0;
+  } catch { return 0; }
+}
+
 function _vantaSegment() {
   try {
     const heartbeat = _heartbeat();
     const parts = [`vanta ${heartbeat}`];
     const unsynced = _unsyncedCount();
     if (unsynced > 0) parts.push(`⚡${unsynced}`);
+    const autoStaged = _autoStagedCount();
+    if (autoStaged > 0) parts.push(`📥${autoStaged}`);
     if (_hasRecentHookErrors()) parts.push('❗');
     return parts.join(' ');
   } catch (_) {
@@ -153,4 +179,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { _heartbeat, _vantaSegment, _unsyncedCount, _hasRecentHookErrors };
+module.exports = { _heartbeat, _vantaSegment, _unsyncedCount, _hasRecentHookErrors, _autoStagedCount };
