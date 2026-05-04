@@ -391,6 +391,97 @@ process.stdin.on('end', () => {
         session_id: sid,
       });
     }
+
+    // ─── v3.12 — auto-stage candidates from this session's telemetry ──
+    //
+    // Why: /vanta-sync used to require manual invocation. Operator must
+    // remember to run it after every milestone. Backlog accumulates,
+    // learnings get lost. v3.11 made the extract path cheap (no LLM,
+    // no transcript re-scan). This step wires the cheap path into the
+    // Stop hook so capture is automatic.
+    //
+    // Quality tradeoff (operator-decided): mid-quality auto-extracted
+    // text → staging file with `auto=true` audit field. Manual /vanta-sync
+    // still runs the LLM-distilled high-quality path. Reviewer sees
+    // both and can distinguish via the audit prefix.
+    //
+    // Hard constraints (R7 P1 from v3.10):
+    //   - NEVER auto-promote to global vinamr-invariants.md
+    //   - Both `staging` (0.40-0.65) and `auto` (≥0.65) routes write
+    //     to the staging file. Promotion to global is human-gated.
+    //   - Wrap in try/catch + timer — never break the Stop hook.
+    const _AUTO_STAGE_BUDGET_MS = 2000;  // hard cap; typical run <500ms
+    const _autoStageStart = Date.now();
+    try {
+      let extractMod, scoreMod, consumeMod;
+      for (const p of [
+        path.join(__dirname, '..', 'bin', 'vanta-sync-extract.js'),
+        path.join(os.homedir(), '.claude', 'bin', 'vanta-sync-extract.js'),
+      ]) { try { extractMod = require(p); break; } catch {} }
+      for (const p of [
+        path.join(__dirname, '..', 'bin', 'vanta-extract-score.js'),
+        path.join(os.homedir(), '.claude', 'bin', 'vanta-extract-score.js'),
+      ]) { try { scoreMod = require(p); break; } catch {} }
+      for (const p of [
+        path.join(__dirname, '..', 'bin', 'vanta-sync-consume.js'),
+        path.join(os.homedir(), '.claude', 'bin', 'vanta-sync-consume.js'),
+      ]) { try { consumeMod = require(p); break; } catch {} }
+
+      if (extractMod && scoreMod && consumeMod) {
+        const cwdForExtract = cwd || process.cwd();
+        const r = extractMod.extract({ cwd: cwdForExtract, max: 10 });
+
+        const STAGING_FILE = path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.staging.md');
+        const INVARIANTS_FILE = path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.md');
+        const existing = scoreMod.readInvariantBullets(INVARIANTS_FILE);
+        const staging = scoreMod.readInvariantBullets(STAGING_FILE);
+
+        let staged = 0;
+        for (const rec of r.records) {
+          if (Date.now() - _autoStageStart > _AUTO_STAGE_BUDGET_MS) break;
+          if (rec.type !== 'candidate') continue;
+          const route = scoreMod.routeCandidate(rec.candidate, { existing, staging });
+          // staging | auto → both write to staging file. R7 P1.
+          // update-in-place / staging-duplicate / discard / hardReject → skip.
+          if (route.route !== 'staging' && route.route !== 'auto') continue;
+          const audit = scoreMod.auditPrefix({
+            sessionId: sid,
+            confidence: route.score,
+            auto: true,
+          });
+          // Section header derived from source (best-effort categorization).
+          // Reviewer can move entries between sections during promote.
+          const sectionTitle = '## Auto-staged (' + rec.source + ')';
+          const block = '\n' + sectionTitle + '\n' + audit + '\n- ' + rec.candidate + '\n';
+          try {
+            fs.mkdirSync(path.dirname(STAGING_FILE), { recursive: true });
+            fs.appendFileSync(STAGING_FILE, block);
+            // Mark consumed only AFTER staging write succeeds — atomicity boundary.
+            consumeMod.mark({
+              slug: r.slug || slug,
+              source: rec.source,
+              ref: rec.ref,
+              ts: rec.ts,
+              candidate_hash: rec.candidate_hash,
+            });
+            // In-process dedup: future iterations in this loop should see
+            // the just-staged candidate as already-staged. Cheap append
+            // to the local `staging` array (Jaccard check is text-based).
+            staging.push(rec.candidate);
+            staged++;
+          } catch (e) {
+            vlog().warn('auto-sync.auto-stage', 'staging write failed: ' + e.message);
+          }
+        }
+        if (staged > 0) {
+          vlog().info('auto-sync.auto-stage', `staged ${staged} candidates from session ${sid}`);
+        }
+      }
+    } catch (e) {
+      // Never break the Stop hook on auto-stage failure.
+      vlog().warn('auto-sync.auto-stage', 'skipped: ' + e.message);
+    }
+
     // R8 P2 — wire resetSession + reapStale (Codex council finding).
     // Earlier code exposed both functions via vanta-runtime-state.js but
     // nothing called them. Per-session journals at ~/.vanta/runtime/*.jsonl
