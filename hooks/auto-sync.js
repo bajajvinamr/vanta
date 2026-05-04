@@ -412,20 +412,34 @@ process.stdin.on('end', () => {
     //   - Wrap in try/catch + timer — never break the Stop hook.
     const _AUTO_STAGE_BUDGET_MS = 2000;  // hard cap; typical run <500ms
     const _autoStageStart = Date.now();
+    // Council R1+R2 follow-up: only swallow MODULE_NOT_FOUND. Syntax/runtime
+    // errors in a Vanta bin must surface — silent fallback to a stale deployed
+    // copy at ~/.claude/bin/ creates version skew (matches vinamr invariant
+    // "Never silently swallow non-MODULE_NOT_FOUND require() failures").
+    function _lazyRequire(candidates, label) {
+      for (const p of candidates) {
+        try { return require(p); }
+        catch (e) {
+          if (e && e.code === 'MODULE_NOT_FOUND' && (e.message || '').includes(p)) continue;
+          vlog().warn('auto-sync.auto-stage', `${label} load failed: ${e.message}`);
+          return null;
+        }
+      }
+      return null;
+    }
     try {
-      let extractMod, scoreMod, consumeMod;
-      for (const p of [
+      const extractMod = _lazyRequire([
         path.join(__dirname, '..', 'bin', 'vanta-sync-extract.js'),
         path.join(os.homedir(), '.claude', 'bin', 'vanta-sync-extract.js'),
-      ]) { try { extractMod = require(p); break; } catch {} }
-      for (const p of [
+      ], 'vanta-sync-extract');
+      const scoreMod = _lazyRequire([
         path.join(__dirname, '..', 'bin', 'vanta-extract-score.js'),
         path.join(os.homedir(), '.claude', 'bin', 'vanta-extract-score.js'),
-      ]) { try { scoreMod = require(p); break; } catch {} }
-      for (const p of [
+      ], 'vanta-extract-score');
+      const consumeMod = _lazyRequire([
         path.join(__dirname, '..', 'bin', 'vanta-sync-consume.js'),
         path.join(os.homedir(), '.claude', 'bin', 'vanta-sync-consume.js'),
-      ]) { try { consumeMod = require(p); break; } catch {} }
+      ], 'vanta-sync-consume');
 
       if (extractMod && scoreMod && consumeMod) {
         const cwdForExtract = cwd || process.cwd();
@@ -433,48 +447,119 @@ process.stdin.on('end', () => {
 
         const STAGING_FILE = path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.staging.md');
         const INVARIANTS_FILE = path.join(os.homedir(), '.claude', 'rules', 'vinamr-invariants.md');
-        const existing = scoreMod.readInvariantBullets(INVARIANTS_FILE);
-        const staging = scoreMod.readInvariantBullets(STAGING_FILE);
+        const STAGING_LOCK  = STAGING_FILE + '.lock';
 
-        let staged = 0;
-        for (const rec of r.records) {
-          if (Date.now() - _autoStageStart > _AUTO_STAGE_BUDGET_MS) break;
-          if (rec.type !== 'candidate') continue;
-          const route = scoreMod.routeCandidate(rec.candidate, { existing, staging });
-          // staging | auto → both write to staging file. R7 P1.
-          // update-in-place / staging-duplicate / discard / hardReject → skip.
-          if (route.route !== 'staging' && route.route !== 'auto') continue;
-          const audit = scoreMod.auditPrefix({
-            sessionId: sid,
-            confidence: route.score,
-            auto: true,
-          });
-          // Section header derived from source (best-effort categorization).
-          // Reviewer can move entries between sections during promote.
-          const sectionTitle = '## Auto-staged (' + rec.source + ')';
-          const block = '\n' + sectionTitle + '\n' + audit + '\n- ' + rec.candidate + '\n';
-          try {
-            fs.mkdirSync(path.dirname(STAGING_FILE), { recursive: true });
-            fs.appendFileSync(STAGING_FILE, block);
-            // Mark consumed only AFTER staging write succeeds — atomicity boundary.
-            consumeMod.mark({
-              slug: r.slug || slug,
-              source: rec.source,
-              ref: rec.ref,
-              ts: rec.ts,
-              candidate_hash: rec.candidate_hash,
-            });
-            // In-process dedup: future iterations in this loop should see
-            // the just-staged candidate as already-staged. Cheap append
-            // to the local `staging` array (Jaccard check is text-based).
-            staging.push(rec.candidate);
-            staged++;
-          } catch (e) {
-            vlog().warn('auto-sync.auto-stage', 'staging write failed: ' + e.message);
-          }
+        // Council R1 P1 (both confirmed): serialize staging writes via O_EXCL
+        // lockfile. Without this, two Stop hooks ending within 100ms both read
+        // the same staging snapshot, both miss the dup, both append.
+        // Pattern lifted from bin/vanta-index-code.js — PID-aware steal +
+        // generous safety threshold. Lock is best-effort: failure to acquire
+        // skips this run rather than blocking the Stop hook.
+        function _isPidAlive(pid) {
+          if (!pid || typeof pid !== 'number') return false;
+          try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
         }
-        if (staged > 0) {
-          vlog().info('auto-sync.auto-stage', `staged ${staged} candidates from session ${sid}`);
+        function _acquireStagingLock() {
+          fs.mkdirSync(path.dirname(STAGING_LOCK), { recursive: true });
+          for (let attempt = 0; attempt < 10; attempt++) {
+            try {
+              const fd = fs.openSync(STAGING_LOCK, 'wx');
+              fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+              fs.closeSync(fd);
+              return true;
+            } catch (err) {
+              if (err.code !== 'EEXIST') return false;
+              try {
+                const meta = JSON.parse(fs.readFileSync(STAGING_LOCK, 'utf8'));
+                const st = fs.statSync(STAGING_LOCK);
+                const ageMs = Date.now() - st.mtimeMs;
+                if (!_isPidAlive(meta.pid) || ageMs > 30_000) {
+                  try { fs.unlinkSync(STAGING_LOCK); } catch {}
+                  continue;
+                }
+              } catch {
+                try { fs.unlinkSync(STAGING_LOCK); } catch {}
+                continue;
+              }
+              const t = Date.now() + 50;
+              while (Date.now() < t) { /* spin */ }
+            }
+          }
+          return false;
+        }
+        function _releaseStagingLock() { try { fs.unlinkSync(STAGING_LOCK); } catch {} }
+
+        if (!_acquireStagingLock()) {
+          vlog().warn('auto-sync.auto-stage', 'lock contention — skipping this run');
+          return;
+        }
+        try {
+          const existing = scoreMod.readInvariantBullets(INVARIANTS_FILE);
+          // Re-read staging UNDER the lock — Codex R1 P2 fix: in-memory
+          // snapshot is only valid while we hold the lock.
+          const staging = scoreMod.readInvariantBullets(STAGING_FILE);
+
+          let staged = 0;
+          // Council R1+R2: single section header per (source) per run.
+          // Tracking via Set prevents the markdown-litter / parser-break
+          // failure mode (split(/\n(?=<!-- vanta-sync:)/g) phantom blocks).
+          const headersWritten = new Set();
+
+          for (const rec of r.records) {
+            if (Date.now() - _autoStageStart > _AUTO_STAGE_BUDGET_MS) break;
+            if (rec.type !== 'candidate') continue;
+            const route = scoreMod.routeCandidate(rec.candidate, { existing, staging });
+
+            // Council R2 P1 (Gemini): mark consumed for EVERY evaluated
+            // candidate, regardless of route. Otherwise discard /
+            // update-in-place / staging-duplicate re-extract every session
+            // forever, gradually exhausting the 2s budget.
+            const _markConsumed = () => {
+              try {
+                consumeMod.mark({
+                  slug: r.slug || slug,
+                  source: rec.source,
+                  ref: rec.ref,
+                  ts: rec.ts,
+                  candidate_hash: rec.candidate_hash,
+                });
+              } catch (e) {
+                vlog().warn('auto-sync.auto-stage', 'consume.mark failed: ' + e.message);
+              }
+            };
+
+            // staging | auto → both write to staging file. R7 P1.
+            // update-in-place / staging-duplicate / discard / hardReject → mark consumed only.
+            if (route.route !== 'staging' && route.route !== 'auto') {
+              _markConsumed();
+              continue;
+            }
+            const audit = scoreMod.auditPrefix({
+              sessionId: sid,
+              confidence: route.score,
+              auto: true,
+            });
+            const sectionTitle = '## Auto-staged (' + rec.source + ')';
+            const headerBlock = headersWritten.has(rec.source)
+              ? ''
+              : '\n' + sectionTitle + '\n';
+            const block = headerBlock + audit + '\n- ' + rec.candidate + '\n';
+            try {
+              fs.mkdirSync(path.dirname(STAGING_FILE), { recursive: true });
+              fs.appendFileSync(STAGING_FILE, block);
+              headersWritten.add(rec.source);
+              _markConsumed();
+              staging.push(rec.candidate);
+              staged++;
+            } catch (e) {
+              vlog().warn('auto-sync.auto-stage', 'staging write failed: ' + e.message);
+            }
+          }
+          if (staged > 0) {
+            vlog().info('auto-sync.auto-stage', `staged ${staged} candidates from session ${sid}`);
+          }
+        } finally {
+          _releaseStagingLock();
         }
       }
     } catch (e) {
