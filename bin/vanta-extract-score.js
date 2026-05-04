@@ -224,11 +224,17 @@ function routeCandidate(text, opts = {}) {
 
 // ── audit comment ───────────────────────────────────────────────────────────
 
-function auditPrefix({ sessionId, confidence, ts }) {
+function auditPrefix({ sessionId, confidence, ts, auto }) {
   const t = ts || new Date().toISOString();
   const sid = sessionId || 'unknown';
   const conf = (typeof confidence === 'number') ? confidence.toFixed(2) : 'unknown';
-  return `<!-- vanta-sync: session=${sid} ts=${t} confidence=${conf} -->`;
+  // v3.12 — optional `auto` flag distinguishes Stop-hook auto-staged
+  // entries from manually-distilled /vanta-sync entries. Reviewer can
+  // tell the two apart; promotion paths can refuse auto=true entries
+  // without explicit human confirmation. Backward-compat: when `auto`
+  // is undefined the v3.10/v3.11 audit format is produced unchanged.
+  const tail = (typeof auto === 'boolean') ? ` auto=${auto}` : '';
+  return `<!-- vanta-sync: session=${sid} ts=${t} confidence=${conf}${tail} -->`;
 }
 
 // ── helpers for vanta-sync integration ─────────────────────────────────────
