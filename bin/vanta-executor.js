@@ -36,9 +36,14 @@ let _killSwitch, _safetyFloor, _rewriter, _riskClassifier, _peerRouter, _escalat
 // the operator notices that a dependency broke instead of inferring
 // "Vanta is just being permissive today" from the lack of routing.
 function _resolve(name) {
+  // P0 test-seam fix: try __dirname first so require.cache stubs from
+  // tests/canonical.test.js (which stub at `require.resolve('../bin/x')` =
+  // the repo path) are found before the deployed copy at ~/.claude/bin/.
+  // When the executor is deployed, __dirname IS ~/.claude/bin/ so the two
+  // first paths collapse to the same file — no production behaviour change.
   for (const p of [
-    path.join(os.homedir(), '.claude', 'bin', name),
     path.join(__dirname, name),
+    path.join(os.homedir(), '.claude', 'bin', name),
     path.join(os.homedir(), 'Projects', 'vanta', 'bin', name),
   ]) {
     try {
@@ -310,6 +315,13 @@ function decide(input = {}) {
 
   // 1. Kill-switch — terminal short-circuit.
   const ks = killSwitch();
+  if (!ks) {
+    // P0 kill-switch warn: module unavailable means we cannot honour an
+    // emergency halt. Surface this clearly so the operator notices rather
+    // than inferring "Vanta is just permissive today". Routing continues
+    // normally — all other safety layers (floor, classifier) still apply.
+    try { process.stderr.write('[vanta-executor] WARN: kill-switch module unavailable — no kill-switch enforcement this session\n'); } catch (_) {}
+  }
   if (ks && ks.check) {
     const c = ks.check({ sessionId: ctx.session_id, cwd: ctx.cwd });
     if (c && c.off) {

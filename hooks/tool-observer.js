@@ -23,6 +23,7 @@ const os = require('os');
 
 let _log = null;
 let _state = null;
+let _projects = null;
 
 function logger() {
   if (_log !== null) return _log;
@@ -31,6 +32,14 @@ function logger() {
     path.join(os.homedir(), 'Projects', 'vanta', 'bin', 'vanta-interaction-log.js'),
   ]) { try { _log = require(p); break; } catch {} }
   return _log;
+}
+function projects() {
+  if (_projects !== null) return _projects;
+  for (const p of [
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-projects.js'),
+    path.join(os.homedir(), 'Projects', 'vanta', 'bin', 'vanta-projects.js'),
+  ]) { try { _projects = require(p); break; } catch {} }
+  return _projects;
 }
 function rs() {
   if (_state !== null) return _state;
@@ -98,7 +107,11 @@ async function main() {
       ext: shape.ext,
       bash_verb: shape.bashVerb,
       ok,
-      slug: path.basename(data.cwd || process.cwd()),
+      // P1 slug fix: path.basename fragments monorepo project-scoped trust
+      // because basename of ~/Projects/foo/packages/api is 'api', not 'foo'.
+      // slugFromCwd() walks symlinks, prefers git remote slug, falls back to
+      // git-root basename. path.basename() fallback covers non-git dirs.
+      slug: (projects()?.slugFromCwd(data.cwd || process.cwd())) || path.basename(data.cwd || process.cwd()),
     });
   } catch { /* never block on log failure */ }
 

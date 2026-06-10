@@ -11,6 +11,6 @@
   },
   "keywords": ["vanta", "claude-code", "gstack", "gsd", "superpowers", "ai-workflow", "council"],
   "scripts": {
-    "test": "node --test tests/canonical.test.js"
+    "test": "node --test tests/*.test.js"
   }
 }

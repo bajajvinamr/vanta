@@ -41,8 +41,9 @@ function vlog() {
 }
 
 function _floorPath() {
-  const userOverride = process.env.VANTA_SAFETY_FLOOR;
-  if (userOverride && fs.existsSync(userOverride)) return userOverride;
+  // P0 security: VANTA_SAFETY_FLOOR env override removed. An arbitrary env var
+  // pointing to /dev/null or an empty file could silently disable all safety
+  // rules. Policy must live in one of the three known safe locations below.
   const deployed = path.join(os.homedir(), '.vanta', 'policy', 'safety-floor.yaml');
   if (fs.existsSync(deployed)) return deployed;
   const repoLocal = path.join(__dirname, '..', 'policy', 'safety-floor.yaml');
@@ -89,6 +90,48 @@ function _parseFloorYaml(src) {
   return out;
 }
 
+// P0 safety-floor fail-closed: hardcoded minimal floor returned on ANY load
+// failure. Previously all failure paths returned {floor:[]}, making the
+// deterministic always-ask layer silently disappear on YAML corruption or a
+// missing policy file. The entries below cover the most critical always-ask
+// rules so a broken policy file degrades to "fewer rules" not "no rules".
+// _re fields are pre-compiled to avoid depending on the compile step.
+const MINIMAL_FLOOR = Object.freeze({
+  version: 0,
+  _minimal: true,
+  floor: [
+    {
+      id: 'git-force-push-main', kind: 'command',
+      pattern: 'push.*(--force|-f).*(main|master)',
+      why: 'force-pushing main/master rewrites shared history — always confirm',
+      _re: /push.*(--force|-f).*(main|master)/,
+    },
+    {
+      id: 'env-file-write', kind: 'file',
+      pattern: '**/.env*',
+      why: '.env files risk leaking secrets',
+    },
+    {
+      id: 'destructive-sql', kind: 'command',
+      pattern: '(DROP\\s+(TABLE|DATABASE)|TRUNCATE\\s+TABLE)',
+      why: 'irreversible data destruction — always confirm',
+      _re: /(DROP\s+(TABLE|DATABASE)|TRUNCATE\s+TABLE)/i,
+    },
+    {
+      id: 'rm-rf-root', kind: 'command',
+      pattern: 'rm\\s+(-rf|-fr)\\s+/',
+      why: 'deleting from / is catastrophic — always confirm',
+      _re: /rm\s+(-rf|-fr)\s+\//,
+    },
+    {
+      id: 'reset-hard', kind: 'command',
+      pattern: 'git\\s+reset\\s+--hard',
+      why: 'hard reset discards uncommitted work — always confirm',
+      _re: /git\s+reset\s+--hard/,
+    },
+  ],
+});
+
 let _cache = null;
 let _cacheMtime = 0;
 
@@ -97,12 +140,20 @@ function reload() { _cache = null; _cacheMtime = 0; }
 function load() {
   const p = _floorPath();
   if (!p) {
-    if (!_cache) { _cache = { version: 0, floor: [], _empty: true }; }
+    // No policy file anywhere — warn and use the minimal floor.
+    if (!_cache) {
+      vlog().warn('safety-floor.load', 'no policy file found — using hardcoded minimal floor');
+      _cache = MINIMAL_FLOOR;
+    }
     return _cache;
   }
   let st;
-  try { st = fs.statSync(p); } catch { return _cache || { version: 0, floor: [] }; }
-  if (_cache && st.mtimeMs === _cacheMtime) return _cache;
+  try { st = fs.statSync(p); } catch {
+    // Stat failed — use minimal floor, not empty floor.
+    vlog().warn('safety-floor.load', `cannot stat ${p} — using hardcoded minimal floor`);
+    return _cache || MINIMAL_FLOOR;
+  }
+  if (_cache && _cache !== MINIMAL_FLOOR && st.mtimeMs === _cacheMtime) return _cache;
   try {
     const src = fs.readFileSync(p, 'utf8');
     const parsed = _parseFloorYaml(src);
@@ -124,7 +175,10 @@ function load() {
     return _cache;
   } catch (err) {
     vlog().error('safety-floor.load', `failed to load ${p}: ${err.message}`);
-    if (!_cache) _cache = { version: 0, floor: [], _empty: true };
+    // Parse error — return minimal floor, not empty floor.
+    if (!_cache || _cache === MINIMAL_FLOOR) {
+      _cache = MINIMAL_FLOOR;
+    }
     return _cache;
   }
 }

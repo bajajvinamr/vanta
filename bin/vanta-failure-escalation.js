@@ -32,9 +32,11 @@ const os = require('os');
 let _al;
 function actionLog() {
   if (_al) return _al;
+  // Same __dirname-first order as vanta-executor.js — tests stub at the repo
+  // path; deployed copies have __dirname === ~/.claude/bin/ (same file anyway).
   for (const p of [
-    path.join(os.homedir(), '.claude', 'bin', 'vanta-action-log.js'),
     path.join(__dirname, 'vanta-action-log.js'),
+    path.join(os.homedir(), '.claude', 'bin', 'vanta-action-log.js'),
   ]) { try { _al = require(p); return _al; } catch {} }
   return null;
 }

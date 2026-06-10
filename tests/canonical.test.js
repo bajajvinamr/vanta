@@ -3420,22 +3420,17 @@ describe('vanta-autonomy — project-context detection (v3.6.17)', () => {
     } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
   });
 
-  test('manual upgrade: L1 → L2 writes config + records action-log', () => {
+  test('manual upgrade: L1 → L2 is blocked — only L0→L1 is allowed', () => {
+    // P1.2 gate: manualUpgrade is L0→L1 only. Calling it from L1 (no config =
+    // default L1) must throw. This test was previously named "L1→L2 writes
+    // config..." and tested old unintended behaviour; see the L0→L1 test below
+    // and the Council R1 P3 comment in the integration suite for context.
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-auto-upg-'));
     try {
       process.env.VANTA_DIR_OVERRIDE = tmp;
       execSync('git init -q', { cwd: tmp });
       fs.writeFileSync(path.join(tmp, 'package.json'), '{}\n');
-      const r = auto.manualUpgrade(tmp);
-      assert.equal(r.changed, true);
-      assert.equal(r.prior, 'L1');
-      assert.equal(r.level, 'L2');
-      assert.equal(auto.effectiveLevel(tmp).level, 'L2');
-      // Action-log should have the autonomy-promote entry.
-      const al3 = require('../bin/vanta-action-log');
-      const entries = al3.read({ action: 'autonomy-promote' });
-      assert.ok(entries.length >= 1);
-      assert.equal(entries[0].undo_hint.kind, 'autonomy-promote');
+      assert.throws(() => auto.manualUpgrade(tmp), /manualUpgrade only allows L0→L1/);
     } finally {
       delete process.env.VANTA_DIR_OVERRIDE;
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -3989,25 +3984,19 @@ describe('integration: trust-metrics ↔ autonomy gating (v3.6.19)', () => {
     }
   });
 
-  test('manualUpgrade from default (L1, no config) → L2 records autonomy-promote action with payload', () => {
+  test('manualUpgrade from default L1 throws — only L0→L1 is the documented opt-in path', () => {
+    // P1.2 gate: default repos start at L1 (no config). manualUpgrade from
+    // L1 must throw — the only allowed manual path is L0→L1. This test
+    // previously verified L1→L2 writing an action-log entry (old behaviour).
+    // The correct L0→L1 test is two tests below this one.
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-int-auton-upgrade-'));
     try {
       process.env.VANTA_DIR_OVERRIDE = tmp;
-      // code repo, no config → effective L1 by default. Upgrade therefore goes L1 → L2.
       fs.writeFileSync(path.join(tmp, 'package.json'), '{}');
       fs.mkdirSync(path.join(tmp, '.git'), { recursive: true });
       delete require.cache[require.resolve('../bin/vanta-autonomy')];
       const auton = require('../bin/vanta-autonomy');
-      const r = auton.manualUpgrade(tmp);
-      assert.equal(r.changed, true);
-      assert.equal(r.level, 'L2');
-      // Action-log must contain it.
-      const events = al2.read({ action: 'autonomy-promote' });
-      const ev = events.find(e => e.subject === tmp);
-      assert.ok(ev, 'manualUpgrade must record autonomy-promote');
-      assert.equal(ev.undo_hint.kind, 'autonomy-promote');
-      assert.equal(ev.undo_hint.payload.prior_level, 'L1');
-      assert.equal(ev.undo_hint.payload.new_level, 'L2');
+      assert.throws(() => auton.manualUpgrade(tmp), /manualUpgrade only allows L0→L1/);
     } finally {
       delete process.env.VANTA_DIR_OVERRIDE;
       fs.rmSync(tmp, { recursive: true, force: true });

@@ -270,6 +270,11 @@ function manualUpgrade(cwd) {
   if (eff.locked) throw new Error('autonomy is locked by override_until — manual upgrade not allowed');
   const cur = eff.level;
   if (cur === 'L3') return { level: 'L3', changed: false };
+  // P1 gate: manualUpgrade is opt-in L0→L1 ONLY. L1→L2 and above require
+  // sustained trust-metrics thresholds via autonomy-promote (tick()). This
+  // matches the documented intent ("the only manual path") and prevents
+  // a single call from jumping multiple trust levels.
+  if (cur !== 'L0') throw new Error(`manualUpgrade only allows L0→L1 — current level is ${cur}; higher levels require trust-metrics promotion`);
   const next = `L${parseInt(cur.slice(1), 10) + 1}`;
   writeConfig(eff.detected.root, { level: next });
   al.record({

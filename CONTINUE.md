@@ -1,43 +1,38 @@
-# Vanta v3.3 — Shipped while you slept
+# Vanta P0/P1 Security Fixes
 
-Resumed your "use codex and gemini to the fullest, build the version of Vanta we can't even foresee" directive. 4 commits pushed to master.
+**Started:** 2026-06-10  
+**Sprint:** P0 audit findings from deep audit (2026-06-08)
 
-## What shipped
+## P0 — Fix before next tag
 
-| Commit | Tier | Headline |
-|---|---|---|
-| `7f4ec32` | v3.2 | Constraint-pack hook, episodes, vanta-patterns governance, decision metadata |
-| `8da5f0d` | v3.3 T1 | **Install bug fix** (only Stop hook was registered; 3 of 4 hooks silently dead on fresh installs), expiry/supersession parser, dedup, race fix |
-| `7708f7f` | v3.3 T2 | **`bin/vanta-resolve.js`** canonical knowledge index, **Shadow Council** via `plan-watcher.js` |
-| `6d5f83b` | v3.3 polish | Stricter decision extractor (rejects skill-doc patterns), Shadow + stale-decision in session brief |
+- [x] P0.1 — Test suite: wire all 14 files + fix _resolve() path order so stubs hit
+- [x] P0.2 — Safety-floor: fail-closed (hardcoded MINIMAL_FLOOR on any load failure; removed env override)
+- [x] P0.3 — Kill-switch: warn when module unavailable (no silent skip)
+- [x] P0.4 — Shell injection: execFileSync + SHA validation in vanta-regret-detector.js
 
-## The two big architectural shifts
+## P1 — Fix in same session
 
-1. **One canonical resolver, not five separate greps.** Both Codex and Gemini independently flagged this gap. `bin/vanta-resolve.js` queries invariants + decisions + gotchas + episodes + memory through a single ranked pipeline. Drops expired decisions and superseded entries. Used by `/recall` and by `council-advisory.js` — same ranking everywhere.
+- [x] P1.1 — tool-observer slug: path.basename → slugFromCwd (fixes interrupt-rate gate always-zero)
+- [x] P1.2 — manualUpgrade gate: L0→L1 only (not any level)
 
-2. **Shadow Council (pre-emptive governance).** When you write a sensitive plan to `.planning/*.md`, `plan-watcher.js` detects auth/payment/migration/security keywords and flags it in `~/.gstack/projects/<slug>/.shadow_pending.md`. The flag surfaces in the constraint pack on the very first code edit AND in the session-start brief. You can't accidentally implement a sensitive plan that hasn't been council-reviewed.
+## Verify
 
-## End-to-end smoke tests passed
+- [x] `node --test --test-concurrency=1 tests/canonical.test.js` → 347 pass, 0 fail
+- [x] `node --test tests/*.test.js` → 729 pass, 0 fail (all 14 files)
+- [ ] `/council` before committing safety-floor + kill-switch changes (safety-critical)
 
-- Editing `/auth/jwt.ts` → constraint pack surfaces ES256 JWT invariant + Baileys auth state invariant + project gotcha. Zero noise.
-- Plan-watcher → flag write → council-advisory pickup chain works.
-- Stop hook deduped: same session_id fired twice = 1 entry kept.
-- Resolver: `--topic jwt` returns 2 ranked results with confidence + recency scoring.
+## Files changed
 
-## What I deliberately deferred (open in v3.4)
+vanta-executor.js, vanta-safety-floor.js, vanta-regret-detector.js, hooks/tool-observer.js, bin/vanta-autonomy.js, package.json
 
-- **Real async Shadow Council fire** (Gemini's full proposal) — spawning detached Codex/Gemini CLI from a hook is risky without auth-check infrastructure. v3.3 ships flag-only; the verdict-cache step lands when we know the false-positive rate.
-- **Route manifest** (Codex's P2) — `vanta-patterns` still edits the deployed SKILL.md directly. Routes get wiped on `setup.sh` reinstall. Move routing table to JSON manifest in repo, regenerate SKILL.md from it.
-- **Promoted-invariants metric** — sync coverage measures queue clearing, not actual knowledge promotion. Track which invariants got added by which session.
-- **Read-blind anticipatory memory** — constraint pack only fires on Write/Edit. Should also fire when Claude reads sensitive files or on plan-mode entry.
+## Next after verifying
 
-## State of `~/.vanta/` after cleanup
+- `/council` on the safety-floor + kill-switch changes
+- `/vanta-sync` to capture learnings → tag v3.13
 
-- `episodes.jsonl`: 0 entries (purged poisoned data; new sessions populate cleanly with stricter extractor)
-- `sync-queue.jsonl`: 3 unsynced sessions (vanta, sales-agent-publisher, priyaa-audit) — would benefit from `/vanta-sync` runs
+---
 
-## Next concrete action when you wake up
+## Prior state (v3.3 ship note)
 
-1. `/vanta-sync` in any of the 3 unsynced project dirs to extract their learnings (will use the new stricter extractor, no markdown poisoning).
-2. Restart Claude Code so the new `plan-watcher.js` hook registers and `council-advisory.js` picks up the resolver.
-3. Test cross-project recall: `/vanta what do I know about pixijs` should now hit invariants + memory in one ranked block.
+Resumed your "use codex and gemini to the fullest" directive. 4 commits pushed:
+`7f4ec32` v3.2 · `8da5f0d` v3.3 T1 (install bug fix) · `7708f7f` v3.3 T2 (vanta-resolve + Shadow Council) · `6d5f83b` v3.3 polish

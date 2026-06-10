@@ -19,7 +19,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 
 const al = require('./vanta-action-log');
 
@@ -56,12 +56,18 @@ function _vantaTouchedFiles({ days = 7, maxFiles = 50 } = {}) {
 // Did the user edit `file` after vanta touched it (per `since`)?
 // We check `git log` for commits authored after that ts that touched
 // the file. Returns array of { sha, author_ts, message }.
+// P0 shell-injection fix: use execFileSync with explicit arg arrays instead of
+// execSync with template literals. action-log paths (file) are user-controlled;
+// template-literal interpolation into /bin/sh strings is an injection vector.
+const SHA_RE = /^[0-9a-f]{40}$/;
+
 function _userEditsAfter(file, sinceTs) {
   try {
     const dir = path.dirname(file);
     const since = new Date(sinceTs).toISOString();
-    const out = execSync(
-      `git log --since="${since}" --format="%H|%cI|%s" -- "${file}"`,
+    const out = execFileSync(
+      'git',
+      ['log', `--since=${since}`, '--format=%H|%cI|%s', '--', file],
       { cwd: dir, stdio: ['pipe', 'pipe', 'ignore'] }
     ).toString().trim();
     if (!out) return [];
@@ -90,16 +96,18 @@ function _isRegretCommit(commit) {
 // score: pct of vanta's added lines that no longer exist post-user-commit.
 function _silentRevertScore(file, vantaTs, userCommit) {
   try {
+    // Validate SHAs before use — both come from git output but defense-in-depth.
+    if (userCommit.sha && !SHA_RE.test(userCommit.sha)) return 0;
     const dir = path.dirname(file);
-    // Approximate: diff the file at vanta-touch time vs user-commit.
-    // We use vanta's ts to pick the closest commit before that ts.
-    const vantaCommit = execSync(
-      `git log --before="${new Date(vantaTs).toISOString()}" --format="%H" -1 -- "${file}"`,
+    const vantaCommit = execFileSync(
+      'git',
+      ['log', `--before=${new Date(vantaTs).toISOString()}`, '--format=%H', '-1', '--', file],
       { cwd: dir, stdio: ['pipe', 'pipe', 'ignore'] }
     ).toString().trim();
-    if (!vantaCommit) return 0;
-    const diff = execSync(
-      `git diff ${vantaCommit} ${userCommit.sha} -- "${file}"`,
+    if (!vantaCommit || !SHA_RE.test(vantaCommit)) return 0;
+    const diff = execFileSync(
+      'git',
+      ['diff', vantaCommit, userCommit.sha, '--', file],
       { cwd: dir, stdio: ['pipe', 'pipe', 'ignore'] }
     ).toString();
     if (!diff) return 0;
