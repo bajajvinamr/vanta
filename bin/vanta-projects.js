@@ -119,6 +119,16 @@ const AMBIGUOUS_BASENAMES = new Set([
   'downloads', 'projects', 'src', 'code', 'repo', 'repos', 'work',
 ]);
 
+// Known-meaningful workspace paths that a bare basename can't identify.
+// ~/Projects is the Vinamr OS central layer (CoS sessions run there) — its
+// basename "projects" is in AMBIGUOUS_BASENAMES, so without this alias every
+// CoS session logged slug '' and project-scoped trust fragmented (114 empty
+// slugs in the 07-17 sync-queue audit).
+const _os = require('os');
+const WORKSPACE_ALIASES = {
+  [_path.join(_os.homedir(), 'Projects')]: 'vinamr-os',
+};
+
 function slugFromCwd(cwd) {
   if (!cwd) return null;
   let real = cwd;
@@ -141,6 +151,10 @@ function slugFromCwd(cwd) {
     ).toString().trim();
   } catch { /* not a git repo */ }
   const target = repoRoot || real;
+  if (WORKSPACE_ALIASES[target]) return WORKSPACE_ALIASES[target];
+  // $HOME's basename is the username ("vinamr"), which the name-set can't
+  // catch — 30 sessions fragmented onto that slug before this guard.
+  if (target === _os.homedir()) return null;
   const base = _path.basename(target).toLowerCase();
 
   if (AMBIGUOUS_BASENAMES.has(base)) return null;
