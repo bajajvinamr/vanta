@@ -16,6 +16,12 @@ const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
 
+// Same test seam as vanta-action/vanta-action-log/vanta-cancellation — without
+// it, tests that read ~/.vanta pass only on machines with a clean failure ledger.
+function _vantaDir() {
+  return process.env.VANTA_DIR_OVERRIDE || path.join(os.homedir(), '.vanta');
+}
+
 function readSafe(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } }
 function readJsonl(p) {
   const c = readSafe(p);
@@ -140,7 +146,7 @@ function unsyncedSessions(cwd) {
   // R8 P1 — read merged across rotated `.bak.<ts>` + live file. Producer
   // no longer compacts on rotate (concurrent-write data loss); merge here.
   const { readMergedJsonl } = require('./vanta-jsonl');
-  const file = path.join(os.homedir(), '.vanta', 'sync-queue.jsonl');
+  const file = path.join(_vantaDir(), 'sync-queue.jsonl');
   const merged = readMergedJsonl(file);
   const entries = merged.split('\n').filter(Boolean)
     .map(l => { try { return JSON.parse(l); } catch { return null; } })
@@ -153,7 +159,7 @@ function unsyncedSessions(cwd) {
 }
 
 function recentMisses(days = 7) {
-  const file = path.join(os.homedir(), '.vanta', 'missed-intents.jsonl');
+  const file = path.join(_vantaDir(), 'missed-intents.jsonl');
   const entries = readJsonl(file);
   const cutoff = new Date(Date.now() - days * 86400000).toISOString();
   return entries.filter(e => (e.ts || '') >= cutoff).length;
@@ -171,7 +177,7 @@ function recentMisses(days = 7) {
 // Window: last 24h. Older failures aren't actionable for the current
 // session — they belong in the soak report instead.
 function recentFailures({ project = null, hours = 24, topK = 3 } = {}) {
-  const file = path.join(os.homedir(), '.vanta', 'recent-failures.jsonl');
+  const file = path.join(_vantaDir(), 'recent-failures.jsonl');
   // Read across rotated bak siblings — failures are append-only with
   // size-based rotation in the Stop hook.
   let entries;

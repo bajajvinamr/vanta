@@ -544,6 +544,69 @@ process.stdin.on('end', () => {
               ? ''
               : '\n' + sectionTitle + '\n';
             const block = headerBlock + audit + '\n- ' + rec.candidate + '\n';
+
+            // P1 completeness + confidence gate — two guards before any staging write.
+            // Both must pass; rejected entries are logged to ~/.vanta/staging-rejects.jsonl
+            // so nothing is silently lost.
+            //
+            // (a) Completeness: reject if <80 chars, no sentence-terminal punctuation
+            //     at the end, or last word looks mid-truncation (no trailing space/punct
+            //     after the final non-whitespace run).
+            // (b) Confidence floor: if score available, require >=0.70; if no score,
+            //     fall through to completeness check only.
+            const _logReject = (reason) => {
+              try {
+                const rejectPath = path.join(_vantaDir(), 'staging-rejects.jsonl');
+                fs.mkdirSync(_vantaDir(), { recursive: true });
+                fs.appendFileSync(rejectPath,
+                  '\n' + JSON.stringify({
+                    ts: new Date().toISOString(),
+                    reason,
+                    session_id: sid,
+                    source: rec.source,
+                    excerpt: rec.candidate.slice(0, 120),
+                  }) + '\n');
+              } catch { /* never block on reject logging */ }
+            };
+            const _candidate = rec.candidate.trimEnd();
+            let rejectReason = null;
+            // (b) confidence floor — only tested when score is available
+            const _score = (typeof route.score === 'number') ? route.score : null;
+            if (_score !== null && _score < 0.70) {
+              rejectReason = `confidence_below_floor (${_score.toFixed(2)} < 0.70)`;
+            }
+            if (!rejectReason) {
+              // (a) length check
+              if (_candidate.length < 80) {
+                rejectReason = `too_short (${_candidate.length} chars)`;
+              }
+            }
+            if (!rejectReason) {
+              // (a) terminal punctuation — last non-whitespace char must be .!?)'"»
+              const lastChar = _candidate[_candidate.length - 1];
+              if (!/[.!?)"'»\]]/.test(lastChar)) {
+                rejectReason = `no_terminal_punctuation (ends: "${lastChar}")`;
+              }
+            }
+            if (!rejectReason) {
+              // (a) truncated tail — last "word" (run of non-space chars) ends without
+              // any punctuation AND the candidate doesn't itself end the sentence.
+              // Heuristic: if the last word is >2 chars and contains no punctuation
+              // and is immediately preceded by a space (mid-word cut), flag it.
+              const lastWordMatch = _candidate.match(/\s(\S{3,})$/);
+              if (lastWordMatch) {
+                const lastWord = lastWordMatch[1];
+                if (!/[.!?,;:)"'»\]]/.test(lastWord)) {
+                  rejectReason = `truncated_tail (last word: "${lastWord}")`;
+                }
+              }
+            }
+            if (rejectReason) {
+              _logReject(rejectReason);
+              _markConsumed();
+              continue;
+            }
+
             try {
               fs.mkdirSync(path.dirname(STAGING_FILE), { recursive: true });
               fs.appendFileSync(STAGING_FILE, block);
