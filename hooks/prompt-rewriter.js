@@ -321,8 +321,30 @@ process.stdin.on('end', () => {
     decision: decision.decision, why: decision.why || decision.intent || 'passthrough',
     subject: prompt.slice(0, 80), tier: decision.tier,
     decision_id: decision.decision_id });  // v3.10 final-council fix
+
+  // v3.13.1: missed-intents PRODUCER — the ROUTING_MISSES staleness signal had
+  // three readers (vanta-status, vanta-brief, using-vanta SKILL.md) but no
+  // writer since design; the file could never exist. True misses only:
+  // unmatched decisions on human-scale prompts — ritual preambles and queue
+  // briefs are automation, not routing misses.
+  if (decision.decision === 'unmatched'
+      && prompt.length < 1500
+      && !/Mode: (WAKE|PULSE|CLOSE)/.test(prompt)) {
+    _appendVantaJsonl('missed-intents.jsonl', {
+      ts: new Date().toISOString(), session_id: sessionId, project,
+      prompt: prompt.slice(0, 120),
+    });
+  }
   return _empty();
 });
+
+function _appendVantaJsonl(name, obj) {
+  try {
+    const dir = process.env.VANTA_DIR_OVERRIDE || path.join(os.homedir(), '.vanta');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, name), JSON.stringify(obj) + '\n');
+  } catch { /* telemetry never blocks the hook */ }
+}
 
 function _logAction(entry) {
   try {
